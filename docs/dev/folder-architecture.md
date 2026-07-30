@@ -364,6 +364,33 @@ It is an internal operational surface used alongside this repo for:
 
 OpenCode sessions should be treated as operator sessions, not product sessions.
 
+**Explicit Boundary:**
+
+| Surface | Purpose | Part of Production Runtime? |
+|---|---|---|
+| OpenCode | Internal developer/operator workbench | **No** |
+| Neryva Backend (`backend/`) | Customer-facing control plane | **Yes** |
+| Neryva Widget (`widget/`) | Embeddable customer chat | **Yes** |
+| Neryva Frontend (`frontend/`) | Admin/tenant configuration UI | **Yes** |
+
+**What OpenCode Is Used For:**
+- Testing multiple LLM provider APIs without polluting production adapters
+- Comparing model behavior across providers (Claude, GPT, Gemini, self-hosted)
+- Prototyping MCP servers and tool integrations before they enter the policy gate
+- Session forking for debugging complex orchestration flows
+- Prompt iteration and A/B testing in a sandboxed environment
+- Replay and debug workflows using sampled production traces (after PII redaction)
+
+**What OpenCode Is NOT Used For:**
+- The production customer agent runtime
+- Tenant session storage or state management
+- Policy enforcement or guardrail evaluation
+- Direct customer-facing interactions
+- Bypassing Neryva's tenant policies, PII handling, or approval boundaries
+
+**Implementation Rule:**
+OpenCode must remain behind Neryva's security boundary. Any tool, provider connection, or workflow prototyped in OpenCode must pass through the production policy gate (Component P), PII layer (Component E), and guardrail stack (Component A/D) before it can be used in the customer runtime.
+
 ---
 
 ## 10. Recommended Initial Build Order

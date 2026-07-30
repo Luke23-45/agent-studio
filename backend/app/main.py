@@ -6,6 +6,7 @@ This is the main entry point for the FastAPI application.
 
 from fastapi import FastAPI
 
+from backend.app.api.routes import conversations_router
 from backend.app.settings.env import settings
 
 
@@ -20,11 +21,8 @@ def create_application() -> FastAPI:
         openapi_url="/openapi.json",
     )
 
-    # Register routes here
-    # from backend.app.api.routes import conversations, tenants, policies
-    # app.include_router(conversations.router, prefix="/api/v1")
-    # app.include_router(tenants.router, prefix="/api/v1")
-    # app.include_router(policies.router, prefix="/api/v1")
+    # Register routes
+    app.include_router(conversations_router, prefix="/api/v1")
 
     @app.get("/health")
     async def health_check():

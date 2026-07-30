@@ -1,97 +1,97 @@
 # Neryva Agent Studio
 
-Governance and control layer for LLM applications. Neryva controls the behavior, voice, scope, and workflow fit of a customer-selected LLM without replacing the model provider or the secure deployment layer.
+**Enterprise-grade governance and control layer for LLM applications.**
+
+## Overview
+
+Neryva Agent Studio provides a production-ready control layer that governs the behavior, voice, scope, and workflow fit of customer-selected LLMs without replacing the model provider or secure deployment layer.
 
 ## Architecture
 
-This repository implements the architecture described in:
+Built on the CoALA (Cognitive Architectures for Language Agents) framework, the system decomposes into:
 
-- [Reference Architecture v1.1](docs/implementation/idea.md)
-- [Development Stack v1.2](docs/dev/stack.md)
-- [Folder Architecture v1.0](docs/dev/folder-architecture.md)
+- **Memory**: Tenant-specific configurations, policies, and knowledge bases
+- **Action Space**: Structured tool integrations and escalation paths
+- **Decision Loop**: LangGraph-based orchestration with guardrails
 
-## Repository Structure
+## Key Features
+
+- **Multi-tenant**: Each enterprise customer gets isolated policy, data scope, and knowledge base
+- **Layered Security**: PII detection (Presidio), input/output validation (NeMo Guardrails, Guardrails AI), topic filtering
+- **Escalation**: Automatic human handoff when confidence is low or policy requires
+- **Observability**: Langfuse integration for tracing and debugging
+- **RAG**: Document ingestion, chunking, embedding, and retrieval with tenant isolation
+
+## Project Structure
 
 ```
 neryva_studio/
-├── backend/          # Python control plane (FastAPI + LangGraph)
-├── frontend/         # Admin UI (React 19 + Vite + TanStack Router)
-├── widget/           # Embeddable customer chat runtime
-├── worker/           # Background jobs and async processing
-├── ops/              # Deployment templates and infrastructure
-├── evals/            # Red-team and evaluation harness
-├── contracts/        # Shared API schemas and event contracts
-├── packages/         # Shared cross-runtime code
-└── docs/             # Architecture and implementation docs
+├── backend/app/           # Main application code
+│   ├── adapters/          # External service adapters (LLM, vector store, DLP)
+│   ├── api/               # FastAPI routes, middleware, dependencies
+│   ├── application/       # Application services (orchestration, handoff, ingestion, retrieval, validation)
+│   ├── domain/            # Domain models (tenant, policy, conversation, knowledge)
+│   ├── infrastructure/    # Infrastructure (database, cache, queue, storage)
+│   ├── modules/           # Feature modules (guardrails, RAG, observability, tenant config, escalation)
+│   └── settings/          # Configuration management
+├── backend/tests/         # Test suite
+├── contracts/             # API schemas and event contracts
+├── frontend/              # Admin UI (React 19 + TanStack Router)
+├── widget/                # Embeddable chat widget
+├── worker/                # Background job processor
+└── ops/                   # Deployment configurations
 ```
 
-## Tech Stack
-
-### Backend
-- **Language:** Python 3.13.x
-- **Framework:** FastAPI >=0.115
-- **Validation:** Pydantic v2
-- **Orchestration:** LangGraph core >=1.2
-- **Guardrails:** NeMo Guardrails + Guardrails AI
-- **PII Detection:** Presidio
-- **Observability:** Langfuse
-- **Database:** PostgreSQL 18 + pgvector
-
-### Frontend
-- **Language:** TypeScript
-- **UI Framework:** React 19
-- **Bundler:** Vite >=6.x
-- **Routing:** TanStack Router
-
-### Red Teaming
-- Garak (automated probing)
-- PyRIT (multi-turn adversarial testing)
-
-## Getting Started
+## Quick Start
 
 ### Prerequisites
 
-- Python 3.13+
-- Node.js 24 LTS
-- pnpm 9.0+
-- PostgreSQL 18+
+- Python 3.12+
+- PostgreSQL 15+ with pgvector extension
 - Redis 7+
+- Node.js 20+ (for frontend/widget)
 
-### Backend Setup
-
-```bash
-cd /workspace
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-```
-
-### Frontend Setup
+### Installation
 
 ```bash
-pnpm install
+# Install backend dependencies
+pip install -e ".[all]"
+
+# Set environment variables
+cp .env.example .env
+# Edit .env with your configuration
+
+# Run migrations
+# (when implemented)
+
+# Start the server
+python -m uvicorn backend.app.main:app --reload
 ```
 
-### Run Development Servers
+### Development
 
 ```bash
-# Backend
-uvicorn backend.app.main:app --reload
+# Run tests
+pytest backend/tests
 
-# Frontend
-pnpm dev:frontend
+# Run linting
+ruff check backend/
+mypy backend/
 
-# Widget
-pnpm dev:widget
+# Run with coverage
+pytest --cov=backend/app backend/tests
 ```
 
-## Design Principles
+## OpenCode Integration
 
-1. **The model is not the product; the control layer is.** Works with Claude, GPT, Gemini, or compatible self-hosted providers.
-2. **No single filter is a security boundary.** Layered controls with defense in depth.
-3. **Multi-tenant from day one.** Each customer gets their own policy, data scope, and knowledge base.
-4. **Every guardrail is also a test target.** Recurring adversarial testing required.
-5. **Internal operator tooling is separate from customer runtime.** OpenCode is for internal development only.
+OpenCode is used internally for:
+- MCP experiments and server prototyping
+- Provider connection testing
+- Prompt iteration
+- Tool integration testing
+- Session forking and replay/debug workflows
+
+**Note**: OpenCode is NOT part of the production runtime. It remains an internal developer/operator surface.
 
 ## License
 
