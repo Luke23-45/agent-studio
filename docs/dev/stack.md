@@ -1,8 +1,8 @@
-# Neryva Development Stack v1.1
+# Neryva Development Stack v1.2
 
-**Status:** Updated July 2026 with verified tool status and decision rationale.
+**Status:** Updated July 2026 with verified tool status and implementation rationale.
 
-This document turns the architecture from `docs/implementation/idea.md` into an implementation stack with specific versions, licensing notes, and replacement options verified against current (July 2026) tool status.
+This document turns the architecture in [docs/implementation/idea.md](/C:/Users/Hellx/Documents/Programming/python/Project/Neryva/neryva_studio/docs/implementation/idea.md) into an implementation stack with concrete versions, licensing notes, and replacement options verified against current tool status.
 
 ---
 
@@ -10,67 +10,70 @@ This document turns the architecture from `docs/implementation/idea.md` into an 
 
 | Layer | Language | Why |
 |---|---|---|
-| Backend / control plane | **Python 3.13.x** | LangGraph, NeMo Guardrails, Guardrails AI, Presidio, RAGAS, Garak — all Python-native. The guardrail/agent ecosystem is strongest here. |
-| Admin / product UI | **TypeScript** | Next.js 16, dashboard, tenant config screens, review workflows. Web UI lives here. |
-| Internal dev tooling | **TypeScript (OpenCode)** | Provider testing, prompt iteration, MCP prototyping. Kept separate from production runtime. |
+| Backend / control plane | **Python 3.13.x** | LangGraph, NeMo Guardrails, Guardrails AI, Presidio, RAGAS, Garak are Python-native. The guardrail and agent ecosystem is strongest here. |
+| Admin / product UI | **TypeScript** | React 19, Vite, TanStack Router, dashboard, tenant config screens, review workflows. The admin surface is a SPA, so SSR is unnecessary. |
+| Internal dev tooling | **OpenCode sessions** | Provider testing, prompt iteration, MCP prototyping, session forking. Kept separate from the production runtime. |
 
-Python 3.14 is available but untested across the dependency matrix. Start on 3.13.x and upgrade after the stack is proven.
+Python 3.14 is available, but the safer move is to start on 3.13.x and upgrade after the dependency matrix is proven.
 
 ---
 
-## Backend Stack (Python)
+## Backend Stack
 
 | Component | Choice | Version | License | Status (July 2026) |
 |---|---|---|---|---|
-| Web framework | **FastAPI** | ≥0.115 | MIT | ✅ Standard. Pydantic v2 native. |
-| Validation | **Pydantic v2** | ≥2.10 | MIT | ✅ |
-| Agent orchestration | **LangGraph (core)** | ≥0.3 | MIT | ✅ Consensus choice for production. 90K+ stars. Used at Uber, LinkedIn, Klarna. |
-| Production server | **Custom FastAPI wrapper** around LangGraph core | — | — | ⚠️ `langgraph-api` server is Elastic 2.0 (needs commercial key). Build a thin FastAPI wrapper around the free LangGraph core instead. |
-| Dialog guardrails | **NeMo Guardrails** | v0.22.0 (May 2025) | Apache 2.0 | ⚠️ v0.23.0 not yet released as of July 2026. Verify breakage risk. Colang DSL has a learning curve. |
-| Output validation | **Guardrails AI** | ≥v0.10.0 (Apr 2026) | Apache 2.0 | ✅ 6.6K stars. 60+ community validators. Best for structured output enforcement. |
-| Content safety classifier | **Llama Guard 4** (Meta) | 12B params | Custom (Meta) | ✅ Newest in the Llama Guard family. Used as classifier inside NeMo's content-safety rail. ~459ms per check. |
-| PII detection | **Presidio** | v2.2.362 (Mar 2026) | MIT | ✅ 8.8K stars. OpenSSF Best Practices badge. Self-hosted. Custom recognizers for tenant-specific PII. |
-| Observability | **Langfuse** | ≥v3.x | MIT core / EE modules | ✅ 27.2K stars. ClickHouse-affiliated since Jan 2026. OTel-native. Self-hostable. |
-| Red-teaming (probes) | **Garak** | latest | MIT-style | ✅ ~8K stars. Individual-led (Leon Derczynski). Broad automated probe coverage. |
-| Red-teaming (multi-turn) | **PyRIT** | latest | MIT | ✅ 4K stars. Microsoft. Crescendo-style multi-turn attacks. |
-| RAG evaluation | **RAGAS** | ≥v0.2 | Apache 2.0 | ✅ Reference-free metrics for faithfulness, relevance. |
-| Governance classifiers | **jina-embeddings-v2-small-en** (fine-tuned) | 33M params | Apache 2.0 | ✅ For off-topic detection. Trainable per tenant. ~3ms inference on CPU. |
-| Governance classifiers | **stsb-roberta-base** (fine-tuned) | 110M params | MIT | ✅ Cross-encoder for high-precision topic relevance. ~8ms inference. |
-| Governance fastpath | **Custom regex engine** | — | — | Implements Claude Code-style userPromptKeywords patterns for zero-cost sentiment/topic detection. |
+| Web framework | **FastAPI** | >=0.115 | MIT | Standard. Pydantic v2 native. |
+| Validation | **Pydantic v2** | >=2.10 | MIT | Current production line. |
+| Agent orchestration | **LangGraph (core)** | >=1.2 | MIT | Very active. Production server package is separate from core. |
+| Production server | **Custom FastAPI wrapper** around LangGraph core | - | - | `langgraph-api` exists, but the core + custom wrapper path keeps production licensing simpler. |
+| Dialog guardrails | **NeMo Guardrails** | v0.23.0 | Apache 2.0 | Current released version in the official repo. Colang has a learning curve. |
+| Output validation | **Guardrails AI** | 0.10.0 | Apache 2.0 | Pin explicitly to 0.10.0. The project advisory says not to install 0.10.1 while the PyPI quarantine is active. |
+| Content safety classifier | **Llama Guard 4** (Meta) | 12B params | Custom (Meta) | Optional classifier layer inside NeMo-style safety rails. Verify before adoption. |
+| PII detection | **Presidio** | v2.2.362 | MIT | Self-hosted, customizable, auditable detection. |
+| Observability | **Langfuse** | >=v3.x | MIT core / EE modules | Self-hostable tracing, evals, prompt management. |
+| Red-teaming (probes) | **Garak** | latest | MIT-style | Broad automated probe coverage. |
+| Red-teaming (multi-turn) | **PyRIT** | latest | MIT | Crescendo-style multi-turn attacks. |
+| RAG evaluation | **RAGAS** | >=v0.2 | Apache 2.0 | Reference-free metrics for faithfulness and relevance. |
+| Governance classifiers | **jina-embeddings-v2-small-en** (fine-tuned) | 33M params | Apache 2.0 | Lightweight off-topic detection. |
+| Governance classifiers | **stsb-roberta-base** (fine-tuned) | 110M params | MIT | Cross-encoder for higher-precision topic relevance. |
+| Governance fastpath | **Custom regex engine** | - | - | Cheap first-pass topic/sentiment triage before heavier checks. |
 
-### Guardrail Architecture: Two Complementary Tools
+### Guardrail Architecture: Complementary Layers
 
-Do not choose between NeMo Guardrails and Guardrails AI — they solve different problems and compose together:
+Do not choose between NeMo Guardrails and Guardrails AI. They solve different problems and compose together.
 
 | Concern | Handled by |
 |---|---|
-| Dialog flow control (Colang) | NeMo Guardrails |
-| Topic/safety rails | NeMo Guardrails + Llama Guard 4 |
+| Dialog flow control | NeMo Guardrails |
+| Topic/safety rails | NeMo Guardrails + classifier layer |
 | Structured output enforcement | Guardrails AI |
-| PII detection | Presidio (wraps both) |
-| Jailbreak detection | Lakera Guard or NeMo's jailbreak rail |
+| PII detection | Presidio |
+| Jailbreak detection | NeMo jailbreak rail or another maintained scanner |
 
-**Note:** LLM Guard (Protect AI) was **archived July 9, 2026** — do not use. It was listed in earlier research but is now explicitly unmaintained.
+**Note:** LLM Guard (Protect AI) was archived July 9, 2026. Do not use it.
 
 ### LangGraph Server Licensing
 
-The `langgraph` core library (MIT) and `langgraph-api` server (Elastic 2.0) are separate packages. For a multi-tenant startup shipping per-customer deployments:
+The `langgraph` core library and `langgraph-api` server are separate packages. For a multi-tenant startup shipping per-customer deployments:
 
-- **Phase 1:** Use LangGraph core + custom FastAPI server. Cost: $0.
-- **Phase 2:** If LangGraph's managed platform becomes cost-effective vs. self-hosting, migrate. Get a quote from LangChain Inc before locking in.
-- **Alternative:** AG2 (ag2ai/ag2, Apache 2.0, independently governed since Nov 2024) as fallback if LangGraph licensing math doesn't work.
+- **Phase 1:** Use LangGraph core + custom FastAPI server. Cost: $0 in licensing for the runtime wrapper.
+- **Phase 2:** If LangGraph's managed/server offering becomes cost-effective versus self-hosting, revisit.
+- **Alternative:** AG2 (`ag2ai/ag2`, Apache 2.0, independently governed) remains a fallback if LangGraph economics stop working.
 
 ---
 
-## Frontend Stack (TypeScript)
+## Frontend Stack
 
 | Component | Choice | Version | Notes |
 |---|---|---|---|
-| Framework | **Next.js 16** | ≥16.0 | Standard for React admin UIs in 2026. |
-| Runtime (prod) | **Node.js 24 LTS** | 24.x | October 2026 LTS. |
-| Runtime (dev) | **Node.js 26** | 26.x | OK for experimentation, not production. |
-| Admin UI | Custom dashboard | — | Tenant config, agent editor, monitoring, escalation queue. |
-| Customer chat widget | **Web component** (no iframe) | — | Embeddable via `<script>` tag. Communicates via SSE. |
+| Bundler | **Vite** | >=6.x | Fast dev server, optimized builds. |
+| UI framework | **React 19** | >=19.0 | Good fit for an authenticated admin dashboard. |
+| Routing | **TanStack Router** | >=1.x | Typed routing for the product UI. |
+| Runtime (prod) | **Node.js 24 LTS** | 24.x | Already on the LTS line. Only needed for build tooling; deployment is static files. |
+| Admin UI | Custom dashboard | - | Tenant config, agent editor, monitoring, escalation queue. |
+| Customer chat widget | **Web component** (no iframe) | - | Embeddable via `<script>` tag and communicates via SSE. |
+
+No SSR is required for the admin surface. Static SPA delivery is simpler, cheaper, and easier to reason about for this use case.
 
 ---
 
@@ -78,26 +81,22 @@ The `langgraph` core library (MIT) and `langgraph-api` server (Elastic 2.0) are 
 
 | Component | Choice | Version | Notes |
 |---|---|---|---|
-| Primary database | **PostgreSQL 18** | 18.x | ✅ Stable. PG 19 still in beta. |
-| Vector search (default) | **pgvector** | ≥v0.8 | ✅ Best for ≤5M vectors. Zero new infra. ACID with app data. |
-| Vector search (scale) | **pgvectorscale** (Timescale) | latest | ✅ StreamingDiskANN extends pgvector to 50M+ vectors without dedicated infra. |
-| Vector search (upgrade path) | **Qdrant** | ≥v1.12 | ⚠️ For >10M vectors or hybrid search needs. Rust-native, 99.2% recall at 1M. Self-host or managed cloud. |
-| Object storage | S3-compatible | — | Documents, exports, eval artifacts. |
-| Cache / queue | **Redis** | ≥v7 | Lightweight cache / job queue. |
+| Primary database | **PostgreSQL 18** | 18.x | Stable production baseline. PostgreSQL 19 is still in beta. |
+| Vector search (default) | **pgvector** | >=v0.8 | Best default for Postgres-first tenants. |
+| Vector search (scale path) | **pgvectorscale** (Timescale) | latest | Use when you need to push past plain pgvector territory without moving off Postgres. |
+| Vector search (alternate) | **Qdrant** | >=v1.12 | Better fit for dedicated vector workloads or hybrid search. |
+| Object storage | S3-compatible | - | Documents, exports, eval artifacts. |
+| Cache / queue | **Redis** | >=v7 | Lightweight cache / job queue. |
 
 ### Vector Database Decision Flow
 
-```
-Already on Postgres? ──YES──→ ≤5M vectors? ──YES──→ pgvector (stop)
-                                │
-                                NO
-                                ├──→ pgvectorscale (up to 50M)
-                                └──→ >10M or hybrid search needed? ──→ Qdrant
-
-Not on Postgres yet? ──→ Need zero-ops? ──YES──→ Pinecone Serverless
-                              │
-                              NO
-                              └──→ Need max performance? ──→ Qdrant
+```text
+Already on Postgres?
+  -> yes -> <=5M vectors -> pgvector
+         -> >5M vectors or higher throughput -> pgvectorscale
+         -> need dedicated vector service -> Qdrant
+  -> no  -> need zero-ops? -> Pinecone Serverless
+         -> need self-host control? -> Qdrant
 ```
 
 ---
@@ -106,69 +105,66 @@ Not on Postgres yet? ──→ Need zero-ops? ──YES──→ Pinecone Server
 
 | Component | Role |
 |---|---|
-| **OpenCode** | Internal dev workbench: provider testing, prompt iteration, MCP prototyping, session forking. NOT the production runtime. |
+| **OpenCode** | Internal dev workbench: provider testing, prompt iteration, MCP prototyping, session forking. Not the production runtime. |
 | **GitHub Actions** | CI/CD |
 | **Docker** | Container builds |
 | **Terraform** | Infrastructure as code |
 
 ---
 
-## OpenCode Role (Refined)
+## OpenCode Role
 
-OpenCode's current feature set (multi-provider, custom models, tools/permissions/plugins, MCP support, headless API) makes it ideal as an **internal engineering tool**, not as the production runtime.
+OpenCode's current feature set makes it useful as an internal engineering tool, not as the production runtime.
 
-**Use it for:**
-- Exercising real provider APIs without mixing that logic into the product
-- Testing model behavior across providers (Claude vs GPT vs Gemini comparison)
-- Prototyping new MCP servers and tool integrations
-- Session forking for debugging
+Use it for:
 
-**Do NOT use it for:**
-- The production customer agent runtime
-- Tenant session storage
-- Policy enforcement (that's Neryva's governance engine)
+- exercising real provider APIs without mixing that logic into the product
+- testing model behavior across providers
+- prototyping MCP servers and tool integrations
+- session forking for debugging
+- keeping internal sessions for implementation work, provider comparisons, and replay/debug flows
+
+Do not use it for:
+
+- the production customer agent runtime
+- tenant session storage
+- policy enforcement
+
+OpenCode sessions are internal operator sessions. They are not customer sessions and they are not the Neryva runtime state store.
 
 ---
 
-## Governance Classifier Layer (NEW)
+## Governance Classifier Layer
 
-One critical gap in the prior stack: there is no lightweight pre-filter before the heavy guardrails. Add this as a dedicated layer:
+Add a lightweight pre-filter before the heavier guardrails:
 
-```
+```text
 User Message
-    │
-    ▼
-[L0: Regex Fastpath]  ← 0ms, $0. Catches obvious off-topic/angry.
-    │ (uncertain)
-    ▼
-[L1: Classifier Models]  ← 3-8ms, ~$0.00001. Fine-tuned 33M-110M param models.
-    │ (uncertain)
-    ▼
-[L2: Llama Guard 4 / NeMo]  ← 100-459ms, ~$0.0002. Heavy guardrails.
-    │
-    ▼
-[L3: Main LLM via LangGraph]
+  -> L0: Regex Fastpath
+  -> L1: Classifier Models
+  -> L2: Llama Guard 4 / NeMo-style guardrails
+  -> L3: Main LLM via LangGraph
 ```
 
-The lightweight classifiers are fine-tuned per tenant on synthetic data (training cost: <$5 per tenant, one-time). They absorb ~90% of off-topic queries before the heavy stack runs.
+This is meant to reduce cost and latency, not to replace the real safety boundary. The final decision still belongs to the policy and guardrail stack.
 
 ---
 
-## Tools NOT Chosen (with reasons)
+## Tools Not Chosen
 
 | Tool | Reason rejected |
 |---|---|
-| **LangGraph API server** | Elastic 2.0 license. Commercial key needed for production self-hosting. Using core + custom wrapper instead. |
-| **LLM Guard (Protect AI)** | **Archived July 9, 2026.** No longer maintained. |
-| **Promptfoo** | Acquired by OpenAI (Mar 2026). Model-neutrality concern. Use Garak + PyRIT instead. |
-| **CrewAI** | Role-based model hits ceiling at 6-12 months. Teams report needing to rewrite to LangGraph later. |
-| **AutoGen / AG2** | Version fragmentation. Less deterministic workflows. Not ideal for auditable customer-service agents. |
-| **Pinecone Serverless** | Vendor lock-in. No HNSW tuning knobs. 95% recall vs Qdrant's 99.2% at 1M vectors. More expensive at scale. |
-| **Weaviate** | Schema rigidity. Resource-intensive. Lower QPS than Qdrant at equivalent hardware. |
-| **Helicone** | Proxy approach has shallower trace depth. Less eval tooling than Langfuse. |
-| **LangSmith** | Requires LangChain stack for auto-tracing. SaaS-only (no self-host). More expensive at scale than Langfuse. |
-| **ChromaDB** | Not production-grade for multi-tenant RAG at scale. |
-| **NeMo Guardrails alone** | Needs Guardrails AI alongside it for structured output validation. They are complementary, not alternatives. |
+| **LangGraph API server** | Separate licensing path. Core + custom FastAPI wrapper keeps early deployment simpler. |
+| **LLM Guard (Protect AI)** | Archived July 9, 2026. |
+| **Promptfoo** | Ownership neutrality risk for a model-agnostic product. |
+| **CrewAI** | Less deterministic for auditable customer-service workflows. |
+| **AutoGen / AG2** | Viable fallback, but not the default if LangGraph economics work. |
+| **Next.js** | Unnecessary for this admin dashboard. Adds SSR and framework coupling we do not need right now. |
+| **Pinecone Serverless** | Strong managed option, but not the default if we want tighter infra control. |
+| **Weaviate** | Not the default when simpler Postgres-first and Qdrant paths exist. |
+| **Helicone** | Proxy-only tracing is not enough for the observability depth we want. |
+| **LangSmith** | Useful if we go deep on LangChain stack, but less attractive if we want broader stack independence. |
+| **ChromaDB** | Not the right default for multi-tenant production RAG at scale. |
 
 ---
 
@@ -176,44 +172,52 @@ The lightweight classifiers are fine-tuned per tenant on synthetic data (trainin
 
 Proceed with:
 
-```
-Backend:     Python 3.13.x + FastAPI + Pydantic v2
-Orchestrate: LangGraph core (MIT) + custom FastAPI server wrapper
-Guardrails:  NeMo Guardrails + Guardrails AI + Llama Guard 4
-PII:         Presidio
-Classifiers: jina-embeddings-v2-small-en (33M) + stsb-roberta-base (110M)
+```text
+Backend:      Python 3.13.x + FastAPI + Pydantic v2
+Orchestrate:  LangGraph core (MIT) + custom FastAPI server wrapper
+Guardrails:   NeMo Guardrails + Guardrails AI + classifier layer
+PII:          Presidio
+Classifiers:  jina-embeddings-v2-small-en + stsb-roberta-base
 Observability: Langfuse (self-hosted)
-Red-team:    Garak + PyRIT
-Database:    PostgreSQL 18 + pgvector (with pgvectorscale for growth)
-Frontend:    TypeScript + Next.js 16 + Node.js 24 LTS
-Dev tool:    OpenCode (internal only)
+Red-team:     Garak + PyRIT
+Database:     PostgreSQL 18 + pgvector (with pgvectorscale for growth)
+Frontend:     TypeScript + React 19 + Vite + TanStack Router
+Dev tool:     OpenCode (internal only)
 ```
 
-All tool decisions are grounded in verified July 2026 status — licenses, community activity, and documented production deployments. The most consequential open decision is the LangGraph server licensing, which is deferred to Phase 2 by using a custom FastAPI wrapper in Phase 1.
+This is the lowest-risk stack for the current architecture. The two main open decisions are LangGraph server economics and when, if ever, to add a dedicated vector service beyond Postgres-first storage.
+
+---
 
 ## Primary Sources
 
 - [Python downloads](https://www.python.org/downloads/)
+- [Python source releases](https://www.python.org/downloads/source/)
 - [FastAPI docs](https://fastapi.tiangolo.com/)
 - [Pydantic v2 migration guide](https://docs.pydantic.dev/2.4/migration/)
-- [LangGraph GitHub](https://github.com/langchain-ai/langgraph) — 90K+ stars, MIT/Elastic 2.0
-- [LangGraph vs CrewAI vs AutoGen 2026 comparison](https://devops.gheware.com/blog/posts/langgraph-vs-crewai-vs-autogen-comparison-2026.html)
-- [NeMo Guardrails GitHub](https://github.com/NVIDIA-NeMo/Guardrails) — v0.22.0 (May 2025), Apache 2.0
-- [Guardrails AI GitHub](https://github.com/guardrails-ai/guardrails) — 6.6K stars, v0.10.0 (Apr 2026)
-- [Guardrails AI vs NeMo Guardrails comparison 2026](https://genai.qa/blog/guardrails-ai-vs-nemo-guardrails/)
-- [Llama Guard 4 on Hugging Face](https://huggingface.co/blog/llama-guard-4) — 12B safety classifier, 2026
-- [Presidio GitHub](https://github.com/microsoft/presidio) — 8.8K stars, MIT, OpenSSF-badged
-- [Langfuse GitHub](https://github.com/langfuse/langfuse) — 27.2K stars, MIT/EE, ClickHouse-affiliated
-- [Langfuse vs LangSmith vs Helicone 2026 comparison](https://geodocs.dev/tools/langfuse-vs-langsmith-vs-helicone-agent-observability)
-- [Garak GitHub](https://github.com/NVIDIA/garak) — ~8K stars, LLM probe framework
-- [PyRIT GitHub](https://github.com/microsoft/PyRIT) — 4K stars, MIT, multi-turn red-teaming
+- [LangGraph GitHub](https://github.com/langchain-ai/langgraph)
+- [NeMo Guardrails GitHub](https://github.com/NVIDIA-NeMo/Guardrails)
+- [Guardrails AI GitHub](https://github.com/guardrails-ai/guardrails)
+- [Presidio GitHub](https://github.com/microsoft/presidio)
+- [Langfuse GitHub](https://github.com/langfuse/langfuse)
+- [Garak GitHub](https://github.com/NVIDIA/garak)
+- [PyRIT GitHub](https://github.com/microsoft/PyRIT)
 - [pgvector GitHub](https://github.com/pgvector/pgvector)
-- [pgvectorscale (Timescale)](https://github.com/timescale/pgvectorscale) — StreamingDiskANN for large-scale pgvector
-- [Vector DB comparison 2026](https://topreviewed.ai/blog/vector-database-comparison-2026-pinecone-vs-qdrant-vs-pgvector-vs-weaviate-at-scale)
-- [Qdrant](https://qdrant.tech/) — 99.2% recall at 1M vectors, hybrid search
-- [Next.js docs](https://nextjs.org/docs)
+- [pgvectorscale (Timescale)](https://github.com/timescale/pgvectorscale)
+- [Qdrant](https://qdrant.tech/)
 - [Node.js releases](https://nodejs.org/en/about/previous-releases)
 - [PostgreSQL releases](https://www.postgresql.org/docs/release/)
 - [OpenCode docs](https://opencode.ai/v2/docs/providers)
-- [Off-topic guardrail paper (arXiv 2411.12946)](https://arxiv.org/html/2411.12946v1) — 33M-param model beats GPT-4 at off-topic detection
 - [OWASP Top 10 for LLM Applications 2025 (v2.0)](https://genai.owasp.org/)
+
+## Secondary References
+
+- [NeMo Guardrails release discussion](https://github.com/NVIDIA-NeMo/Guardrails/discussions/2117)
+- [Guardrails AI security advisory](https://github.com/guardrails-ai/guardrails/blob/main/SECURITY_ADVISORY.md)
+- [Node.js LTS blog](https://nodejs.org/en/blog/release/v24.11.0)
+- [LangGraph vs CrewAI vs AutoGen 2026 comparison](https://devops.gheware.com/blog/posts/langgraph-vs-crewai-vs-autogen-comparison-2026.html)
+- [Guardrails AI vs NeMo Guardrails comparison 2026](https://genai.qa/blog/guardrails-ai-vs-nemo-guardrails/)
+- [Llama Guard 4 overview](https://huggingface.co/blog/llama-guard-4)
+- [Langfuse vs LangSmith vs Helicone 2026 comparison](https://geodocs.dev/tools/langfuse-vs-langsmith-vs-helicone-agent-observability)
+- [Vector DB comparison 2026](https://topreviewed.ai/blog/vector-database-comparison-2026-pinecone-vs-qdrant-vs-pgvector-vs-weaviate-at-scale)
+- [Off-topic guardrail paper (arXiv 2411.12946)](https://arxiv.org/html/2411.12946v1)
