@@ -226,24 +226,65 @@ class AnthropicAdapter(BaseLLMAdapter):
                 raise ImportError("anthropic package not installed")
         return self._client
 
+    @staticmethod
+    def _system_param(messages: list[LLMMessage]) -> Any:
+        """Build the Anthropic ``system`` parameter from all system messages.
+
+        Every system-role message (system prefix, summary layers, memory,
+        knowledge) is included — earlier code kept only the last one. When
+        any block carries cache_control metadata (P2-6), the system is sent
+        as text blocks with explicit ephemeral breakpoints on the marked
+        blocks (Anthropic caches from each breakpoint to the end of the
+        request); otherwise the joined string form keeps the wire format
+        unchanged.
+        """
+        blocks: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.role != "system":
+                continue
+            block: dict[str, Any] = {"type": "text", "text": msg.content}
+            if msg.metadata.get("cache_control"):
+                block["cache_control"] = {"type": "ephemeral"}
+            blocks.append(block)
+        if not blocks:
+            return ""
+        if not any("cache_control" in block for block in blocks):
+            return "\n\n".join(block["text"] for block in blocks)
+        return blocks
+
+    @staticmethod
+    def _chat_params(messages: list[LLMMessage]) -> list[dict[str, Any]]:
+        """Non-system messages for the ``messages`` parameter.
+
+        Messages with cache_control metadata are sent in content-block form
+        with the ephemeral breakpoint (required by Anthropic for per-message
+        caching); unmarked messages keep the plain-string form.
+        """
+        chat_messages: list[dict[str, Any]] = []
+        for msg in messages:
+            if msg.role == "system":
+                continue
+            if msg.metadata.get("cache_control"):
+                chat_messages.append(
+                    {
+                        "role": msg.role,
+                        "content": [{"type": "text", "text": msg.content}],
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                )
+            else:
+                chat_messages.append({"role": msg.role, "content": msg.content})
+        return chat_messages
+
     async def chat(self, messages: list[LLMMessage]) -> LLMResponse:
         """Send chat request to Anthropic."""
         client = self._get_client()
 
-        # Separate system message
-        system_message = ""
-        chat_messages = []
-        for msg in messages:
-            if msg.role == "system":
-                system_message = msg.content
-            else:
-                chat_messages.append({"role": msg.role, "content": msg.content})
-
         response = await client.messages.create(
             model=self.config.model,
             max_tokens=self.config.max_tokens or 1024,
-            system=system_message,
-            messages=chat_messages,
+            system=self._system_param(messages),
+            messages=self._chat_params(messages),
         )
 
         return LLMResponse(
@@ -260,19 +301,11 @@ class AnthropicAdapter(BaseLLMAdapter):
         """Stream chat response from Anthropic."""
         client = self._get_client()
 
-        system_message = ""
-        chat_messages = []
-        for msg in messages:
-            if msg.role == "system":
-                system_message = msg.content
-            else:
-                chat_messages.append({"role": msg.role, "content": msg.content})
-
         stream = await client.messages.stream(
             model=self.config.model,
             max_tokens=self.config.max_tokens or 1024,
-            system=system_message,
-            messages=chat_messages,
+            system=self._system_param(messages),
+            messages=self._chat_params(messages),
         )
 
         return stream

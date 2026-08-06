@@ -39,6 +39,14 @@ class TenantConfig:
     # Feature flags
     features: dict[str, bool] = field(default_factory=dict)
 
+    # Tool-result clearing (Arch 8.3, P2-7): keep_recent_turns = newest
+    # turns whose tool payloads stay intact (the in-flight conversation
+    # remains fully legible); older payloads are reclaimed in the
+    # background when features["clear_tool_results"] is enabled.
+    tool_clearing: dict[str, float] = field(default_factory=lambda: {
+        "keep_recent_turns": 2.0,
+    })
+
     # Guardrail configuration
     guardrail_config: dict[str, bool] = field(default_factory=lambda: {
         "regex_fastpath": True,

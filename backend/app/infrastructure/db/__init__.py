@@ -4,16 +4,20 @@ from .repositories import (
     ApiKeyRepository,
     AuditRepository,
     ConversationRepository,
+    EndUserRepository,
     EscalationRepository,
     EvidenceRepository,
     ModelCatalogRepository,
     PolicyRepository,
+    SessionTokenRepository,
     SpendEventRepository,
+    SurfaceRepository,
     TenantConfigVersionRepository,
     TenantProviderKeyRepository,
     TenantRepository,
     WebhookRepository,
 )
+from .threads import ThreadRepository
 
 __all__ = [
     "DatabaseManager",
@@ -24,13 +28,17 @@ __all__ = [
     "ApiKeyRepository",
     "AuditRepository",
     "ConversationRepository",
+    "EndUserRepository",
     "EscalationRepository",
     "EvidenceRepository",
     "ModelCatalogRepository",
     "PolicyRepository",
+    "SessionTokenRepository",
     "SpendEventRepository",
+    "SurfaceRepository",
     "TenantConfigVersionRepository",
     "TenantProviderKeyRepository",
     "TenantRepository",
     "WebhookRepository",
+    "ThreadRepository",
 ]

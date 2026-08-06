@@ -239,6 +239,9 @@ def tenant_config_from_data(data: dict[str, Any]) -> TenantConfig:
         "max_graph_steps": 50.0,
         "max_duration_s": 60.0,
     }
+    default_tool_clearing = {
+        "keep_recent_turns": 2.0,
+    }
     return TenantConfig(
         id=UUID(data["id"]),
         name=data["name"],
@@ -258,6 +261,7 @@ def tenant_config_from_data(data: dict[str, Any]) -> TenantConfig:
             **data.get("guardrail_thresholds", {}),
         },
         budgets={**default_budgets, **data.get("budgets", {})},
+        tool_clearing={**default_tool_clearing, **data.get("tool_clearing", {})},
     )
 
 

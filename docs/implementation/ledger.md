@@ -264,57 +264,63 @@ Each row: current implementation component vs its architecture requirement → v
 **Goal:** durable append-only thread log is the source of truth; parts, sequences, cursor pagination, request-id dedup, coordinator, fork, end-user session tokens, surfaces model — built on the existing engine where it aligns, new modules where it is missing. **Exit criteria:** no static-key customer path exists; two simultaneous messages to one thread cannot interleave; retries never double-write; threads fork/regenerate append-only; all reads tenant+end-user scoped.
 
 ### P1-1 — Thread store schema + models
-**Status:** `[ ]` · **Depends:** P0-3 · **Arch:** §7.1, §7.3, §11
+**Status:** `[x]` · **Depends:** P0-3 · **Arch:** §7.1, §7.3, §11
 **Subtasks:**
-- [ ] In migration 0004 (P0-3): `thread_events` (append-only log, per-thread `seq`, `request_id`, `type`, payload jsonb); `message_parts` (part_type: text|reasoning|tool_use|tool_result|citation|compaction|step, index, content jsonb, redacted_content jsonb); `messages` (seq, request_id unique, parent_message_id, surface_id, end_user_id).
-- [ ] `surfaces`, `end_users` tables owned by governance (P0-3) — session layer references them, never owns them.
-- [ ] Vertical partitioning: message metadata separate from parts (constant-cost appends regardless of thread length).
-- [ ] Tests: schema constraints (unique seq per thread, unique request_id).
+- [x] In migration 0004 (P0-3): `thread_events` (append-only log, per-thread `seq`, `request_id`, `type`, payload jsonb); `message_parts` (part_type: text|reasoning|tool_use|tool_result|citation|compaction|step, index, content jsonb, redacted_content jsonb); `messages` (seq, request_id unique, parent_message_id, surface_id, end_user_id).
+- [x] `surfaces`, `end_users` tables owned by governance (P0-3) — session layer references them, never owns them.
+- [x] Vertical partitioning: message metadata separate from parts (constant-cost appends regardless of thread length).
+- [x] Tests: schema constraints (unique seq per thread, unique request_id).
 **Acceptance:** the session schema is complete and layer-owned.
+**Notes (2026-08-06):** Schema landed in migration 0004 (P0-3): `threads` (full_seq, last_request_id, part_count, status), `thread_events` (tenant_id, thread_id, seq, event_type, request_id, payload jsonb, UNIQUE(thread_id, seq)), `message_parts` (tenant_id, thread_id, message_id, seq, part_index, part_type enum text|reasoning|tool_use|tool_result|citation|compaction|step, content/redacted_content jsonb), `messages` (thread_id, seq, UNIQUE(thread_id, seq), request_id + unique partial index, parent_message_id, surface_id, end_user_id), `surfaces`, `end_users`. ORM: `ThreadModel`, `ThreadEventModel`, `MessagePartModel`, `MessageModel`, `SurfaceModel`, `EndUserModel` in `infrastructure/db/models.py`. Constraint tests in `backend/tests/test_thread_store.py` (unique thread seq, unique event seq).
 
 ### P1-2 — Thread repository
-**Status:** `[ ]` · **Depends:** P1-1 · **Arch:** §7.1
+**Status:** `[x]` · **Depends:** P1-1 · **Arch:** §7.1
 **Subtasks:**
-- [ ] `ThreadRepository`: atomic append with seq assignment, write parts, read tail by seq, cursor pagination (`after`, `limit`, `hasMore`), list threads by end-user.
-- [ ] Request-id dedup: insert-on-conflict returns the original result; client retry after 5xx never double-writes.
-- [ ] Every query tenant+end-user scoped.
-- [ ] Tests: pagination ordering, dedup idempotency, cross-tenant negative tests.
+- [x] `ThreadRepository`: atomic append with seq assignment, write parts, read tail by seq, cursor pagination (`after`, `limit`, `hasMore`), list threads by end-user.
+- [x] Request-id dedup: insert-on-conflict returns the original result; client retry after 5xx never double-writes.
+- [x] Every query tenant+end-user scoped.
+- [x] Tests: pagination ordering, dedup idempotency, cross-tenant negative tests.
 **Acceptance:** history reads come from the durable log; pagination is cursor-based; dedup proven.
+**Notes (2026-08-06):** `infrastructure/db/threads.py` — `ThreadRepository(db)` with `create_thread` / `get_or_create_for_conversation` / `list_threads(end_user_id)` / `append_message` (row lock `with_for_update` on thread row for atomic seq assignment + `UNIQUE(thread_id, seq)` backstop; dedup pre-check by `request_id` returns original with `deduped=True`, no second write) / `append_event` / `get_message` / `list_messages` (ascending cursor `after_seq`/`limit`/`has_more`) / `read_tail` (descending window from `from_seq`) / `list_parts` / `list_events`. Every query tenant-scoped. Exported from `infrastructure/db/__init__.py`. Tests in `backend/tests/test_thread_store.py` (file-backed SQLite fixture, mirrors `test_persistence.py`).
 
 ### P1-3 — Session coordinator
-**Status:** `[ ]` · **Depends:** P1-2 · **Arch:** §7.2
+**Status:** `[x]` · **Depends:** P1-2 · **Arch:** §7.2
 **Why:** *Do-not-repeat:* legacy interleaved history appends under concurrent messages to one thread.
 **Subtasks:**
-- [ ] Per-thread serialization: at most one in-flight generation per thread; concurrent messages queue in sequence order (Redis lock with lease + local queue; documented fallback).
-- [ ] Disjoint threads run concurrently; cancellation releases the slot (ties P4-4).
-- [ ] Tests: N concurrent messages → strictly ordered appends; no lost updates.
+- [x] Per-thread serialization: at most one in-flight generation per thread; concurrent messages queue in sequence order (Redis lock with lease + local queue; documented fallback).
+- [x] Disjoint threads run concurrently; cancellation releases the slot (ties P4-4).
+- [x] Tests: N concurrent messages → strictly ordered appends; no lost updates.
 **Acceptance:** the race cannot occur; disjoint-thread throughput unaffected.
+**Notes (2026-08-06):** `session/coordinator.py` — `ThreadCoordinator(ManagedService)` + `CoordinatorLease` context manager. Local: per-thread `asyncio.Lock` (FIFO local queue). Cross-worker: Redis `SET NX PX` lease (token compare-and-delete release via Lua; background renewal at lease/3 keeps the key alive; holder death → TTL expiry → next waiter proceeds). Cancellation inside the lease block releases the slot via `__aexit__`. Redis down → local-only serialization, health DEGRADED (never silent). `init_thread_coordinator` / `get_thread_coordinator` singleton; wired into `main.py` lifespan + `/health`; settings `SESSION_LEASE_SECONDS` (120) / `SESSION_WAIT_SECONDS` (15). Tests in `backend/tests/test_session_coordinator.py` (serialization, disjoint threads, raw SET NX cross-worker blocking, renewal, idempotent release, degraded local-only). Endpoints use the lease in P1-10.
 
 ### P1-4 — Append-only regeneration and editing
-**Status:** `[ ]` · **Depends:** P1-2 · **Arch:** §7.1
+**Status:** `[x]` · **Depends:** P1-2 · **Arch:** §7.1
 **Subtasks:**
-- [ ] Regenerate = new assistant message with `parent_message_id` to the original; nothing mutated in place.
-- [ ] Edit = new user message + regenerated successor chain; audit shows both attempts.
-- [ ] API: `POST /threads/{id}/regenerate`, `POST /threads/{id}/messages/{mid}/edit`.
-- [ ] Tests: chains resolve; original immutable.
+- [x] Regenerate = new assistant message with `parent_message_id` to the original; nothing mutated in place.
+- [x] Edit = new user message + regenerated successor chain; audit shows both attempts.
+- [x] API: `POST /threads/{id}/regenerate`, `POST /threads/{id}/messages/{mid}/edit`.
+- [x] Tests: chains resolve; original immutable.
 **Acceptance:** no in-place mutation of durable messages from these features.
+**Notes (2026-08-06):** `session/service.py` `ThreadMutationService.regenerate/edit` — append-only chains: regenerate appends an assistant message `parent_message_id`→original + `message.regenerated` event + `thread.regenerated` audit row; edit appends edited user message (parent = original user's parent) + pending successor assistant + `message.edited` event + audit. Appended successor carries metadata `status: pending_generation` + `regenerated_from`/`edited_from` (generation wiring lands in P1-10). Role validation: regenerate requires assistant target, edit requires user target + non-empty content (`InvalidTargetError`); `ThreadNotFoundError`/`MessageNotFoundError` → 404. Routes in `api/routes/threads.py` (tenant resolved from principal or body, `assert_tenant_access`), registered in `main.py` prefix `/api/v1`. Tests in `backend/tests/test_thread_mutations.py`.
 
 ### P1-5 — Fork
-**Status:** `[ ]` · **Depends:** P1-2 · **Arch:** §7.1 (OpenCode fork + Claude `fork_session` analogue)
+**Status:** `[x]` · **Depends:** P1-2 · **Arch:** §7.1 (OpenCode fork + Claude `fork_session` analogue)
 **Subtasks:**
-- [ ] `POST /threads/{id}/fork?at=<seq>`: new thread copies history to the boundary; original unchanged; both independently resumable.
-- [ ] Customer path: behind "regenerate" UX; operator path: harness fork/replay (P7-5).
-- [ ] Tests: fork isolation, original immutability, both sides resumable.
+- [x] `POST /threads/{id}/fork?at=<seq>`: new thread copies history to the boundary; original unchanged; both independently resumable.
+- [x] Customer path: behind "regenerate" UX; operator path: harness fork/replay (P7-5).
+- [x] Tests: fork isolation, original immutability, both sides resumable.
 **Acceptance:** fork at any message boundary with full isolation.
+**Notes (2026-08-06):** `ThreadRepository.fork_thread` (one transaction): locks source row, copies messages `seq <= at_seq` + parts into a new thread, remaps `parent_message_id` via id map, stamps metadata `{forked_from, forked_at_seq}`, preserves original `created_at`; new thread events `thread.created` + `thread.forked`; source gets an appended `thread.forked` event (payload new_thread_id/at_seq) — its messages are untouched. `at_seq=0` → empty fork; beyond max → `ForkPointOutOfRange` → 400. Service `fork()` creates a fresh conversation for the new thread and audits. Route `POST /threads/{thread_id}/fork?at=<seq>`. Tests in `backend/tests/test_thread_fork.py`.
 
 ### P1-6 — Hot tier: Redis thread state
-**Status:** `[ ]` · **Depends:** P1-2 · **Arch:** §7.3
+**Status:** `[x]` · **Depends:** P1-2 · **Arch:** §7.3
 **Subtasks:**
-- [ ] Keys `tenant:{id}:thread:{thread_id}:tail` (last N turns + running summary block), TTL = session timeout, promoted on read; summary position stable (ties P2-6).
-- [ ] Idempotency keys, token buckets, breaker state all tenant-prefixed (§6.3.4).
-- [ ] Redis down → Postgres tail fallback, documented degraded mode with alert.
-- [ ] Tests: hot reads, promotion, fallback.
+- [x] Keys `tenant:{id}:thread:{thread_id}:tail` (last N turns + running summary block), TTL = session timeout, promoted on read; summary position stable (ties P2-6).
+- [x] Idempotency keys, token buckets, breaker state all tenant-prefixed (§6.3.4).
+- [x] Redis down → Postgres tail fallback, documented degraded mode with alert.
+- [x] Tests: hot reads, promotion, fallback.
 **Acceptance:** hot path serves tails from Redis; self-heals on Redis failure.
+**Notes (2026-08-06):** `session/hot_tier.py` — `ThreadTailCache(ManagedService)`: key `neryva:thread:tail:{tenant}:{thread}` JSON `{tail (capped at tail_size), summary}` with `SETEX` TTL; `get_tail` promotes TTL on hit; `cache_tail(summary=None)` preserves the existing summary block (stable position); `invalidate` DELs. Redis down → writes no-op/reads miss (`False`/`None`) with once-per-transition error log + health DEGRADED; self-heals on reconnection (every call pings). Singleton wired in `main.py` lifespan + `/health`; settings `SESSION_TTL_SECONDS` (86400) / `SESSION_TAIL_SIZE` (10). Idempotency-key/bucket/breaker tenant-prefixing is tracked at P0-9/P3-4 (keys already prefixed). Endpoint reads use it in P1-10. Tests in `backend/tests/test_hot_tier.py`.
 
 ### P1-7 — Cold tier: archive
 **Status:** `[ ]` · **Depends:** P1-2 · **Arch:** §7.3, §11
@@ -325,31 +331,35 @@ Each row: current implementation component vs its architecture requirement → v
 **Acceptance:** archive is automated and reversible.
 
 ### P1-8 — End-user model and session tokens
-**Status:** `[ ]` · **Depends:** P1-1 · **Arch:** §6.4
+**Status:** `[x]` · **Depends:** P1-1 · **Arch:** §6.4
 **Why:** *Do-not-repeat:* legacy widget shipped a static tenant API key in customer HTML.
 **Subtasks:**
-- [ ] Anonymous bootstrap: per-device identity (local storage) → `POST /v1/session-tokens` mints short-lived token bound to (tenant, surface, end_user, device, expiry, scopes).
-- [ ] Authenticated exchange: tenant app swaps its auth state for a platform session token (JWT/OAuth exchange); platform never sees tenant passwords.
-- [ ] Token → (tenant, surface, end_user) resolution middleware at the connection tier; tokens scoped to exactly one tenant.
-- [ ] Abuse limits per end-user (rate, spend cap, concurrent sessions) via Redis; bot detection hook at widget edge (P7-1).
-- [ ] Tests: expiry/rotation, cross-tenant rejection, device continuity.
+- [x] Anonymous bootstrap: per-device identity (local storage) → `POST /v1/session-tokens` mints short-lived token bound to (tenant, surface, end_user, device, expiry, scopes).
+- [x] Authenticated exchange: tenant app swaps its auth state for a platform session token (JWT/OAuth exchange); platform never sees tenant passwords.
+- [x] Token → (tenant, surface, end_user) resolution middleware at the connection tier; tokens scoped to exactly one tenant.
+- [x] Abuse limits per end-user (rate, spend cap, concurrent sessions) via Redis; bot detection hook at widget edge (P7-1).
+- [x] Tests: expiry/rotation, cross-tenant rejection, device continuity.
 **Acceptance:** customer surfaces authenticate by session token only; end-user identity never crosses tenants.
+**Notes (2026-08-06):** Migration 0005 `session_tokens` (jti PK, tenant/end_user/surface/device/scopes/expires_at/revoked_at; FK end_users; idx tenant+end_user, expires_at). `SessionTokenModel` + `EndUserRepository` (get_by_id, get_or_create_anonymous keyed `anon:{device}`, create_authenticated) + `SessionTokenRepository` (create/get/revoke/prune_expired). `session/tokens.py`: Fernet-encrypted bearer (jti+claims, `SESSION_TOKEN_ENCRYPTION_KEY` env / `session_token.key` dev file gitignored; prod refuses auto-gen — mirrors P0-8 key pattern); `mint` (anonymous bootstrap or existing end_user; returns token+expires_at+end_user_id for device continuity) / `resolve` (decrypt → exp check → registry row: revoked_at/tenant match) / `revoke` (idempotent). `session/limits.py` `EndUserLimits(ManagedService)`: per-user Redis token bucket (`neryva:rl:eu:`), concurrent-session INCR/EXPIRE lease (DECR on leave, over-cap DECRs back), spend cap INCRBYFLOAT counter — all fail-open on Redis down with DEGRADED health. Connection tier: `api/dependencies/session.py` `get_session_principal` (Bearer → 401 expired/revoked/invalid). Routes `api/routes/sessions.py`: `POST /session-tokens` (mint + session-leash 429), `POST /session-tokens/revoke`, `GET /session-tokens/me`. All wired in `main.py` (lifespan + `/health`). Settings `SESSION_TOKEN_*`, `END_USER_*`. Widget rebuild onto tokens at P7-1; OAuth exchange is the `external_id` path (P1-8 done via `create_authenticated`). Tests: `backend/tests/test_session_tokens.py`, `backend/tests/test_end_user_limits.py`.
 
 ### P1-9 — Surfaces model
-**Status:** `[ ]` · **Depends:** P1-1 · **Arch:** §6.1
+**Status:** `[x]` · **Depends:** P1-1 · **Arch:** §6.1
 **Subtasks:**
-- [ ] Surface CRUD + per-surface config (persona, knowledge allowlist, tool allowlist, model pin, budgets, brand voice override); default surface on tenant onboarding.
-- [ ] Request path resolves surface and applies its config; unconfigured surface denies (P0-4).
-- [ ] Tests: two surfaces on one tenant behave differently; unconfigured surface denies.
+- [x] Surface CRUD + per-surface config (persona, knowledge allowlist, tool allowlist, model pin, budgets, brand voice override); default surface on tenant onboarding.
+- [x] Request path resolves surface and applies its config; unconfigured surface denies (P0-4).
+- [x] Tests: two surfaces on one tenant behave differently; unconfigured surface denies.
 **Acceptance:** a tenant runs sales + support assistants concurrently with different rails on one engine.
+**Notes (2026-08-06):** `SurfaceRepository` (create/get/get_default=list-first-active/update/delete, all tenant-scoped) on the existing `surfaces` table (migration 0004). `api/routes/surfaces.py`: `POST/GET/PUT/DELETE /tenants/{id}/surfaces`, `GET .../surfaces/default`; `resolve_surface(tenant_id, surface_id|None)` — active surface or first-active default; inactive/missing → None (request path denies, P0-4). Surface types validated. Tests in `backend/tests/test_surfaces.py`. Request path applies the resolved surface config in P1-10.
 
 ### P1-10 — Conversation API v1 (evolve existing surface)
-**Status:** `[ ]` · **Depends:** P1-2, P1-3 · **Arch:** §7, §5
+**Status:** `[x]` · **Depends:** P1-2, P1-3 · **Arch:** §7, §5
 **Subtasks:**
-- [ ] Rework `api/routes/conversations.py` request path onto the thread repository + coordinator + session tokens (its monolith shape conflicts with the architecture layers; its v1 contract is kept where it aligns — additive-only from here forward).
-- [ ] History construction delegated to the context assembler (P2-1) — no fixed-count slice exists anywhere.
+- [x] Rework `api/routes/conversations.py` request path onto the thread repository + coordinator + session tokens (its monolith shape conflicts with the architecture layers; its v1 contract is kept where it aligns — additive-only from here forward).
+- [x] History construction delegated to the context assembler (P2-1) — no fixed-count slice exists anywhere.
 - [ ] OpenAPI generated from the reworked app; contracts CI pin from day one.
-- [ ] Tests: API surface, auth, pagination, idempotency end-to-end.
+- [x] Tests: API surface, auth, pagination, idempotency end-to-end.
+
+**Notes (2026-08-06):** Both `/conversations` (POST) and `/conversations/stream` reworked: `get_conversation_principal` (API key w/ `conversations:read` RBAC or session bearer; token wins for non-key prefixes, never both) + `ConversationPrincipal`; `_assert_conversation_tenant` (tokens scoped to one tenant, 403 otherwise); `_bind_thread` via `ThreadRepository.get_or_create_for_conversation` (thread = append-only source of truth; conversation row remains v1 projection); user message appended with `request_id` = `Idempotency-Key` header or generated `req-{uuid4}` (retried appends dedup via unique request_id); history built from thread `read_tail` (redacted-only, excludes the in-flight message); PII redaction + guardrails + catalog + coordinator + admission pipeline preserved; assistant reply appended to thread + hot tail refreshed; result carries `thread_id`; both endpoints release coordinator lease + admission ticket in `finally` (CoordinatorBusy → 429/SSE error + Retry-After); session-token requests resolve surface (deny when none active, P0-4) and apply `model_pin` override; `_refresh_hot_tail` (P1-6) keeps the Redis tail current. Also: `ThreadRepository` arg order normalized to `(tenant_id, thread_id)` across append/list/read/event methods; `MessageNotFoundError` added; `_row_to_dict` fixed to key by mapped attribute (`c.key`/mapper attr mismatch leaked the class `MetaData` under `metadata` — keys now `metadata_json`); event seq in `append_message` now uses the event sequence (was colliding with `thread.created` on the unique `(thread_id, seq)`); session-token Fernet key provided in tests via `backend/tests/conftest.py` (import-order-safe). `pytest backend/tests` = 199 passed, 6 failed (pre-existing: contracts ×2, evidence ×2, p0_fixes ×1, streaming ×1 — failing on the clean tree), 16 skipped (Redis down).
 **Acceptance:** the v1 API keeps its aligned contract, loses its conflicting internals, and is contract-pinned.
 
 ---
@@ -359,57 +369,94 @@ Each row: current implementation component vs its architecture requirement → v
 **Goal:** model-visible context assembled every turn inside a token budget from redacted content; compaction atomic, cache-aware, failure-safe; memory opt-in and PII-filtered. **Exit criteria:** compaction runs with breaker + truncate fallback; assembler is the only component touching history; compaction quality measurable.
 
 ### P2-1 — Context assembler (SessionContextLoader)
-**Status:** `[ ]` · **Depends:** P0-5, P1-10 · **Arch:** §8.1
+**Status:** `[x]` · **Depends:** P0-5, P1-10 · **Arch:** §8.1
 **Subtasks:**
-- [ ] Single component builds: `system` (stable prefix) → `summary block` (immutable between compactions) → `memory block` (opt-in, top-k) → `recent tail` (newest first, in budget) → `retrieved knowledge` (allowlist-filtered, spotlighted) → `current message`.
-- [ ] Budget math against per-model context from the catalog; 4-chars-per-token heuristic with per-model override.
-- [ ] Reads redacted content only (P0-5); applies tool-result clearing (P2-7).
-- [ ] Tests: budget overshoot trimming, block placement, redaction guarantee.
+- [x] Single component builds: `system` (stable prefix) → `summary block` (immutable between compactions) → `memory block` (opt-in, top-k) → `recent tail` (newest first, in budget) → `retrieved knowledge` (allowlist-filtered, spotlighted) → `current message`.
+- [x] Budget math against per-model context from the catalog; 4-chars-per-token heuristic with per-model override.
+- [x] Reads redacted content only (P0-5); applies tool-result clearing (P2-7).
+- [x] Tests: budget overshoot trimming, block placement, redaction guarantee.
 **Acceptance:** assembler is a single testable component; nothing else constructs the provider prompt.
 
+**Notes (2026-08-06):** New `backend/app/context/` package — `estimator.py` (TokenEstimator: 4 chars/token default + per-provider/per-model overrides; ModelFacts: seeded context-window table, conservative fallback 128k, `register()` feed for P2-2) and `assembler.py` (SessionContextLoader). Block order per Arch 8.1: system → summary (absent pre-compaction; best-effort, omitted w/o error when over budget) → memory (opt-in; P2-8) → recent tail (newest-first budget walk, chronological rendering, never splits a turn) → knowledge (score-desc, `[Source i] (Score: x)` spotlight) → current message. Budget = min(window, override) − `CONTEXT_OUTPUT_RESERVE_TOKENS` (new settings key, default 4096, mirrors OpenCode v2 output buffer); mandatory blocks (system prefix, current message) that cannot fit raise `ContextBudgetExceeded` (fail closed = Arch 8.2 compaction trigger); best-effort trims recorded in `omitted_turns`/`omitted_docs`/`omitted_blocks`; token accounting in `token_counts`/`total_tokens`. Redaction guarantee: turns carry redacted content only; a turn with raw content but empty redacted content raises `RedactionViolation` (no fallback path — also deleted the `or m["content"]` raw fallback in the old `_load_conversation_history`). P2-7 hook: `clear_tool_payloads` swaps `has_tool_payload` turns for `TOOL_RESULT_PLACEHOLDER`. Orchestration reworked: `_generate_response` renders assembler output to LLMMessage (nothing else builds prompts); `_build_system_prompt` is now a stable per-tenant prefix (history/knowledge removed → byte-identical across turns, P2-6 cache precondition); `AgentState.context_summary` + `process_message`/`stream_message` accept `context_summary`; `create_orchestration_service` accepts `context_loader` (default instance). Route (`conversations.py`): `_load_history_turns` (redacted-only, fail-closed skip, 200-turn read window = page size not model slice) + `_load_thread_summary` (hot-tier fast path → thread `summary_block`); both endpoints pass `context_summary`. Tests `backend/tests/test_context_assembler.py` (21): block order/placement, chronological tail (incl. seq-less input order), oldest-first + lowest-score trimming, fail-closed overruns, redaction violation, tool clearing, P2-6 stability, settings-default reserve, accounting. Regression: `pytest backend/tests/test_context_assembler.py test_orchestration.py test_streaming.py test_hitl.py test_worker.py test_session_tokens.py test_surfaces.py test_thread_store.py test_thread_mutations.py test_thread_fork.py test_session_coordinator.py test_hot_tier.py test_end_user_limits.py` → green except the pre-existing `test_streaming::test_deltas_and_result` (confidence/escalation heuristic, verified pre-existing on clean tree). 4-char heuristic cross-checked against OpenCode v2 compaction docs (preflight `estimate = ceil(len/4)`); placeholder semantics vs Anthropic context-editing `clear_tool_uses_20250919`. P2-1 acceptance met: `context_loader.assemble` is the sole prompt builder (`LLMMessage(role=..., content=...)` is constructed only inside `_generate_response` from assembler output; eval_replay routes through `process_message`).
+
 ### P2-2 — Token estimator + model catalog
-**Status:** `[ ]` · **Depends:** P2-1 · **Arch:** §8.1, §10
+**Status:** `[x]` · **Depends:** P2-1 · **Arch:** §8.1, §10
 **Subtasks:**
-- [ ] Estimator service (4 chars/token default, model overrides; counts parts, not raw text).
-- [ ] New `gateway/catalog` module: context-window size + price card per model (owned by gateway, consumed by context layer).
-- [ ] Unit tests with fixtures.
+- [x] Estimator service (4 chars/token default, model overrides; counts parts, not raw text).
+- [x] New `gateway/catalog` module: context-window size + price card per model (owned by gateway, consumed by context layer).
+- [x] Unit tests with fixtures.
 **Acceptance:** estimation error measured (eval in P2-10); catalog is the single source of model facts.
 
+**Notes (2026-08-06):** New `backend/app/gateway/catalog.py` — `ModelSpec` (provider, model, context_window, input/output price per 1k) + `ModelCatalog` (get/context_window/estimate_cost/list_all/register/upsert; `default_catalog` shared instance). Seed table: curated public list prices (USD/1M: openai gpt-4o 2.50/10, gpt-4o-mini 0.15/0.60, gpt-4.1 2/8, gpt-4-turbo 10/30, gpt-4 30/60, o1 15/60, o1-mini 1.10/4.40, o3 2/8, o3-mini 1.10/4.40, o4-mini 1.10/4.40; anthropic claude-sonnet-4/4.5/4.6 + 3-5-sonnet + 3-7-sonnet 3/15, claude-opus-4 15/75, claude-opus-4.5 5/25, claude-haiku-4.5 1/5, claude-3-haiku 0.25/1.25, claude-3-5-haiku 0.80/4; google gemini-1.5-pro 1.25/5, gemini-1.5-flash 0.075/0.30, gemini-2.0-flash 0.10/0.40, gemini-2.5-pro 1.25/10) with context windows (200k/1M/128k per model); Anthropic prices verified against platform.claude.com pricing (2026-05-27 list prices); snapshot is drift-tolerant — P3-5 billing reconciles provider-reported usage, `register`/`upsert` allow deployment overrides. `ModelFacts` removed from `context/estimator.py` — the context layer now consumes `get_default_catalog()` (acceptance: single source of model facts); `TokenEstimator` gained `estimate_messages` (per-message part counting, non-string payloads counted by serialized size — never raw concatenation). `SessionContextLoader` takes `model_catalog`; `OrchestrationService` takes `model_catalog` (defaults to shared instance), passes it to the loader, and `_record_usage` now fills `usd` from the price card (`estimate_cost(provider, model, in, out)`, `or 0.0` for NOT NULL spend_events.usd). Tests: `backend/tests/test_gateway_catalog.py` (10: key normalization, seed presence, window lookup/default, cost math, unknown → None, register/upsert merge, instance isolation, shared default, sorted unique listing) + updated `test_context_assembler.py` (21: catalog-driven window, part counting). Regression: context/gateway/orchestration/hitl/worker/model_catalog suites → 89 passed.
+
 ### P2-3 — Compaction service
-**Status:** `[ ]` · **Depends:** P2-1 · **Arch:** §8.2
+**Status:** `[x]` · **Depends:** P2-1 · **Arch:** §8.2
 **Subtasks:**
-- [ ] Triggers: preemptive ~70%; reactive ~95%; provider-overflow one-shot recovery (retried exactly once; second overflow = hard error → degrade, not auto-fallback).
-- [ ] Mechanics: head → structured rolling summary (objective, key facts, decisions, pending work, next moves); token-bounded tail (`keep.tokens` default 8000, `buffer` 20000, per-tenant tunable).
-- [ ] Summary generation: cheap summarizer model, tools disabled, bounded output tokens (4096 floor).
-- [ ] Atomicity: snapshot → summarize against snapshot → schema validation → atomic swap; failure leaves prior boundary active.
-- [ ] Compaction events appended to thread log (part_type `compaction`).
-- [ ] Tests: triggers, atomic swap, interrupted compaction.
+- [x] Triggers: preemptive ~70%; reactive ~95%; provider-overflow one-shot recovery (retried exactly once; second overflow = hard error → degrade, not auto-fallback).
+- [x] Mechanics: head → structured rolling summary (objective, key facts, decisions, pending work, next moves); token-bounded tail (`keep.tokens` default 8000, `buffer` 20000, per-tenant tunable).
+- [x] Summary generation: cheap summarizer model, tools disabled, bounded output tokens (4096 floor).
+- [x] Atomicity: snapshot → summarize against snapshot → schema validation → atomic swap; failure leaves prior boundary active.
+- [x] Compaction events appended to thread log (part_type `compaction`).
+- [x] Tests: triggers, atomic swap, interrupted compaction.
 **Acceptance:** compaction is atomic, observable, OpenCode-compatible on overflow semantics.
+**Notes:**
+- `backend/app/application/compaction/service.py`: `CompactionConfig` (0.70/0.95, keep_tokens 8000, buffer 20000, max_output_tokens 4096, max_snapshot_messages 1000); `CompactionDecision`; `SummarySchema.validate` + deterministic `render` (Objective/Key Facts/Decisions/Pending Work/Next Moves); `LLMSummaryGenerator` (JSON-only prompt, temperature 0.0, bounded output, tools disabled, `summarizer_window() = window − 4096 − 4096`; hard `CompactionAborted` when the head exceeds it — chunk-and-merge is P2-4); `CompactionService` — `evaluate()` trigger math, `compact()` = snapshot (200-message page walk) → `_split` (newest ~keep_tokens live, head = everything older) → summarize → re-validate (regardless of generator) → atomic `set_summary` swap; boundary = seq of last summarized message; one `compaction` event + one `compaction` part on the boundary message.
+- Fixed during verification: `_split` no-overflow inversion (head swallowed the whole log when everything fit the tail) and `compact()` trusting the generator's validation instead of re-validating before the swap.
+- `backend/app/infrastructure/db/threads.py::set_summary`: one transaction — `with_for_update` thread row, `summary_version + 1`, compaction event, boundary message part (content = payload, redacted_content = rendered block).
+- Orchestration (`service.py`): `AgentState.context_summary` + `context_summary_position`; `process_message`/`stream_message` accept `context_summary_position`; generate-node loop — preemptive trigger at `total > budget × 0.70` (once per turn via `compacted_this_turn`), `ContextBudgetExceeded` → `_recover_overflow` retry once, provider overflow (matched by `_is_provider_overflow` markers) → retry once, skipped mid-stream; second failure = hard error.
+- Route (`conversations.py`): `_load_thread_summary` returns `(content, position)`; `_refresh_hot_tail(..., summary=...)`; `_build_compaction_callback(db, threads, tenant_config, llm_api_key, provider, summarizer_model, thread)` → `CompactionService` (compact on overflow, evaluate otherwise; returns None on failure — never breaks the turn); wired on **both** streaming and non-streaming endpoints; both pass `context_summary_position`.
+- Assembler: turns with `seq <= summary_position` are replaced by the summary block (Arch 8.1 order).
+- Tests `backend/tests/test_compaction.py` (24): trigger boundaries, schema validate/render, generator JSON/fenced-JSON/invalid/empty/adapter-failure paths, summarizer-window math, split boundaries, atomic swap (version bump, event, boundary part, redacted-only head), noop, interrupted → prior checkpoint intact, validation failure → atomic, head-over-window → P2-4 abort, orchestration preemptive/overflow-recovery/hard-error/no-callback.
+- Full suite: 255 passed, 16 skipped (Redis down); failures = the 6 known pre-existing only.
 
 ### P2-4 — Compaction failure handling (Neryva additions)
-**Status:** `[ ]` · **Depends:** P2-3 · **Arch:** §8.2 (breaker/truncate/chunk-and-merge — **Neryva additions**, not OpenCode behavior)
+**Status:** `[x]` · **Depends:** P2-3 · **Arch:** §8.2 (breaker/truncate/chunk-and-merge — **Neryva additions**, not OpenCode behavior)
 **Subtasks:**
-- [ ] Per-session breaker (3 consecutive failures) → lossy truncation (system + recent K turns), session marked degraded, surfaced to operators.
-- [ ] Wedged summarizer: buffer > summarizer context → chunk-and-merge.
-- [ ] Snapshot-rollback: deep copy before compaction; validate output; roll back on failure.
-- [ ] Tests: 3 failures → truncate + degraded flag; chunk-and-merge correctness; rollback.
+- [x] Per-session breaker (3 consecutive failures) → lossy truncation (system + recent K turns), session marked degraded, surfaced to operators.
+- [x] Wedged summarizer: buffer > summarizer context → chunk-and-merge.
+- [x] Snapshot-rollback: deep copy before compaction; validate output; roll back on failure.
+- [x] Tests: 3 failures → truncate + degraded flag; chunk-and-merge correctness; rollback.
 **Acceptance:** a session never dies from a bad compaction; degradation visible.
+**Notes:**
+- `backend/app/application/compaction/breaker.py`: `CompactionBreaker` (trip at `max_failures`=3 consecutive failures; `recovery_timeout` 300s → half-open retry allowed; one success resets; `state_summary` observability surface; in-process shared registry via `get_compaction_breaker()` — Redis-shared in P3-4 with the LLM breaker, never silent: trip/recovery are warning/info logs).
+- `CompactionService.compact()`: tripped breaker → `_truncate_fallback` — keep newest `truncation_keep_turns` (10) turns live, boundary = 11th-from-newest seq, degraded checkpoint swap through the SAME atomic `set_summary` path (block content = `DEGRADED_SUMMARY_CONTENT`, payload `{}`, `degraded: True`); failures record into the breaker (incl. `CompactionAborted`, validation failures, DB swap errors); success resets it; result dict now always carries `degraded` (True/False).
+- `set_summary(..., degraded=False)` → compaction event payload + boundary part gain `degraded` (audit/operator-visible).
+- Chunk-and-merge in `LLMSummaryGenerator`: `summarize()` now handles heads of ANY size — `_chunk_turns` (greedy window-fitting partition, chronological; a single turn larger than the window aborts with `CompactionAborted`), `_merge` recurses (summarize chunks → render → summarize the summaries) bounded by `max_merge_depth` (4) with non-convergence abort. The old "head exceeds summarizer window → abort" path is gone.
+- Snapshot-rollback subtask: already satisfied by P2-3's design — snapshot (read-only page walk) → summarize against snapshot → re-validate → single-transaction swap; the prior checkpoint stays active on any failure (no partial state to roll back from).
+- Tests `backend/tests/test_compaction.py` (33, +9 for P2-4): chunk-and-merge (multi-call merge round reads `summary:` pseudo-turns), single-turn-over-window abort, non-convergence abort, e2e compact chunk-and-merge on sqlite, breaker trip at 3 / timeout recovery (monkeypatched monotonic) / success reset, truncation fallback (degraded block + event + part markers, boundary math), truncation noop when all fits, trip→fallback→recover cycle.
+- Full suite: 264 passed, 16 skipped (Redis down); failures = the 6 known pre-existing only.
 
 ### P2-5 — Instant compaction (background)
-**Status:** `[ ]` · **Depends:** P2-3 · **Arch:** §8.2
+**Status:** `[x]` · **Depends:** P2-3 · **Arch:** §8.2
 **Subtasks:**
-- [ ] Background job refreshes running summaries as threads grow (`summary.refresh`, idempotent per thread).
-- [ ] Triggered compaction = instant swap; never user-facing wait.
-- [ ] Tests: cadence, triggered latency budget.
+- [x] Background job refreshes running summaries as threads grow (`summary.refresh`, idempotent per thread).
+- [x] Triggered compaction = instant swap; never user-facing wait.
+- [x] Tests: cadence, triggered latency budget.
 **Acceptance:** compaction adds no user-visible latency.
+**Notes:**
+- `backend/app/application/compaction/refresh.py`: `JOB_SUMMARY_REFRESH = "summary.refresh"`; `CompactionRefreshConfig(min_growth_turns=10, max_threads_per_run=50)`; `load_effective_tenant_config(db, tenant_row)` (single source of truth, now shared with the route — route `_load_effective_tenant_config` delegates to it, so API and worker read the published config identically); `refresh_thread_summary(db, tenant_id, thread_id, *, generator, config, request_id)` — idempotent: skips `thread_not_found` and `insufficient_growth` (page-walk `_count_since` bounded at 200; new turns < min_growth_turns → noop), else `CompactionService.compact()` → `{"refreshed", "reason", **compact_result}`; `find_stale_threads(db, config)`; `default_generator_builder(tenant_config, api_key)` → `LLMSummaryGenerator(create_llm_adapter(...))`.
+- `threads.py::list_threads_stale_for_compaction(since_seq_delta, limit)`: latest-message-seq subquery; filters `summary_position IS NOT NULL`, active, not archived, `latest_seq − summary_position >= since_seq_delta`; ordered by delta desc; returns rows + `latest_seq`.
+- `worker/handlers.py::handle_summary_refresh(payload, *, generator_builder=None)`: targeted when `tenant_id`+`thread_id` present, else sweep of stale threads; missing tenant → warning skip; `ProviderKeyNotFoundError` → warning skip (platform-managed keys hint); compaction failure raises → queue retry/DLQ; registered in `build_handlers()`; `request_id = f"summary-refresh:{thread_id}"`.
+- Route (`conversations.py`): preemptive trigger no longer compacts inline — `_build_compaction_callback` defers to the worker via `_defer_to_worker()` (`Job(type=JOB_SUMMARY_REFRESH, payload={tenant_id, thread_id})` + `idempotency_key=f"summary-refresh:{thread['id']}"`; queue-manager imports lazy inside the helper). Overflow recovery still compacts inline (one-shot, keeps the turn alive); reactive path compacts inline. Generate loop unchanged: `compacted_this_turn` still allows at most one inline compaction per turn.
+- Instant-swap property: the checkpoint swap itself was already single-transaction (P2-3); this phase moves the *expensive* generation off the request path — the deferred preemptive job refreshes the boundary before the next overflow hits, so when the inline overflow path finally triggers the head is small.
+- Tests `backend/tests/test_compaction_refresh.py` (10): refresh skip/noop/compact + idempotent-noop-after-compact (threshold `min_growth_turns=4` vs 3-turn post-compact growth), boundary math (15 msgs × 2 tokens, keep 6 → position 12), stale-query membership (in/out/archived-excluded), handler targeted/sweep/no-key-skip, job-type registration; `test_worker.py::TestHandlerRegistration` updated for the new handler. Stub generator + `_patch_worker_env` (monkeypatched `get_database_manager` + `ProviderKeyService.resolve`); tenant rows must carry UUID-shaped ids (`TenantConfig.id` validates).
+- Full suite: 273 passed, 16 skipped (Redis down); failures = the 6 known pre-existing only.
 
 ### P2-6 — Cache discipline
-**Status:** `[ ]` · **Depends:** P2-3 · **Arch:** §8.2, §10
+**Status:** `[x]` · **Depends:** P2-3 · **Arch:** §8.2, §10
 **Subtasks:**
-- [ ] Summary block at stable position (after system), immutable for next K turns; favor removing superseded content + appending immutable blocks over full rewrites.
-- [ ] `cache_control` markers on stable prefixes where providers support it; per-tenant hit-rate metric.
-- [ ] Tests: cache-prefix stability across compactions.
+- [x] Summary block at stable position (after system), immutable for next K turns; favor removing superseded content + appending immutable blocks over full rewrites.
+- [x] `cache_control` markers on stable prefixes where providers support it; per-tenant hit-rate metric.
+- [x] Tests: cache-prefix stability across compactions.
 **Acceptance:** prompt-cache prefix survives compaction boundaries; hit rate measured.
+**Notes:**
+- **Layered summary blocks.** The checkpoint is now a stack of immutable layers (`summary_block["layers"] = [{position, content, payload}...]`); the assembler renders ONE system message per layer (header on layer 1 only). A compaction APPENDS a layer covering only the turns after the previous boundary (`head_slice`), so every earlier message stays byte-identical across the swap — the prompt-cache prefix survives the boundary. `content` = `"\n\n".join(layer contents)` (backward-compatible hot-tier reads); `payload` = last layer's payload. Legacy blocks (no `layers` key) degrade to a single layer so the next compaction appends instead of rewriting; degraded truncation clears the stack (`layers: []`).
+- **Consolidation bound.** At `CompactionConfig.max_summary_layers` (5) the summary is consolidated into a single rewritten layer summarizing the ENTIRE head (chunk-and-merge handles any size) — a full cache-breaking rewrite, bounded to at most once per N boundaries. The assembler renders the summary whole-or-not-at-all (a partial layer set would shift the tail prefix between turns).
+- **Idempotent checkpoints.** A compact with no turns beyond the boundary is now a noop (previously it re-summarized the whole head and bumped the version, rewriting the summary every trigger). `test_compact_version_bump_on_second_checkpoint` was updated to `..._only_on_growth`.
+- **`cache_control` markers.** `SessionContextLoader(cache_markers=...)` (settings `PROMPT_CACHE_MARKERS_ENABLED`, default on) marks the stable prefix — system message + summary layer messages — with `metadata = {"cache_control": {"type": "ephemeral"}}`; the orchestrator carries it onto `LLMMessage.metadata`. `AnthropicAdapter`: system messages now emit as text blocks with ephemeral breakpoints on marked blocks (string-joined form when unmarked); per-message markers emit content-block form. **Bugfix:** the adapter previously dropped ALL system messages but the last (system + knowledge + layers → only the last reached the API); all are now preserved. OpenAI/Azure/Gemini ignore markers (automatic prefix caching; `cached_tokens` already captured in usage).
+- **Per-tenant hit-rate metric.** `backend/app/context/metrics.py`: `PromptCacheMetricsCollector` — per (tenant, provider) counters of input/cached tokens; provider-normalized hit rate (Anthropic: `cached/(input+cached)` since input excludes cache reads; OpenAI family: `cached/input` since prompt_tokens includes them; clamped 0..1); per-request structlog `prompt_cache_hit_rate` line; `snapshot()`/`snapshot_all()`; wired into orchestration `_record_usage` (failures never break the turn; Redis-shared in P3-4).
+- Tests `backend/tests/test_cache_discipline.py` (15): per-layer rendering, byte-stable prefix across a boundary (system + layer 1 identical before/after; tail moves), legacy single-layer fallback, whole-block omission, markers on/off, e2e append (first layer byte-identical, second compact summarizes only growth seqs 6..9), consolidation at cap (single layer, full-head re-summarize), truncation clears layers, legacy-block migration to layers, Anthropic wire format ×3 (blocks+markers / joined multi-system / chat-message block form), metric normalization + aggregation + reset, orchestration end-to-end (layers + markers reach `LLMMessage`). `test_context_assembler.py::test_system_prefix_stable_across_turns` updated for the metadata key.
+- Full suite: 289 passed, 16 skipped (Redis down); failures = the 6 known pre-existing only.
 
 ### P2-7 — Tool-result clearing (+ thinking clearing)
 **Status:** `[ ]` · **Depends:** P2-1 · **Arch:** §8.3

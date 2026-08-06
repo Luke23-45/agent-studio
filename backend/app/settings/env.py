@@ -102,6 +102,37 @@ class Settings(BaseSettings):
     ADMISSION_WAIT_SECONDS: float = 5.0
     ADMISSION_LEASE_SECONDS: int = 300
 
+    # Session coordinator (per-thread serialization; queueing budget)
+    SESSION_LEASE_SECONDS: int = 120
+    SESSION_WAIT_SECONDS: float = 15.0
+
+    # Context assembler (Arch 8.1, P2-1): token reserve kept free for model
+    # output when budgeting the prompt (mirrors OpenCode v2's output buffer).
+    CONTEXT_OUTPUT_RESERVE_TOKENS: int = 4096
+
+    # Prompt-cache discipline (Arch 8.2, P2-6): when enabled, the assembler
+    # marks the stable prefix (system + immutable summary layers) with
+    # cache_control metadata; providers that support markers (Anthropic)
+    # receive them on the wire, others cache automatically.
+    PROMPT_CACHE_MARKERS_ENABLED: bool = True
+
+    # Hot tier (Redis thread tail): TTL = session timeout, tail size
+    SESSION_TTL_SECONDS: int = 86400
+    SESSION_TAIL_SIZE: int = 10
+
+    # End-user session tokens (Arch 6.4): Fernet bearer tokens, DB-revoked
+    SESSION_TOKEN_TTL_SECONDS: int = 43200
+    SESSION_TOKEN_ENCRYPTION_KEY: str | None = None
+    SESSION_TOKEN_ENCRYPTION_KEY_FILE: str = "session_token.key"
+
+    # End-user abuse limits (Redis; per-user rate/spend/concurrency)
+    END_USER_RATE_MAX_REQUESTS: int = 300
+    END_USER_RATE_WINDOW_SECONDS: float = 60.0
+    END_USER_MAX_CONCURRENT_SESSIONS: int = 5
+    END_USER_SESSION_LEASE_SECONDS: int = 3600
+    # 0 = unlimited by default; enforce when > 0 (per tenant can override)
+    END_USER_SPEND_CAP_TOKENS: int = 0
+
     # Provider credential encryption (envelope, KMS-ready)
     # Fernet key (urlsafe base64); KMS-injected in production.
     PROVIDER_KEY_ENCRYPTION_KEY: str | None = None

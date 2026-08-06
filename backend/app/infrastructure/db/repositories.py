@@ -12,19 +12,23 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import delete, func, select, update
+from sqlalchemy.exc import IntegrityError
 
 from .manager import DatabaseManager
 from .models import (
     ApiKeyModel,
     AuditEventModel,
     ConversationModel,
+    EndUserModel,
     EscalationModel,
     GuardrailEvidenceModel,
     MessageModel,
     ModelCatalogModel,
     PolicyRuleModel,
     PolicySetModel,
+    SessionTokenModel,
     SpendEventModel,
+    SurfaceModel,
     TenantModel,
     TenantConfigVersionModel,
     TenantProviderKeyModel,
@@ -41,7 +45,10 @@ def _now() -> datetime:
 
 
 def _row_to_dict(row: Any) -> dict[str, Any]:
-    return {c.name: getattr(row, c.name) for c in row.__table__.columns}
+    return {
+        attr.key: getattr(row, attr.key)
+        for attr in row.__mapper__.column_attrs
+    }
 
 
 class TenantRepository:
@@ -634,6 +641,250 @@ class EscalationRepository:
                 delete(EscalationModel).where(EscalationModel.tenant_id == tenant_id)
             )
             return result.rowcount or 0
+
+
+class EndUserRepository:
+    """End-user identity rows (Arch 6.4, P1-8). Identity never crosses tenants."""
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def get_by_id(self, tenant_id: str, end_user_id: str) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(EndUserModel).where(
+                    EndUserModel.tenant_id == tenant_id,
+                    EndUserModel.id == end_user_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def get_or_create_anonymous(
+        self,
+        tenant_id: str,
+        anonymous_identity: str,
+        display_name: str | None = None,
+    ) -> dict[str, Any]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(EndUserModel).where(
+                    EndUserModel.tenant_id == tenant_id,
+                    EndUserModel.anonymous_identity == anonymous_identity,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is not None:
+                return _row_to_dict(row)
+            model = EndUserModel(
+                id=str(uuid4()),
+                tenant_id=tenant_id,
+                anonymous_identity=anonymous_identity,
+                display_name=display_name,
+                status="active",
+            )
+            session.add(model)
+            try:
+                await session.flush()
+            except IntegrityError:
+                await session.rollback()
+                result = await session.execute(
+                    select(EndUserModel).where(
+                        EndUserModel.tenant_id == tenant_id,
+                        EndUserModel.anonymous_identity == anonymous_identity,
+                    )
+                )
+                row = result.scalar_one_or_none()
+                if row is None:
+                    raise
+                return _row_to_dict(row)
+            return _row_to_dict(model)
+
+    async def create_authenticated(
+        self,
+        tenant_id: str,
+        external_id: str,
+        display_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Register a tenant-issued end user (authenticated exchange, P1-8)."""
+        async with self.db.get_session() as session:
+            model = EndUserModel(
+                id=str(uuid4()),
+                tenant_id=tenant_id,
+                external_id=external_id,
+                display_name=display_name,
+                status="active",
+            )
+            session.add(model)
+            await session.flush()
+            return _row_to_dict(model)
+
+
+class SessionTokenRepository:
+    """Durable session-token registry (Arch 6.4, P1-8)."""
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def create(
+        self,
+        jti: str,
+        tenant_id: str,
+        end_user_id: str,
+        *,
+        surface_id: str | None = None,
+        device_id: str | None = None,
+        scopes: list[str] | None = None,
+        expires_at: datetime,
+    ) -> dict[str, Any]:
+        async with self.db.get_session() as session:
+            model = SessionTokenModel(
+                id=jti,
+                tenant_id=tenant_id,
+                end_user_id=end_user_id,
+                surface_id=surface_id,
+                device_id=device_id,
+                scopes=scopes or [],
+                expires_at=expires_at,
+            )
+            session.add(model)
+            await session.flush()
+            return _row_to_dict(model)
+
+    async def get(self, jti: str) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(SessionTokenModel).where(SessionTokenModel.id == jti)
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def revoke(self, jti: str) -> bool:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                update(SessionTokenModel)
+                .where(SessionTokenModel.id == jti, SessionTokenModel.revoked_at.is_(None))
+                .values(revoked_at=_now())
+            )
+            return (result.rowcount or 0) > 0
+
+    async def prune_expired(self, tenant_id: str, before: datetime) -> int:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                delete(SessionTokenModel).where(
+                    SessionTokenModel.tenant_id == tenant_id,
+                    SessionTokenModel.expires_at < before,
+                    SessionTokenModel.revoked_at.is_not(None),
+                )
+            )
+            return result.rowcount or 0
+
+
+class SurfaceRepository:
+    """Per-tenant surfaces (Arch 6.1, P1-9). Governance-owned rows."""
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def create(
+        self,
+        tenant_id: str,
+        name: str,
+        *,
+        surface_type: str = "widget",
+        persona: str | None = None,
+        knowledge_allowlist: list[str] | None = None,
+        tool_allowlist: list[str] | None = None,
+        model_pin: str | None = None,
+        budgets: dict[str, Any] | None = None,
+        brand_voice_override: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        async with self.db.get_session() as session:
+            model = SurfaceModel(
+                id=str(uuid4()),
+                tenant_id=tenant_id,
+                name=name,
+                surface_type=surface_type,
+                persona=persona,
+                knowledge_allowlist=knowledge_allowlist or [],
+                tool_allowlist=tool_allowlist or [],
+                model_pin=model_pin,
+                budgets=budgets or {},
+                brand_voice_override=brand_voice_override,
+                active=True,
+            )
+            session.add(model)
+            await session.flush()
+            return _row_to_dict(model)
+
+    async def get(self, tenant_id: str, surface_id: str) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(SurfaceModel).where(
+                    SurfaceModel.tenant_id == tenant_id,
+                    SurfaceModel.id == surface_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def get_default(self, tenant_id: str) -> dict[str, Any] | None:
+        """First active surface (tenant onboarding default)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(SurfaceModel)
+                .where(SurfaceModel.tenant_id == tenant_id, SurfaceModel.active.is_(True))
+                .order_by(SurfaceModel.created_at.asc())
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def list_by_tenant(self, tenant_id: str) -> list[dict[str, Any]]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(SurfaceModel)
+                .where(SurfaceModel.tenant_id == tenant_id)
+                .order_by(SurfaceModel.created_at.asc())
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def update(
+        self,
+        tenant_id: str,
+        surface_id: str,
+        **fields: Any,
+    ) -> dict[str, Any] | None:
+        allowed = {
+            "name", "surface_type", "persona", "knowledge_allowlist",
+            "tool_allowlist", "model_pin", "budgets", "brand_voice_override",
+            "active",
+        }
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(SurfaceModel).where(
+                    SurfaceModel.tenant_id == tenant_id,
+                    SurfaceModel.id == surface_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            for key, value in fields.items():
+                if key in allowed:
+                    setattr(row, key, value)
+            await session.flush()
+            return _row_to_dict(row)
+
+    async def delete(self, tenant_id: str, surface_id: str) -> bool:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                delete(SurfaceModel).where(
+                    SurfaceModel.tenant_id == tenant_id,
+                    SurfaceModel.id == surface_id,
+                )
+            )
+            return (result.rowcount or 0) > 0
 
 
 class PolicyRepository:

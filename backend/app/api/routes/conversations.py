@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from backend.app.adapters.dlp import get_pii_service
+from backend.app.adapters.llm import LLMConfig, LLMProviderType, create_llm_adapter
 from backend.app.adapters.tracing import get_langfuse_adapter
 from backend.app.api.dependencies.auth import (
     ApiKeyPrincipal,
@@ -29,8 +30,17 @@ from backend.app.api.dependencies.auth import (
     get_rate_limiter,
     require_permission,
 )
+from backend.app.api.dependencies.session import (
+    ConversationPrincipal,
+    get_conversation_principal,
+)
+from backend.app.application.compaction import (
+    CompactionService,
+    LLMSummaryGenerator,
+)
 from backend.app.application.orchestration import create_orchestration_service
 from backend.app.application.retrieval import create_retrieval_service
+from backend.app.context import ContextTurn, TokenEstimator
 from backend.app.domain.policy import PolicySet
 from backend.app.domain.tenant import TenantConfig
 from backend.app.gateway.admission import (
@@ -47,8 +57,10 @@ from backend.app.infrastructure.db import (
     SpendEventRepository,
     TenantConfigVersionRepository,
     TenantRepository,
+    ThreadRepository,
     get_database_manager,
 )
+from backend.app.context import ContextTurn
 from backend.app.modules.escalation import create_escalation_service
 from backend.app.modules.guardrails import get_guardrails_service
 from backend.app.modules.rag import create_rag_service
@@ -61,6 +73,9 @@ from backend.app.modules.tenant_config import (
     policy_set_from_db,
     tenant_config_from_data,
 )
+from backend.app.session.coordinator import CoordinatorBusy, get_thread_coordinator
+from backend.app.session.hot_tier import get_thread_tail_cache
+from backend.app.session.limits import get_end_user_limits
 from backend.app.settings.env import settings
 from backend.app.settings.feature_flags import feature_flags
 
@@ -87,6 +102,7 @@ class ConversationResponse(BaseModel):
     session_id: str
     citations: list[dict] = Field(default_factory=list)
     faithfulness: dict | None = None
+    thread_id: str | None = None
 
 
 class PrincipalResponse(BaseModel):
@@ -145,15 +161,78 @@ async def _load_effective_tenant_config(
     The tenant row is the base; a published config version (if any)
     overrides it, so publish/rollback change runtime behavior without
     touching the tenant row. No published version -> the row is
-    authoritative.
+    authoritative. Shared with the background worker (P2-5).
     """
-    config = tenant_config_from_data(tenant_row)
-    published = await TenantConfigVersionRepository(db).get_latest_published(
-        str(config.id)
+    from backend.app.application.compaction.refresh import (
+        load_effective_tenant_config as _shared_load,
     )
-    if published:
-        return tenant_config_from_data({**tenant_row, **published["config"]})
-    return config
+
+    return await _shared_load(db, tenant_row)
+
+
+def _assert_conversation_tenant(
+    principal: ConversationPrincipal, tenant_config: TenantConfig
+) -> None:
+    """Session tokens are scoped to exactly one tenant; API keys RBAC-checked."""
+    if principal.tenant_id and principal.tenant_id != str(tenant_config.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="principal is scoped to a different tenant",
+        )
+
+
+async def _bind_thread(
+    db: Any,
+    tenant_config: TenantConfig,
+    conversation_id: str,
+    principal: ConversationPrincipal,
+    surface_id: str | None = None,
+) -> dict[str, Any]:
+    """Bind the durable thread to the conversation (Arch 7.1, P1-10)."""
+    return await ThreadRepository(db).get_or_create_for_conversation(
+        str(tenant_config.id),
+        conversation_id,
+        surface_id=surface_id or principal.surface_id,
+        end_user_id=principal.end_user_id,
+    )
+
+
+async def _resolve_request_surface(
+    db: Any, tenant_config: TenantConfig, principal: ConversationPrincipal
+) -> dict[str, Any] | None:
+    """Resolve + validate the request surface (Arch 6.1, P1-9).
+
+    Session-token requests resolve the token's surface (or the tenant's
+    default when the token carries none) and DENY when no active surface
+    exists (P0-4 default-deny). API-key requests are unconstrained.
+    """
+    from backend.app.api.routes.surfaces import resolve_surface
+
+    if not principal.is_session:
+        return None
+    surface = await resolve_surface(str(tenant_config.id), principal.surface_id)
+    if surface is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="No active surface configured for this request",
+        )
+    return surface
+
+
+async def _refresh_hot_tail(
+    db: Any,
+    tenant_id: str,
+    thread_id: str,
+    summary: dict[str, Any] | None = None,
+) -> None:
+    """Push the durable tail into the Redis hot tier; never fatal."""
+    try:
+        rows = await ThreadRepository(db).read_tail(tenant_id, thread_id, limit=10)
+        await get_thread_tail_cache().cache_tail(
+            tenant_id, thread_id, rows, summary=summary
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("hot_tail_refresh_failed", thread_id=thread_id, error=str(e))
 
 
 @router.get("/auth/me", response_model=PrincipalResponse)
@@ -263,13 +342,15 @@ class EscalationResponse(BaseModel):
 async def process_conversation(
     request: ConversationRequest,
     request_ctx: Request,
-    principal: ApiKeyPrincipal = Depends(require_permission("conversations:read")),
+    principal: ConversationPrincipal = Depends(get_conversation_principal),
 ):
     """Process a conversation message.
 
     Idempotent when the client sends an ``Idempotency-Key`` header: the
     first response is stored and replayed verbatim for repeat requests
-    (matrix 1.7).
+    (matrix 1.7). The user turn is also written to the durable thread
+    with the key as its request_id, so a lost response can never
+    double-write (P1-2 dedup).
     """
     idempotency_key = request_ctx.headers.get("Idempotency-Key")
     if idempotency_key:
@@ -301,7 +382,7 @@ async def process_conversation(
         )
 
     tenant_config = await _load_effective_tenant_config(db, tenant_row)
-    assert_tenant_access(principal, tenant_config.id)
+    _assert_conversation_tenant(principal, tenant_config)
 
     # Langfuse tracing for the request pipeline (flag + credentials gated)
     trace = None
@@ -344,6 +425,16 @@ async def process_conversation(
             ),
         )
 
+    # Durable thread (Arch 7.1): the append-only log is the source of truth
+    # for history; the conversation row remains the v1 projection.
+    threads = ThreadRepository(db)
+    surface = await _resolve_request_surface(db, tenant_config, principal)
+    thread = await _bind_thread(
+        db, tenant_config, conversation["id"], principal,
+        surface_id=surface["id"] if surface else None,
+    )
+    request_id = idempotency_key or f"req-{uuid4()}"
+
     # PII redaction (fail-closed: refuse to process when Presidio is enabled
     # but unavailable)
     if feature_flags.ENABLE_PRESIDIO:
@@ -361,6 +452,16 @@ async def process_conversation(
         pii_result = None
         redacted_message = request.message
 
+    user_turn = await threads.append_message(
+        str(tenant_config.id),
+        thread["id"],
+        role="user",
+        content=request.message,
+        redacted_content=redacted_message,
+        conversation_id=conversation["id"],
+        request_id=request_id,
+        end_user_id=principal.end_user_id,
+    )
     await conversation_repo.add_message(
         conversation["id"], "user", request.message,
         redacted_content=redacted_message,
@@ -407,6 +508,17 @@ async def process_conversation(
             "I cannot help with that request.",
             metadata={"blocked": True, "violations": input_validation["violations"]},
         )
+        await threads.append_message(
+            str(tenant_config.id),
+            thread["id"],
+            role="assistant",
+            content="I cannot help with that request.",
+            redacted_content="I cannot help with that request.",
+            conversation_id=conversation["id"],
+            parent_message_id=user_turn["id"],
+            metadata={"blocked": True, "violations": input_validation["violations"]},
+        )
+        await _refresh_hot_tail(db, str(tenant_config.id), thread["id"])
         if trace:
             adapter.update(
                 trace,
@@ -418,6 +530,7 @@ async def process_conversation(
             confidence=1.0,
             handoff_required=False,
             session_id=session_id,
+            thread_id=thread["id"],
         )
         if idempotency_key:
             await _store_idempotent_response(
@@ -435,6 +548,13 @@ async def process_conversation(
     provider, model_override = await _resolve_catalog_model(
         tenant_config, request.message
     )
+    if surface and surface.get("model_pin"):
+        pin = surface["model_pin"]
+        if ":" in pin:
+            pin_provider, pin_model = pin.split(":", 1)
+            provider, model_override = pin_provider.strip(), pin_model.strip()
+        else:
+            model_override = pin.strip()
 
     # Resolve the LLM API key for the tenant's configured provider
     llm_api_key = await _resolve_llm_api_key(tenant_config, db)
@@ -449,8 +569,11 @@ async def process_conversation(
     )
 
     retrieval_service = _get_retrieval_service(tenant_config.id)
-    conversation_history = await _load_conversation_history(
-        conversation_repo, conversation["id"], exclude_latest=True
+    history_turns = await _load_history_turns(
+        threads, thread["id"], str(tenant_config.id), exclude_latest=True
+    )
+    context_summary, context_summary_position, context_summary_layers = (
+        await _load_thread_summary(threads, thread["id"], str(tenant_config.id))
     )
 
     orchestration = create_orchestration_service(
@@ -461,9 +584,28 @@ async def process_conversation(
         escalation_service=escalation_service,
         model_override=model_override,
     )
+    orchestration.compaction_callback = _build_compaction_callback(
+        db,
+        threads,
+        tenant_config,
+        llm_api_key,
+        provider,
+        model_override or tenant_config.default_model,
+        thread,
+    )
     orchestration.evidence_callback = lambda record: evidence_repo.add(record)
     spend_repo = SpendEventRepository(db)
-    orchestration.usage_callback = lambda record: spend_repo.add(record)
+    end_user_limits = get_end_user_limits()
+
+    async def _usage(record: dict[str, Any]) -> None:
+        await spend_repo.add(record)
+        if principal.end_user_id:
+            await end_user_limits.record_spend(
+                str(tenant_config.id), principal.end_user_id,
+                float(record.get("input_tokens", 0) + record.get("output_tokens", 0)),
+            )
+
+    orchestration.usage_callback = _usage
 
     orchestration_span = (
         adapter.create_span(
@@ -471,12 +613,25 @@ async def process_conversation(
             "orchestration",
             input={
                 "message": request.message,
-                "history_turns": len(conversation_history),
+                "history_turns": len(history_turns),
             },
         )
         if trace
         else None
     )
+
+    # Session coordinator (Arch 7.2, P1-3): at most one in-flight
+    # generation per thread; concurrent messages queue in sequence order.
+    try:
+        thread_lease = await get_thread_coordinator().acquire(
+            str(tenant_config.id), thread["id"]
+        )
+    except CoordinatorBusy:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            headers={"Retry-After": "15"},
+            detail="Another message is being processed for this thread. Try again shortly.",
+        ) from None
 
     # Admission control (Arch 10): bound concurrent in-flight generations
     # per tenant and platform-wide; excess requests get 429 + Retry-After.
@@ -484,6 +639,7 @@ async def process_conversation(
     try:
         admission_handle = await admission_gate.admit(tenant_config.id)
     except AdmissionLimitExceeded as e:
+        await thread_lease.release()
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             headers={"Retry-After": str(int(e.retry_after))},
@@ -496,8 +652,11 @@ async def process_conversation(
             user_message=request.message,
             redacted_message=redacted_message,
             session_id=session_id,
-            conversation_history=conversation_history,
+            conversation_history=history_turns,
             context={"conversation_id": conversation["id"]},
+            context_summary=context_summary,
+            context_summary_position=context_summary_position,
+            context_summary_layers=context_summary_layers,
         )
         if orchestration_span:
             orchestration_span.end(
@@ -537,6 +696,20 @@ async def process_conversation(
                 "handoff_required": handoff_required,
             },
         )
+        await threads.append_message(
+            str(tenant_config.id),
+            thread["id"],
+            role="assistant",
+            content=response_raw,
+            redacted_content=response_text,
+            conversation_id=conversation["id"],
+            parent_message_id=user_turn["id"],
+            metadata={
+                "confidence": result.get("confidence", 0.0),
+                "handoff_required": handoff_required,
+            },
+        )
+        await _refresh_hot_tail(db, str(tenant_config.id), thread["id"])
         if handoff_required:
             await conversation_repo.mark_escalated(conversation["id"])
 
@@ -558,6 +731,7 @@ async def process_conversation(
             session_id=session_id,
             citations=result.get("citations") or [],
             faithfulness=result.get("context", {}).get("faithfulness"),
+            thread_id=thread["id"],
         )
         if idempotency_key:
             await _store_idempotent_response(
@@ -589,6 +763,8 @@ async def process_conversation(
         )
     finally:
         await admission_handle.release()
+        await thread_lease.release()
+        await thread_lease.release()
 
 
 def _sse(event: str, data: dict) -> str:
@@ -672,7 +848,8 @@ async def _resolve_catalog_model(
 @router.post("/conversations/stream")
 async def stream_conversation(
     request: ConversationRequest,
-    principal: ApiKeyPrincipal = Depends(require_permission("conversations:read")),
+    request_ctx: Request,
+    principal: ConversationPrincipal = Depends(get_conversation_principal),
 ):
     """Stream a conversation response over Server-Sent Events.
 
@@ -685,6 +862,7 @@ async def stream_conversation(
 
     logger.info("conversation_stream_request", tenant_slug=request.tenant_slug)
     session_id = request.session_id or str(uuid4())
+    idempotency_key = request_ctx.headers.get("Idempotency-Key")
 
     db = get_database_manager()
     tenant_repo = TenantRepository(db)
@@ -696,7 +874,7 @@ async def stream_conversation(
         )
 
     tenant_config = await _load_effective_tenant_config(db, tenant_row)
-    assert_tenant_access(principal, tenant_config.id)
+    _assert_conversation_tenant(principal, tenant_config)
 
     await get_rate_limiter().acquire_multi_or_raise(
         [
@@ -719,6 +897,15 @@ async def stream_conversation(
             ),
         )
 
+    # Durable thread (Arch 7.1): append-only source of truth.
+    threads = ThreadRepository(db)
+    surface = await _resolve_request_surface(db, tenant_config, principal)
+    thread = await _bind_thread(
+        db, tenant_config, conversation["id"], principal,
+        surface_id=surface["id"] if surface else None,
+    )
+    request_id = idempotency_key or f"req-{uuid4()}"
+
     if feature_flags.ENABLE_PRESIDIO:
         try:
             pii_service = get_pii_service()
@@ -729,6 +916,16 @@ async def stream_conversation(
     else:
         redacted_message = request.message
 
+    user_turn = await threads.append_message(
+        str(tenant_config.id),
+        thread["id"],
+        role="user",
+        content=request.message,
+        redacted_content=redacted_message,
+        conversation_id=conversation["id"],
+        request_id=request_id,
+        end_user_id=principal.end_user_id,
+    )
     await conversation_repo.add_message(
         conversation["id"], "user", request.message, redacted_content=redacted_message
     )
@@ -752,25 +949,55 @@ async def stream_conversation(
         escalation_repository=escalation_repository,
     )
     retrieval_service = _get_retrieval_service(tenant_config.id)
-    conversation_history = await _load_conversation_history(
-        conversation_repo, conversation["id"], exclude_latest=True
+    history_turns = await _load_history_turns(
+        threads, thread["id"], str(tenant_config.id), exclude_latest=True
+    )
+    context_summary, context_summary_position, context_summary_layers = (
+        await _load_thread_summary(threads, thread["id"], str(tenant_config.id))
     )
 
-    _, model_override = await _resolve_catalog_model(tenant_config, request.message)
+    provider, model_override = await _resolve_catalog_model(tenant_config, request.message)
+    if surface and surface.get("model_pin"):
+        pin = surface["model_pin"]
+        if ":" in pin:
+            pin_provider, pin_model = pin.split(":", 1)
+            provider, model_override = pin_provider.strip(), pin_model.strip()
+        else:
+            model_override = pin.strip()
+    llm_api_key = await _resolve_llm_api_key(tenant_config, db)
     orchestration = create_orchestration_service(
         tenant_config=tenant_config,
         policy_set=policy_set,
-        llm_api_key=await _resolve_llm_api_key(tenant_config, db),
+        llm_api_key=llm_api_key,
         retrieval_service=retrieval_service,
         escalation_service=escalation_service,
         model_override=model_override,
     )
+    orchestration.compaction_callback = _build_compaction_callback(
+        db,
+        threads,
+        tenant_config,
+        llm_api_key,
+        provider,
+        model_override or tenant_config.default_model,
+        thread,
+    )
     orchestration.evidence_callback = lambda record: evidence_repo.add(record)
     spend_repo = SpendEventRepository(db)
-    orchestration.usage_callback = lambda record: spend_repo.add(record)
+    end_user_limits = get_end_user_limits()
+
+    async def _usage(record: dict[str, Any]) -> None:
+        await spend_repo.add(record)
+        if principal.end_user_id:
+            await end_user_limits.record_spend(
+                str(tenant_config.id), principal.end_user_id,
+                float(record.get("input_tokens", 0) + record.get("output_tokens", 0)),
+            )
+
+    orchestration.usage_callback = _usage
 
     async def event_generator():
-        yield _sse("session", {"session_id": session_id})
+        yield _sse("session", {"session_id": session_id, "thread_id": thread["id"]})
         yield _sse(
             "guardrails",
             {
@@ -791,12 +1018,42 @@ async def stream_conversation(
                 "I cannot help with that request.",
                 metadata={"blocked": True, "violations": input_validation["violations"]},
             )
+            await threads.append_message(
+                str(tenant_config.id),
+                thread["id"],
+                role="assistant",
+                content="I cannot help with that request.",
+                redacted_content="I cannot help with that request.",
+                conversation_id=conversation["id"],
+                parent_message_id=user_turn["id"],
+                metadata={"blocked": True, "violations": input_validation["violations"]},
+            )
+            await _refresh_hot_tail(db, str(tenant_config.id), thread["id"])
             yield _sse(
                 "result",
                 {
                     "response": "I cannot help with that request.",
                     "confidence": 1.0,
                     "handoff_required": False,
+                    "thread_id": thread["id"],
+                },
+            )
+            return
+
+        # Session coordinator (Arch 7.2): per-thread serialization; the
+        # queue waits in sequence order and reports an SSE error on timeout.
+        try:
+            thread_lease = await get_thread_coordinator().acquire(
+                str(tenant_config.id), thread["id"]
+            )
+        except CoordinatorBusy:
+            yield _sse(
+                "error",
+                {
+                    "error": (
+                        "Another message is being processed for this thread. "
+                        "Retry in 15s."
+                    )
                 },
             )
             return
@@ -806,6 +1063,7 @@ async def stream_conversation(
         try:
             admission_handle = await get_admission_gate().admit(tenant_config.id)
         except AdmissionLimitExceeded as e:
+            await thread_lease.release()
             yield _sse(
                 "error",
                 {
@@ -822,8 +1080,11 @@ async def stream_conversation(
                 user_message=request.message,
                 redacted_message=redacted_message,
                 session_id=session_id,
-                conversation_history=conversation_history,
+                conversation_history=history_turns,
                 context={"conversation_id": conversation["id"]},
+                context_summary=context_summary,
+                context_summary_position=context_summary_position,
+                context_summary_layers=context_summary_layers,
             ):
                 if event["type"] == "delta":
                     yield _sse("delta", {"content": event["content"]})
@@ -858,6 +1119,21 @@ async def stream_conversation(
                     "streamed": True,
                 },
             )
+            await threads.append_message(
+                str(tenant_config.id),
+                thread["id"],
+                role="assistant",
+                content=response_raw,
+                redacted_content=response_text,
+                conversation_id=conversation["id"],
+                parent_message_id=user_turn["id"],
+                metadata={
+                    "confidence": result.get("confidence", 0.0),
+                    "handoff_required": handoff_required,
+                    "streamed": True,
+                },
+            )
+            await _refresh_hot_tail(db, str(tenant_config.id), thread["id"])
             if handoff_required:
                 await conversation_repo.mark_escalated(conversation["id"])
 
@@ -869,6 +1145,7 @@ async def stream_conversation(
                     "handoff_required": handoff_required,
                     "citations": result.get("citations") or [],
                     "faithfulness": result.get("faithfulness"),
+                    "thread_id": thread["id"],
                 },
             )
         except HTTPException:
@@ -878,6 +1155,7 @@ async def stream_conversation(
             yield _sse("error", {"error": str(e)})
         finally:
             await admission_handle.release()
+            await thread_lease.release()
 
     return StreamingResponse(
         event_generator(),
@@ -897,30 +1175,179 @@ async def _load_or_create_policy_set(db, tenant_config: TenantConfig) -> PolicyS
     return PolicySet(tenant_id=tenant_config.id, name="default", rules=[])
 
 
-async def _load_conversation_history(
-    conversation_repo: ConversationRepository,
-    conversation_id: str,
+async def _load_history_turns(
+    threads: ThreadRepository,
+    thread_id: str,
+    tenant_id: str,
     exclude_latest: bool = True,
-    limit: int = 30,
-) -> list[dict[str, str]]:
-    """Load prior turns for session memory. The latest message is the one
-    currently being processed, so it is excluded by default.
+    limit: int = 200,
+) -> list[ContextTurn]:
+    """Load prior turns for session memory from the durable thread log.
 
-    Serves the redacted column only (Arch 8.1, P0-5): the model context is
-    redacted-only by construction; raw content is reachable only through
-    access-controlled review/DSR paths.
+    The latest message is the one currently being processed, so it is
+    excluded by default. Serves the redacted column ONLY (Arch 8.1,
+    P0-5): turns without redacted content are skipped (fail closed) --
+    raw content never reaches the model context. The read window is a
+    page size, not a model-visible slice: the SessionContextLoader
+    trims to the model's token budget (P2-1).
     """
-    messages = await conversation_repo.list_messages(conversation_id, limit=limit)
-    if exclude_latest and messages:
-        messages = messages[:-1]
+    rows = await threads.read_tail(tenant_id, thread_id, limit=limit + 1)
+    if exclude_latest and rows:
+        rows = rows[:-1]
     return [
-        {
-            "role": m["role"],
-            "content": m.get("redacted_content") or m["content"],
-        }
-        for m in messages
-        if m["role"] in ("user", "assistant")
+        ContextTurn(
+            role=m["role"],
+            content=m["redacted_content"] or "",
+            seq=m.get("seq"),
+            message_id=m.get("id"),
+        )
+        for m in rows
+        if m["role"] in ("user", "assistant") and m.get("redacted_content")
     ]
+
+
+async def _load_thread_summary(
+    threads: ThreadRepository,
+    thread_id: str,
+    tenant_id: str,
+) -> tuple[str | None, int | None, list[dict[str, Any]] | None]:
+    """Load the compaction checkpoint (Arch 8.2) for a thread.
+
+    Returns ``(content, position, layers)``. Hot tier first (TTL-promoted
+    fast path), then the durable thread row. The summary is written only by
+    the compactor and is immutable once pinned (summary_version); read-only
+    here. ``position`` = seq of the last summarized message: the assembler
+    replaces every turn with ``seq <= position`` by the summary block.
+    ``layers`` (P2-6) are the byte-stable summary layers; None when the
+    block predates layering (assembler falls back to ``content``).
+    """
+    cached = await get_thread_tail_cache().get_tail(tenant_id, thread_id)
+    if cached:
+        block = cached.get("summary") or {}
+        if block.get("content"):
+            return (
+                block["content"],
+                block.get("position"),
+                block.get("layers") or None,
+            )
+    row = await threads.get_thread(tenant_id, thread_id)
+    if not row:
+        return None, None, None
+    block = row.get("summary_block")
+    if isinstance(block, dict):
+        return (
+            block.get("content"),
+            row.get("summary_position"),
+            block.get("layers") or None,
+        )
+    return (block or None), row.get("summary_position"), None
+
+
+def _build_compaction_callback(
+    db: Any,
+    threads: ThreadRepository,
+    tenant_config: TenantConfig,
+    llm_api_key: str,
+    provider: str,
+    summarizer_model: str,
+    thread: dict[str, Any],
+) -> Any:
+    """Build the orchestration compaction hook (Arch 8.2, P2-3/P2-5).
+
+    Preemptive triggers defer to the background ``summary.refresh`` worker
+    job (P2-5: the turn keeps moving — no user-facing wait; the worker
+    performs the summarization and the next trigger is an instant swap).
+    Overflow requests (one-shot recovery path) compact inline — a rare
+    failure path where a synchronous checkpoint is the only option.
+    Failures return None so the turn continues un-compacted — compaction
+    never breaks a turn.
+    """
+    compaction = CompactionService(
+        threads=threads,
+        generator=LLMSummaryGenerator(
+            adapter=create_llm_adapter(
+                LLMProviderType(provider),
+                llm_api_key,
+                LLMConfig(model=summarizer_model),
+            ),
+        ),
+        estimator=TokenEstimator(),
+    )
+    tenant_id = str(tenant_config.id)
+
+    async def _defer_to_worker() -> bool:
+        from backend.app.application.compaction.refresh import JOB_SUMMARY_REFRESH
+        from backend.app.infrastructure.queue.manager import Job, get_queue_manager
+
+        try:
+            manager = get_queue_manager()
+            job = Job(
+                type=JOB_SUMMARY_REFRESH,
+                payload={"tenant_id": tenant_id, "thread_id": thread["id"]},
+            )
+            return bool(
+                await manager.enqueue(
+                    job, idempotency_key=f"summary-refresh:{thread['id']}"
+                )
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "summary_refresh_enqueue_failed",
+                thread_id=thread["id"],
+                error=str(e),
+            )
+            return False
+
+    async def _callback(info: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            if info.get("overflow"):
+                result = await compaction.compact(tenant_id, thread["id"])
+            else:
+                decision = compaction.evaluate(
+                    estimated_tokens=info.get("estimated_tokens") or 0,
+                    budget_tokens=info.get("budget_tokens") or 0,
+                    has_summary=bool(info.get("has_summary")),
+                )
+                if not decision.triggered:
+                    return None
+                if decision.action == "preemptive":
+                    # P2-5: defer to the background worker; no checkpoint
+                    # this turn (the generate loop continues un-compacted).
+                    enqueued = await _defer_to_worker()
+                    logger.info(
+                        "compaction_deferred_to_worker",
+                        thread_id=thread["id"],
+                        ratio=round(
+                            (info.get("estimated_tokens") or 0)
+                            / (info.get("budget_tokens") or 1),
+                            3,
+                        ),
+                        enqueued=enqueued,
+                    )
+                    return None
+                result = await compaction.compact(tenant_id, thread["id"])
+            if not result["compacted"]:
+                return None
+            await _refresh_hot_tail(
+                db,
+                tenant_id,
+                thread["id"],
+                summary={
+                    "content": result["summary"],
+                    "position": result["summary_position"],
+                    "layers": result.get("layers"),
+                },
+            )
+            return {
+                "summary": result["summary"],
+                "position": result["summary_position"],
+                "layers": result.get("layers"),
+            }
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("compaction_failed", thread_id=thread["id"], error=str(e))
+            return None
+
+    return _callback
 
 
 # Per-tenant RAG service registry (vector store + embedding model are shared;

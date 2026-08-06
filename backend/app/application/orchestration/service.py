@@ -22,8 +22,19 @@ from backend.app.adapters.llm import (
     _extract_usage,
     create_llm_adapter,
 )
+from backend.app.application.compaction import (
+    CompactionConfig,
+    CompactionHook,
+)
+from backend.app.context import (
+    AssembledContext,
+    ContextBudgetExceeded,
+    ContextTurn,
+    SessionContextLoader,
+)
 from backend.app.domain.policy import PolicyAction, PolicySet
 from backend.app.domain.tenant import TenantConfig
+from backend.app.gateway.catalog import ModelCatalog, get_default_catalog
 from backend.app.gateway.client import (
     GatewayClientConfig,
     ResilientLLMClient,
@@ -51,6 +62,10 @@ class AgentState(TypedDict):
     handoff_required: bool
     redact_attempts: int
     budget_exceeded: bool
+    context_summary: str | None
+    context_summary_position: int | None
+    # P2-6: immutable summary layers (each byte-stable across compactions).
+    context_summary_layers: list[dict[str, Any]] | None
     error: str | None
 
 
@@ -65,6 +80,10 @@ class OrchestrationService:
         retrieval_service: Any | None = None,
         escalation_service: Any | None = None,
         model_override: str | None = None,
+        context_loader: SessionContextLoader | None = None,
+        model_catalog: ModelCatalog | None = None,
+        compaction_callback: CompactionHook | None = None,
+        compaction_config: CompactionConfig | None = None,
     ):
         self.tenant_config = tenant_config
         self.policy_set = policy_set
@@ -72,6 +91,19 @@ class OrchestrationService:
         self.retrieval_service = retrieval_service
         self.escalation_service = escalation_service
         self.model_override = model_override
+        # P2-2: model facts (context windows, price cards) come from the
+        # gateway catalog; the context layer consumes it, never redefines it.
+        self.model_catalog = model_catalog or get_default_catalog()
+        # P2-1: the context assembler is the single component that builds
+        # provider messages; the generate node only renders its output.
+        self.context_loader = context_loader or SessionContextLoader(
+            model_catalog=self.model_catalog
+        )
+        # P2-3: optional compaction hook (provided by the route, which owns
+        # DB access). When set, the generate node triggers preemptive/
+        # reactive compaction and retries a context overflow exactly once.
+        self.compaction_callback = compaction_callback
+        self.compaction_config = compaction_config or CompactionConfig()
         self.graph: CompiledStateGraph | None = None
         # When set, the generate node streams token deltas through it
         # (used by the SSE endpoint); None keeps the plain chat() path.
@@ -200,30 +232,118 @@ class OrchestrationService:
         return state
 
     async def _generate_response(self, state: AgentState) -> AgentState:
-        """Generate response using the LLM."""
+        """Generate response using the LLM.
+
+        P2-3: when a compaction hook is wired, the node triggers compaction
+        preemptively (~70%) / reactively (~95%) via the hook, and a context
+        overflow (local preflight or provider error) is recovered by
+        compacting and retrying exactly once; a second overflow is a hard
+        error that degrades — never an auto-fallback.
+        """
         logger.info("generating_response", tenant_id=state["tenant_id"])
 
         try:
             llm = self._get_llm_client()
-
-            # Build messages: system prompt, prior session history, current turn
             system_prompt = self._build_system_prompt(state)
-            messages: list[LLMMessage] = [
-                LLMMessage(role="system", content=system_prompt),
-            ]
-            for turn in state.get("conversation_history", []):
-                role = turn.get("role")
-                content = turn.get("content")
-                if role in ("user", "assistant") and content:
-                    messages.append(LLMMessage(role=role, content=content))
-            messages.append(
-                LLMMessage(role="user", content=state["redacted_message"])
-            )
+            compacted_this_turn = False
+            stream_emitted = False
+            response: LLMResponse | None = None
 
-            if self.stream_callback is not None:
-                response = await self._generate_response_streaming(llm, messages)
-            else:
-                response = await llm.chat(messages)
+            while True:
+                try:
+                    assembled = self._assemble_context(state, system_prompt)
+                except ContextBudgetExceeded as e:
+                    if compacted_this_turn or self.compaction_callback is None:
+                        raise
+                    compacted_this_turn = True
+                    logger.info(
+                        "compaction_overflow_preflight",
+                        tenant_id=state["tenant_id"],
+                        error=str(e),
+                    )
+                    if await self._recover_overflow(state, assembled=None):
+                        continue
+                    raise
+
+                # P2-3 preemptive/reactive trigger (at most once per turn).
+                if (
+                    self.compaction_callback is not None
+                    and not compacted_this_turn
+                    and assembled.total_tokens
+                    > assembled.budget_tokens * self.compaction_config.preemptive_ratio
+                ):
+                    checkpoint = await self.compaction_callback(
+                        {
+                            "estimated_tokens": assembled.total_tokens,
+                            "budget_tokens": assembled.budget_tokens,
+                            "has_summary": state.get("context_summary") is not None,
+                            "overflow": False,
+                        }
+                    )
+                    if checkpoint:
+                        state["context_summary"] = checkpoint.get("summary")
+                        state["context_summary_position"] = checkpoint.get("position")
+                        state["context_summary_layers"] = checkpoint.get("layers")
+                        compacted_this_turn = True  # one compaction per turn
+                        continue
+
+                messages = [
+                    LLMMessage(
+                        role=m["role"],
+                        content=m["content"],
+                        metadata=m.get("metadata") or {},
+                    )
+                    for m in assembled.messages
+                ]
+                logger.info(
+                    "context_assembled",
+                    tenant_id=state["tenant_id"],
+                    total_tokens=assembled.total_tokens,
+                    budget_tokens=assembled.budget_tokens,
+                    message_count=len(assembled.messages),
+                    omitted_turns=len(assembled.omitted_turns),
+                    omitted_docs=len(assembled.omitted_docs),
+                )
+
+                try:
+                    if self.stream_callback is not None:
+                        original_callback = self.stream_callback
+
+                        async def _tracked(chunk: str) -> None:
+                            nonlocal stream_emitted
+                            stream_emitted = True
+                            await original_callback(chunk)
+
+                        self.stream_callback = _tracked
+                        try:
+                            response = await self._generate_response_streaming(
+                                llm, messages
+                            )
+                        finally:
+                            self.stream_callback = original_callback
+                    else:
+                        response = await llm.chat(messages)
+                    break
+                except Exception as e:
+                    # Provider-overflow one-shot recovery: retried exactly
+                    # once with a fresh checkpoint; mid-stream overflows
+                    # cannot retry (deltas already sent).
+                    if (
+                        not compacted_this_turn
+                        and not stream_emitted
+                        and self.compaction_callback is not None
+                        and self._is_provider_overflow(e)
+                    ):
+                        compacted_this_turn = True
+                        logger.info(
+                            "compaction_overflow_recovery",
+                            tenant_id=state["tenant_id"],
+                            error=str(e),
+                        )
+                        if await self._recover_overflow(state, assembled=assembled):
+                            continue
+                    raise
+
             state["model_response"] = response.content
             state["confidence"] = self._estimate_confidence(response)
             await self._record_usage(state, llm, response)
@@ -233,6 +353,78 @@ class OrchestrationService:
             state["confidence"] = 0.0
 
         return state
+
+    def _assemble_context(
+        self, state: AgentState, system_prompt: str
+    ) -> AssembledContext:
+        """Render the provider messages via the SessionContextLoader (P2-1)."""
+        turns = [
+            ContextTurn(
+                role=turn.get("role", "user"),
+                content=turn.get("content", ""),
+                seq=turn.get("seq"),
+                message_id=turn.get("message_id"),
+                has_tool_payload=bool(turn.get("has_tool_payload")),
+            )
+            for turn in state.get("conversation_history", [])
+        ]
+        return self.context_loader.assemble(
+            provider=self.tenant_config.default_provider,
+            model=self.model_override or self.tenant_config.default_model,
+            system_prompt=system_prompt,
+            current_message=state["redacted_message"],
+            history_turns=turns,
+            summary=state.get("context_summary"),
+            summary_position=state.get("context_summary_position"),
+            summary_layers=state.get("context_summary_layers"),
+            retrieved_docs=state.get("retrieved_docs") or [],
+        )
+
+    async def _recover_overflow(
+        self,
+        state: AgentState,
+        assembled: AssembledContext | None,
+    ) -> bool:
+        """Ask the compaction hook for a fresh checkpoint (P2-3 overflow path).
+
+        Returns True when a checkpoint was produced (caller retries the
+        generation exactly once with it); False means the session continues
+        degraded without retrying.
+        """
+        checkpoint = await self.compaction_callback(
+            {
+                "estimated_tokens": (
+                    assembled.total_tokens if assembled else None
+                ),
+                "budget_tokens": (
+                    assembled.budget_tokens if assembled else None
+                ),
+                "has_summary": state.get("context_summary") is not None,
+                "overflow": True,
+            }
+        )
+        if not checkpoint:
+            return False
+        state["context_summary"] = checkpoint.get("summary")
+        state["context_summary_position"] = checkpoint.get("position")
+        state["context_summary_layers"] = checkpoint.get("layers")
+        return True
+
+    @staticmethod
+    def _is_provider_overflow(exc: Exception) -> bool:
+        """Detect context-overflow errors from any provider by message text."""
+        text = str(exc).lower()
+        markers = (
+            "maximum context length",
+            "context length exceeded",
+            "context window",
+            "prompt is too long",
+            "input is too long",
+            "context_length_exceeded",
+            "maximum tokens",
+            "token limit exceeded",
+        )
+        return any(m in text for m in markers)
 
     async def _generate_response_streaming(
         self, llm: ResilientLLMClient, messages: list[LLMMessage]
@@ -270,17 +462,27 @@ class OrchestrationService:
         if self.usage_callback is None:
             return
         usage = response.usage or {}
+        provider = llm.adapter.provider_type.value
+        model = getattr(llm.adapter.config, "model", "")
         record = {
             "tenant_id": str(state["tenant_id"]),
             "conversation_id": state.get("context", {}).get("conversation_id"),
             "session_id": state.get("session_id"),
-            "provider": llm.adapter.provider_type.value,
-            "model": getattr(llm.adapter.config, "model", ""),
+            "provider": provider,
+            "model": model,
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
             "reasoning_tokens": usage.get("reasoning_tokens", 0),
             "cached_tokens": usage.get("cached_tokens", 0),
-            "usd": 0.0,
+            # P2-2: price-card estimate (0.0 when the model has no card;
+            # spend_events.usd is NOT NULL).
+            "usd": self.model_catalog.estimate_cost(
+                provider,
+                model,
+                usage.get("input_tokens", 0),
+                usage.get("output_tokens", 0),
+            )
+            or 0.0,
         }
         try:
             outcome = self.usage_callback(record)
@@ -288,6 +490,19 @@ class OrchestrationService:
                 await outcome
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("usage_emit_failed", error=str(e))
+        # P2-6: per-tenant prompt-cache hit-rate metric (provider-reported
+        # cached tokens; failures must never affect the turn).
+        try:
+            from backend.app.context.metrics import get_prompt_cache_metrics
+
+            get_prompt_cache_metrics().record(
+                str(state["tenant_id"]),
+                provider,
+                usage.get("input_tokens", 0),
+                usage.get("cached_tokens", 0),
+            )
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("prompt_cache_metric_failed", error=str(e))
 
     @staticmethod
     def _extract_stream_delta(provider_type: LLMProviderType, chunk: Any) -> str:
@@ -453,30 +668,15 @@ class OrchestrationService:
             return "allow"
 
     def _build_system_prompt(self, state: AgentState) -> str:
-        """Build system prompt with tenant configuration."""
+        """Build the system prompt: a stable per-tenant prefix only.
+
+        P2-1: history, summary and knowledge are separate blocks emitted by
+        the SessionContextLoader (Arch 8.1). Keeping this prefix free of
+        per-turn content makes it byte-identical across turns, which is the
+        precondition for provider prompt caching (P2-6).
+        """
         allowed_topics = ", ".join(self.tenant_config.allowed_topics) or "general"
         blocked_topics = ", ".join(self.tenant_config.blocked_topics) or "none"
-
-        context = state.get("retrieved_docs") or []
-        if context and not any(isinstance(d, str) for d in context):
-            context_parts = [
-                f"[Source {i}] (Score: {doc['score']:.2f})\n{doc['content']}"
-                for i, doc in enumerate(context, 1)
-            ]
-            context_text = "\n\n".join(context_parts)
-        else:
-            context_text = str(state.get("context", {}).get("retrieval_context", "")) or "No relevant context available."
-
-        history = state.get("conversation_history") or []
-        if history:
-            history_parts = [
-                f"{turn.get('role', 'user')}: {turn.get('content', '')}"
-                for turn in history
-                if turn.get("content")
-            ]
-            history_text = "\n".join(history_parts)
-        else:
-            history_text = "No prior conversation in this session."
 
         return f"""You are a helpful assistant configured for a specific tenant.
 
@@ -493,12 +693,6 @@ Guidelines:
 4. Do not make up information
 5. Base your answer on the provided context when available
 6. Be consistent with the prior conversation in this session
-
-Prior conversation in this session:
-{history_text}
-
-Context from knowledge base:
-{context_text}
 """
 
     def _estimate_confidence(self, response: Any) -> float:
@@ -582,13 +776,21 @@ Context from knowledge base:
         session_id: str = "",
         conversation_history: list[dict[str, Any]] | None = None,
         context: dict[str, Any] | None = None,
+        context_summary: str | None = None,
+        context_summary_position: int | None = None,
+        context_summary_layers: list[dict[str, Any]] | None = None,
     ) -> AgentState:
         """Process a user message through the full workflow.
 
         Session memory is supplied via `conversation_history` (prior
-        user/assistant turns, oldest first). A LangGraph checkpointer can be
-        added later for graph-level persistence; DB-backed history keeps the
-        semantics explicit and survives restarts.
+        user/assistant turns, oldest first, redacted content only) and
+        `context_summary` + `context_summary_position` (immutable
+        compaction checkpoint, Arch 8.2). `context_summary_layers` (P2-6)
+        carries the byte-stable summary layers; when absent the legacy
+        `context_summary` string renders as a single layer. A LangGraph
+        checkpointer can be added later for graph-level persistence;
+        DB-backed history keeps the semantics explicit and survives
+        restarts.
         """
         if self.graph is None:
             raise RuntimeError("Graph not initialized")
@@ -612,6 +814,9 @@ Context from knowledge base:
             handoff_required=False,
             redact_attempts=0,
             budget_exceeded=False,
+            context_summary=context_summary,
+            context_summary_position=context_summary_position,
+            context_summary_layers=context_summary_layers,
             error=None,
         )
 
@@ -630,6 +835,9 @@ Context from knowledge base:
         session_id: str = "",
         conversation_history: list[dict[str, Any]] | None = None,
         context: dict[str, Any] | None = None,
+        context_summary: str | None = None,
+        context_summary_position: int | None = None,
+        context_summary_layers: list[dict[str, Any]] | None = None,
     ) -> AsyncGenerator[dict[str, Any], None]:
         """Process a message with token streaming.
 
@@ -655,6 +863,9 @@ Context from knowledge base:
                     session_id=session_id,
                     conversation_history=conversation_history,
                     context=context,
+                    context_summary=context_summary,
+                    context_summary_position=context_summary_position,
+                    context_summary_layers=context_summary_layers,
                 )
             except Exception as e:
                 result = AgentState(
@@ -662,16 +873,20 @@ Context from knowledge base:
                     session_id=session_id,
                     user_message=user_message,
                     redacted_message=redacted_message,
-            context={},
-            conversation_history=conversation_history or [],
-            retrieved_docs=[],
-            citations=[],
-            model_response=None,
+                    context={},
+                    conversation_history=conversation_history or [],
+                    retrieved_docs=[],
+                    citations=[],
+                    model_response=None,
                     validation_result={},
                     policy_action=PolicyAction.ALLOW,
                     confidence=0.0,
                     handoff_required=False,
                     redact_attempts=0,
+                    budget_exceeded=False,
+                    context_summary=context_summary,
+                    context_summary_position=context_summary_position,
+                    context_summary_layers=context_summary_layers,
                     error=str(e),
                 )
             # Sentinel: every delta is put before the graph returns, so this
@@ -713,6 +928,10 @@ def create_orchestration_service(
     retrieval_service: Any | None = None,
     escalation_service: Any | None = None,
     model_override: str | None = None,
+    context_loader: SessionContextLoader | None = None,
+    model_catalog: ModelCatalog | None = None,
+    compaction_callback: CompactionHook | None = None,
+    compaction_config: CompactionConfig | None = None,
 ) -> OrchestrationService:
     """Factory function to create orchestration service."""
     return OrchestrationService(
@@ -722,4 +941,8 @@ def create_orchestration_service(
         retrieval_service=retrieval_service,
         escalation_service=escalation_service,
         model_override=model_override,
+        context_loader=context_loader,
+        model_catalog=model_catalog,
+        compaction_callback=compaction_callback,
+        compaction_config=compaction_config,
     )

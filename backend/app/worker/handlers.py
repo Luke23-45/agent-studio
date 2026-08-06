@@ -19,6 +19,7 @@ JOB_CLEANUP_RUN = "cleanup.run"
 JOB_EVAL_REPLAY = "eval.replay"
 JOB_REDTEAM_RUN = "redteam.run"
 JOB_WEBHOOK_DELIVER = "webhook.deliver"
+JOB_SUMMARY_REFRESH = "summary.refresh"
 
 
 async def handle_ingestion_process(payload: dict[str, Any]) -> None:
@@ -257,6 +258,87 @@ async def handle_webhook_deliver(payload: dict[str, Any]) -> None:
     logger.info("job_webhook_delivered", event_id=event_id, subscription_id=subscription_id)
 
 
+async def handle_summary_refresh(
+    payload: dict[str, Any], *, generator_builder: Callable | None = None
+) -> None:
+    """Background compaction refresh (Arch 8.2, P2-5).
+
+    With ``tenant_id`` + ``thread_id`` refreshes one thread; otherwise
+    sweeps the threads whose summaries are stale. Summarization happens off
+    the request path so triggered compaction is an instant swap. Tenants
+    without a provider key are skipped (logged, never raised); compaction
+    failures raise so the queue can retry/DLQ them.
+    """
+    from backend.app.application.compaction.refresh import (
+        CompactionRefreshConfig,
+        default_generator_builder,
+        find_stale_threads,
+        load_effective_tenant_config,
+        refresh_thread_summary,
+    )
+    from backend.app.infrastructure.db import TenantRepository, get_database_manager
+    from backend.app.infrastructure.keys.service import (
+        ProviderKeyNotFoundError,
+        ProviderKeyService,
+    )
+
+    db = get_database_manager()
+    config = CompactionRefreshConfig()
+    tenant_id = payload.get("tenant_id")
+    thread_id = payload.get("thread_id")
+    builder = generator_builder or default_generator_builder
+
+    if tenant_id and thread_id:
+        targets = [(str(tenant_id), str(thread_id))]
+    else:
+        targets = [
+            (str(thread["tenant_id"]), str(thread["id"]))
+            for thread in await find_stale_threads(db, config)
+        ]
+    if not targets:
+        logger.info("summary_refresh_no_targets")
+        return
+
+    for tenant_id, thread_id in targets[: config.max_threads_per_run]:
+        try:
+            tenant_row = await TenantRepository(db).get_by_id(tenant_id)
+            if not tenant_row:
+                logger.warning("summary_refresh_tenant_missing", tenant_id=tenant_id)
+                continue
+            tenant_config = await load_effective_tenant_config(db, tenant_row)
+            api_key = await ProviderKeyService(db).resolve(tenant_config)
+        except ProviderKeyNotFoundError:
+            logger.warning(
+                "summary_refresh_no_key",
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                hint="set a tenant provider key or enable platform-managed keys",
+            )
+            continue
+        if not api_key:
+            continue
+
+        generator = builder(tenant_config, api_key)
+        result = await refresh_thread_summary(
+            db,
+            tenant_id,
+            thread_id,
+            generator=generator,
+            config=config,
+            request_id=f"summary-refresh:{thread_id}",
+        )
+        logger.info(
+            "summary_refresh_done",
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            refreshed=result.get("refreshed"),
+            reason=result.get("reason"),
+            summary_position=result.get("summary_position"),
+            summary_version=result.get("summary_version"),
+            degraded=result.get("degraded"),
+        )
+
+
 def build_handlers() -> Dict[str, Callable]:
     """Register every job handler with the shared queue manager."""
     handlers: Dict[str, Callable] = {
@@ -267,6 +349,7 @@ def build_handlers() -> Dict[str, Callable]:
         JOB_EVAL_REPLAY: handle_eval_replay,
         JOB_REDTEAM_RUN: handle_redteam_run,
         JOB_WEBHOOK_DELIVER: handle_webhook_deliver,
+        JOB_SUMMARY_REFRESH: handle_summary_refresh,
     }
     manager = get_queue_manager()
     for job_type, handler in handlers.items():

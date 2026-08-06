@@ -28,6 +28,9 @@ from backend.app.api.routes import (
     conversations_router,
     model_catalog_router,
     operations_router,
+    sessions_router,
+    surfaces_router,
+    threads_router,
     webhooks_router,
 )
 from backend.app.gateway.admission import get_admission_gate, init_admission
@@ -41,6 +44,10 @@ from backend.app.infrastructure.db import (
 from backend.app.infrastructure.queue import get_queue_manager, init_queue
 from backend.app.infrastructure.storage import get_storage_manager, init_storage
 from backend.app.modules.tenant_config import configure_tenant_config_service
+from backend.app.session.coordinator import get_thread_coordinator, init_thread_coordinator
+from backend.app.session.hot_tier import get_thread_tail_cache, init_thread_tail_cache
+from backend.app.session.limits import get_end_user_limits, init_end_user_limits
+from backend.app.session.tokens import get_session_token_service, init_session_token_service
 from backend.app.settings.env import settings
 
 logger = structlog.get_logger(__name__)
@@ -111,11 +118,33 @@ async def lifespan(app: FastAPI):
         wait_seconds=settings.ADMISSION_WAIT_SECONDS,
         lease_seconds=settings.ADMISSION_LEASE_SECONDS,
     )
+    coordinator = init_thread_coordinator(
+        settings.REDIS_URL,
+        lease_seconds=settings.SESSION_LEASE_SECONDS,
+        wait_seconds=settings.SESSION_WAIT_SECONDS,
+    )
+    tail_cache = init_thread_tail_cache(
+        settings.REDIS_URL,
+        ttl_seconds=settings.SESSION_TTL_SECONDS,
+        tail_size=settings.SESSION_TAIL_SIZE,
+    )
+    init_session_token_service(db)
+    end_user_limits = init_end_user_limits(
+        settings.REDIS_URL,
+        max_requests=settings.END_USER_RATE_MAX_REQUESTS,
+        window_seconds=settings.END_USER_RATE_WINDOW_SECONDS,
+        max_concurrent_sessions=settings.END_USER_MAX_CONCURRENT_SESSIONS,
+        session_lease_seconds=settings.END_USER_SESSION_LEASE_SECONDS,
+        spend_cap_tokens=settings.END_USER_SPEND_CAP_TOKENS,
+    )
     await asyncio.gather(
         cache.initialize(),
         queue.initialize(),
         storage.initialize(),
         admission.initialize(),
+        coordinator.initialize(),
+        tail_cache.initialize(),
+        end_user_limits.initialize(),
         initialize_rate_limiter(),
     )
 
@@ -129,7 +158,14 @@ async def lifespan(app: FastAPI):
     )
     yield
     await asyncio.gather(
-        db.close(), cache.close(), queue.close(), storage.close(), admission.close()
+        db.close(),
+        cache.close(),
+        queue.close(),
+        storage.close(),
+        admission.close(),
+        coordinator.close(),
+        tail_cache.close(),
+        end_user_limits.close(),
     )
     logger.info("application_shutdown")
 
@@ -165,6 +201,9 @@ def create_application() -> FastAPI:
 
     # Register routes
     app.include_router(conversations_router, prefix="/api/v1")
+    app.include_router(sessions_router, prefix="/api/v1")
+    app.include_router(surfaces_router, prefix="/api/v1")
+    app.include_router(threads_router, prefix="/api/v1")
     app.include_router(webhooks_router, prefix="/api/v1")
     app.include_router(model_catalog_router, prefix="/api/v1")
     app.include_router(operations_router, prefix="/api/v1")
@@ -199,6 +238,9 @@ def create_application() -> FastAPI:
             ("storage", get_storage_manager()),
             ("admission", get_admission_gate()),
             ("rate_limiter", get_rate_limiter()),
+            ("session_coordinator", get_thread_coordinator()),
+            ("thread_tail_cache", get_thread_tail_cache()),
+            ("end_user_limits", get_end_user_limits()),
         ):
             components[name] = (await manager.health_check()).to_dict()
 

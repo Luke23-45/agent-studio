@@ -44,6 +44,9 @@ logs/
 # Provider credential master key (dev fallback; KMS in production)
 provider_master.key
 
+# Session-token signing key (dev fallback; env/KMS in production)
+session_token.key
+
 # Coverage reports
 .coverage
 htmlcov/

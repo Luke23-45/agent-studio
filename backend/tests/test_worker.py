@@ -126,6 +126,7 @@ class TestHandlerRegistration:
             "eval.replay",
             "redteam.run",
             "webhook.deliver",
+            "summary.refresh",
         }
         assert qm._handlers == handlers
 

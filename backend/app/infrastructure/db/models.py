@@ -438,6 +438,36 @@ class EndUserModel(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
 
 
+class SessionTokenModel(Base):
+    """Durable registry for end-user session tokens (Arch 6.4, P1-8).
+
+    One row per minted token (jti). The bearer string is a separate
+    encrypted payload; the row is the revocation source of truth —
+    resolution checks ``revoked_at``/``expires_at`` on every request.
+    Tokens are scoped to exactly one tenant.
+    """
+
+    __tablename__ = "session_tokens"
+    __table_args__ = (
+        Index("ix_session_tokens_tenant_end_user", "tenant_id", "end_user_id"),
+        Index("ix_session_tokens_expires_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # jti
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    end_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("end_users.id", ondelete="CASCADE"), nullable=False
+    )
+    surface_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    device_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    scopes: Mapped[list] = mapped_column(json_column(), default=list, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
 class TenantConfigVersionModel(Base):
     """Immutable, versioned tenant config (Arch 12, P0-11).
 
