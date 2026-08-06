@@ -12,6 +12,7 @@ from .provider import (
     LLMProviderType,
     LLMResponse,
     OpenAIAdapter,
+    _extract_usage,
     create_llm_adapter,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "LLMProviderType",
     "LLMResponse",
     "OpenAIAdapter",
+    "_extract_usage",
     "create_llm_adapter",
 ]

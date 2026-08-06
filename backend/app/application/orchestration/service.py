@@ -19,10 +19,16 @@ from backend.app.adapters.llm import (
     LLMMessage,
     LLMProviderType,
     LLMResponse,
+    _extract_usage,
     create_llm_adapter,
 )
 from backend.app.domain.policy import PolicyAction, PolicySet
 from backend.app.domain.tenant import TenantConfig
+from backend.app.gateway.client import (
+    GatewayClientConfig,
+    ResilientLLMClient,
+    get_llm_client,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -74,6 +80,10 @@ class OrchestrationService:
         # processed message (may be sync or awaitable; failures are logged,
         # never raised).
         self.evidence_callback: Callable[[dict[str, Any]], Any] | None = None
+        # When set, per-turn token usage (Arch 10, P0-10) is emitted after
+        # every completed generation (may be sync or awaitable; failures are
+        # logged, never raised).
+        self.usage_callback: Callable[[dict[str, Any]], Any] | None = None
         self._build_graph()
 
     def _get_llm_adapter(self) -> BaseLLMAdapter:
@@ -82,6 +92,18 @@ class OrchestrationService:
         model = self.model_override or self.tenant_config.default_model
         config = LLMConfig(model=model)
         return create_llm_adapter(provider_type, self.llm_api_key, config)
+
+    def _get_llm_client(self) -> ResilientLLMClient:
+        """Resilient gateway client (timeout, retry, breaker) for the tenant.
+
+        Per-call timeout is tenant-tunable via ``budgets.llm_timeout_seconds``.
+        """
+        adapter = self._get_llm_adapter()
+        timeout = self.tenant_config.budgets.get("llm_timeout_seconds")
+        config = GatewayClientConfig(
+            call_timeout_seconds=float(timeout) if timeout else 60.0
+        )
+        return get_llm_client(str(self.tenant_config.id), adapter, config=config)
 
     def _build_graph(self) -> None:
         """Build the LangGraph workflow."""
@@ -182,7 +204,7 @@ class OrchestrationService:
         logger.info("generating_response", tenant_id=state["tenant_id"])
 
         try:
-            llm = self._get_llm_adapter()
+            llm = self._get_llm_client()
 
             # Build messages: system prompt, prior session history, current turn
             system_prompt = self._build_system_prompt(state)
@@ -204,6 +226,7 @@ class OrchestrationService:
                 response = await llm.chat(messages)
             state["model_response"] = response.content
             state["confidence"] = self._estimate_confidence(response)
+            await self._record_usage(state, llm, response)
         except Exception as e:
             logger.error("llm_error", error=str(e))
             state["error"] = str(e)
@@ -212,18 +235,59 @@ class OrchestrationService:
         return state
 
     async def _generate_response_streaming(
-        self, llm: BaseLLMAdapter, messages: list[LLMMessage]
+        self, llm: ResilientLLMClient, messages: list[LLMMessage]
     ) -> LLMResponse:
         """Generate via stream_chat, forwarding token deltas."""
         stream = await llm.stream_chat(messages)
         parts: list[str] = []
+        usage: dict[str, int] = {}
         async for chunk in stream:
-            delta = self._extract_stream_delta(llm.provider_type, chunk)
+            delta = self._extract_stream_delta(llm.adapter.provider_type, chunk)
             if delta:
                 parts.append(delta)
                 await self.stream_callback(delta)
+            chunk_usage = _extract_usage(llm.adapter.provider_type, chunk)
+            if chunk_usage:
+                usage = {
+                    k: usage.get(k, 0) + v for k, v in chunk_usage.items()
+                }
         content = "".join(parts)
-        return LLMResponse(content=content, model=getattr(llm.config, "model", ""))
+        return LLMResponse(
+            content=content,
+            model=getattr(llm.adapter.config, "model", ""),
+            usage=usage,
+        )
+
+    async def _record_usage(
+        self,
+        state: AgentState,
+        llm: ResilientLLMClient,
+        response: LLMResponse,
+    ) -> None:
+        """Emit per-turn token usage (Arch 10, P0-10) via usage_callback."""
+        import inspect
+
+        if self.usage_callback is None:
+            return
+        usage = response.usage or {}
+        record = {
+            "tenant_id": str(state["tenant_id"]),
+            "conversation_id": state.get("context", {}).get("conversation_id"),
+            "session_id": state.get("session_id"),
+            "provider": llm.adapter.provider_type.value,
+            "model": getattr(llm.adapter.config, "model", ""),
+            "input_tokens": usage.get("input_tokens", 0),
+            "output_tokens": usage.get("output_tokens", 0),
+            "reasoning_tokens": usage.get("reasoning_tokens", 0),
+            "cached_tokens": usage.get("cached_tokens", 0),
+            "usd": 0.0,
+        }
+        try:
+            outcome = self.usage_callback(record)
+            if inspect.isawaitable(outcome):
+                await outcome
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("usage_emit_failed", error=str(e))
 
     @staticmethod
     def _extract_stream_delta(provider_type: LLMProviderType, chunk: Any) -> str:

@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - "6379:6379"
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: ruff check backend
+
+      - name: Typecheck (mypy)
+        run: mypy backend
+
+      - name: Tests (pytest)
+        run: pytest -q
+
+      - name: Vulnerability audit (pip-audit)
+        run: |
+          pip install pip-audit
+          pip-audit --disable-pip
+
+      - name: Vulnerability scan (osv-scanner)
+        uses: google/osv-scanner-action@v2
+        with:
+          args: "--format=sarif --output=osv.sarif"
+          fail-on-vuln: true
+
+      - name: Upload osv-scanner SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: osv.sarif
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install (pnpm)
+        run: corepack enable && pnpm install --no-frozen-lockfile
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Vulnerability audit (pnpm audit)
+        run: pnpm audit --prod
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: docker compose build api worker
+
+      - name: Trivy scan (API image)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: neryva-product-aaa-api
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+  sbom:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          pip install cyclonedx-bom
+          cyclonedx-py requirements --pyproject-only -o sbom.xml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cyclonedx-sbom
+          path: sbom.xml

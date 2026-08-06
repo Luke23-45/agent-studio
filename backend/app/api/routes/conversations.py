@@ -12,6 +12,8 @@ cache for the tenant config service and are never consulted on the hot path.
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+from typing import Any
+
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse
@@ -31,6 +33,10 @@ from backend.app.application.orchestration import create_orchestration_service
 from backend.app.application.retrieval import create_retrieval_service
 from backend.app.domain.policy import PolicySet
 from backend.app.domain.tenant import TenantConfig
+from backend.app.gateway.admission import (
+    AdmissionLimitExceeded,
+    get_admission_gate,
+)
 from backend.app.infrastructure.db import (
     ApiKeyRepository,
     AuditRepository,
@@ -38,6 +44,8 @@ from backend.app.infrastructure.db import (
     EscalationRepository,
     EvidenceRepository,
     PolicyRepository,
+    SpendEventRepository,
+    TenantConfigVersionRepository,
     TenantRepository,
     get_database_manager,
 )
@@ -94,6 +102,58 @@ class PrincipalResponse(BaseModel):
     tenant_id: str | None
     scopes: list[str]
     auth_enabled: bool
+
+
+class ProviderKeyRequest(BaseModel):
+    """Set/rotate a tenant provider credential (Arch 6.3.9, P0-8)."""
+
+    api_key: str = Field(min_length=1, max_length=4096)
+    key_source: str = Field(default="tenant-owned")
+
+
+class ProviderKeyResponse(BaseModel):
+    """Provider key metadata; the secret never leaves the backend."""
+
+    tenant_id: str
+    provider: str
+    key_source: str
+    key_version: int
+    updated_at: datetime
+
+
+class ConfigVersionRequest(BaseModel):
+    """New immutable tenant config version (Arch 12, P0-11)."""
+
+    config: dict
+
+
+class ConfigVersionResponse(BaseModel):
+    """Tenant config version metadata (never the full config payload)."""
+
+    tenant_id: str
+    version: int
+    status: str
+    published_at: datetime | None
+    promoted_by: str | None
+
+
+async def _load_effective_tenant_config(
+    db: Any, tenant_row: dict[str, Any]
+) -> TenantConfig:
+    """Runtime reads the published config version (Arch 12, P0-11).
+
+    The tenant row is the base; a published config version (if any)
+    overrides it, so publish/rollback change runtime behavior without
+    touching the tenant row. No published version -> the row is
+    authoritative.
+    """
+    config = tenant_config_from_data(tenant_row)
+    published = await TenantConfigVersionRepository(db).get_latest_published(
+        str(config.id)
+    )
+    if published:
+        return tenant_config_from_data({**tenant_row, **published["config"]})
+    return config
 
 
 @router.get("/auth/me", response_model=PrincipalResponse)
@@ -240,7 +300,7 @@ async def process_conversation(
             detail=f"Tenant not found: {request.tenant_slug}",
         )
 
-    tenant_config = tenant_config_from_data(tenant_row)
+    tenant_config = await _load_effective_tenant_config(db, tenant_row)
     assert_tenant_access(principal, tenant_config.id)
 
     # Langfuse tracing for the request pipeline (flag + credentials gated)
@@ -377,7 +437,7 @@ async def process_conversation(
     )
 
     # Resolve the LLM API key for the tenant's configured provider
-    llm_api_key = _resolve_llm_api_key(tenant_config)
+    llm_api_key = await _resolve_llm_api_key(tenant_config, db)
 
     escalation_repository = EscalationRepository(db)
     escalation_service = create_escalation_service(
@@ -402,6 +462,8 @@ async def process_conversation(
         model_override=model_override,
     )
     orchestration.evidence_callback = lambda record: evidence_repo.add(record)
+    spend_repo = SpendEventRepository(db)
+    orchestration.usage_callback = lambda record: spend_repo.add(record)
 
     orchestration_span = (
         adapter.create_span(
@@ -415,6 +477,18 @@ async def process_conversation(
         if trace
         else None
     )
+
+    # Admission control (Arch 10): bound concurrent in-flight generations
+    # per tenant and platform-wide; excess requests get 429 + Retry-After.
+    admission_gate = get_admission_gate()
+    try:
+        admission_handle = await admission_gate.admit(tenant_config.id)
+    except AdmissionLimitExceeded as e:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            headers={"Retry-After": str(int(e.retry_after))},
+            detail="Concurrent generation limit exceeded. Try again shortly.",
+        )
 
     # Process message
     try:
@@ -443,6 +517,7 @@ async def process_conversation(
 
         # Output validation: PII redaction on the model response
         response_text = result.get("model_response") or ""
+        response_raw = response_text
         if feature_flags.ENABLE_PRESIDIO and response_text:
             output_validation = await guardrails_service.evaluate_output(
                 response_text,
@@ -455,7 +530,8 @@ async def process_conversation(
 
         handoff_required = bool(result.get("handoff_required", False))
         await conversation_repo.add_message(
-            conversation["id"], "assistant", response_text,
+            conversation["id"], "assistant", response_raw,
+            redacted_content=response_text,
             metadata={
                 "confidence": result.get("confidence", 0.0),
                 "handoff_required": handoff_required,
@@ -511,6 +587,8 @@ async def process_conversation(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e),
         )
+    finally:
+        await admission_handle.release()
 
 
 def _sse(event: str, data: dict) -> str:
@@ -617,7 +695,7 @@ async def stream_conversation(
             detail=f"Tenant not found: {request.tenant_slug}",
         )
 
-    tenant_config = tenant_config_from_data(tenant_row)
+    tenant_config = await _load_effective_tenant_config(db, tenant_row)
     assert_tenant_access(principal, tenant_config.id)
 
     await get_rate_limiter().acquire_multi_or_raise(
@@ -682,12 +760,14 @@ async def stream_conversation(
     orchestration = create_orchestration_service(
         tenant_config=tenant_config,
         policy_set=policy_set,
-        llm_api_key=_resolve_llm_api_key(tenant_config),
+        llm_api_key=await _resolve_llm_api_key(tenant_config, db),
         retrieval_service=retrieval_service,
         escalation_service=escalation_service,
         model_override=model_override,
     )
     orchestration.evidence_callback = lambda record: evidence_repo.add(record)
+    spend_repo = SpendEventRepository(db)
+    orchestration.usage_callback = lambda record: spend_repo.add(record)
 
     async def event_generator():
         yield _sse("session", {"session_id": session_id})
@@ -721,6 +801,22 @@ async def stream_conversation(
             )
             return
 
+        # Admission control (Arch 10): bound concurrent in-flight
+        # generations per tenant; SSE error + retry hint on excess.
+        try:
+            admission_handle = await get_admission_gate().admit(tenant_config.id)
+        except AdmissionLimitExceeded as e:
+            yield _sse(
+                "error",
+                {
+                    "error": (
+                        "Concurrent generation limit exceeded. "
+                        f"Retry in {int(e.retry_after)}s."
+                    )
+                },
+            )
+            return
+
         try:
             async for event in orchestration.stream_message(
                 user_message=request.message,
@@ -741,6 +837,7 @@ async def stream_conversation(
                 return
 
             response_text = result["response"]
+            response_raw = response_text
             if feature_flags.ENABLE_PRESIDIO and response_text:
                 output_validation = await guardrails_service.evaluate_output(
                     response_text,
@@ -753,7 +850,8 @@ async def stream_conversation(
 
             handoff_required = bool(result.get("handoff_required", False))
             await conversation_repo.add_message(
-                conversation["id"], "assistant", response_text,
+                conversation["id"], "assistant", response_raw,
+                redacted_content=response_text,
                 metadata={
                     "confidence": result.get("confidence", 0.0),
                     "handoff_required": handoff_required,
@@ -778,6 +876,8 @@ async def stream_conversation(
         except Exception as e:
             logger.error("conversation_stream_error", error=str(e))
             yield _sse("error", {"error": str(e)})
+        finally:
+            await admission_handle.release()
 
     return StreamingResponse(
         event_generator(),
@@ -804,12 +904,20 @@ async def _load_conversation_history(
     limit: int = 30,
 ) -> list[dict[str, str]]:
     """Load prior turns for session memory. The latest message is the one
-    currently being processed, so it is excluded by default."""
+    currently being processed, so it is excluded by default.
+
+    Serves the redacted column only (Arch 8.1, P0-5): the model context is
+    redacted-only by construction; raw content is reachable only through
+    access-controlled review/DSR paths.
+    """
     messages = await conversation_repo.list_messages(conversation_id, limit=limit)
     if exclude_latest and messages:
         messages = messages[:-1]
     return [
-        {"role": m["role"], "content": m["content"]}
+        {
+            "role": m["role"],
+            "content": m.get("redacted_content") or m["content"],
+        }
         for m in messages
         if m["role"] in ("user", "assistant")
     ]
@@ -842,26 +950,24 @@ def _get_retrieval_service(tenant_id: UUID):
     return retrieval_service
 
 
-def _resolve_llm_api_key(tenant_config: TenantConfig) -> str:
-    """Resolve the API key for the tenant's configured provider."""
-    key_by_provider = {
-        "openai": settings.OPENAI_API_KEY,
-        "anthropic": settings.ANTHROPIC_API_KEY,
-        "google": settings.GOOGLE_API_KEY,
-        "azure": settings.AZURE_API_KEY,
-        "custom": settings.CUSTOM_LLM_API_KEY,
-    }
-    api_key = key_by_provider.get(tenant_config.default_provider)
-    if not api_key:
+async def _resolve_llm_api_key(tenant_config: TenantConfig, db: Any) -> str:
+    """Resolve the tenant's provider key (DB row first, platform fallback).
+
+    Keys are stored envelope-encrypted; the fallback is only the
+    platform-managed settings key while PLATFORM_MANAGED_KEYS_ENABLED is on.
+    """
+    from backend.app.infrastructure.keys.service import (
+        ProviderKeyNotFoundError,
+        ProviderKeyService,
+    )
+
+    try:
+        return await ProviderKeyService(db).resolve(tenant_config)
+    except ProviderKeyNotFoundError as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                f"No API key configured for provider "
-                f"'{tenant_config.default_provider}'. Set "
-                f"{tenant_config.default_provider.upper()}_API_KEY in .env"
-            ),
+            detail=str(e),
         )
-    return api_key
 
 
 @router.post("/tenants", response_model=TenantResponse)
@@ -988,6 +1094,200 @@ async def get_tenant(
         blocked_topics=row["blocked_topics"],
         escalation_threshold=row["escalation_threshold"],
     )
+
+
+@router.put(
+    "/tenants/{tenant_id}/provider-keys/{provider}",
+    response_model=ProviderKeyResponse,
+)
+async def set_tenant_provider_key(
+    tenant_id: UUID,
+    provider: str,
+    request: ProviderKeyRequest,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Set or rotate a tenant's provider credential (BYOK, Arch 6.3.9).
+
+    The key is envelope-encrypted before storage and never returned,
+    logged, or exposed in traces. Rotation bumps ``key_version``.
+    """
+    from backend.app.infrastructure.keys.service import (
+        KEY_SOURCES,
+        SUPPORTED_PROVIDERS,
+        ProviderKeyService,
+    )
+
+    assert_tenant_access(principal, tenant_id)
+
+    if provider not in SUPPORTED_PROVIDERS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unsupported provider '{provider}'. Must be one of: {', '.join(SUPPORTED_PROVIDERS)}",
+        )
+    if request.key_source not in KEY_SOURCES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"key_source must be one of: {', '.join(KEY_SOURCES)}",
+        )
+
+    db = get_database_manager()
+    tenant = await TenantRepository(db).get_by_id(str(tenant_id))
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+
+    row = await ProviderKeyService(db).set_key(
+        str(tenant_id), provider, request.api_key, key_source=request.key_source
+    )
+    await AuditRepository(db).add(
+        action="provider_key.rotated",
+        resource_type="provider_key",
+        resource_id=row["id"],
+        tenant_id=str(tenant_id),
+        actor_type="api_key",
+        actor_id=principal.key_id,
+        details={
+            "provider": provider,
+            "key_source": row["key_source"],
+            "key_version": row["key_version"],
+        },
+    )
+    logger.info(
+        "tenant_provider_key_rotated",
+        tenant_id=str(tenant_id),
+        provider=provider,
+        key_version=row["key_version"],
+    )
+    return ProviderKeyResponse(
+        tenant_id=str(tenant_id),
+        provider=provider,
+        key_source=row["key_source"],
+        key_version=row["key_version"],
+        updated_at=row["updated_at"],
+    )
+
+
+@router.post(
+    "/tenants/{tenant_id}/config-versions",
+    response_model=ConfigVersionResponse,
+)
+async def create_tenant_config_version(
+    tenant_id: UUID,
+    request: ConfigVersionRequest,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Append a new immutable config version (draft) for a tenant.
+
+    The config payload must carry id/name/slug matching the tenant;
+    publish/rollback are separate explicit operations.
+    """
+    assert_tenant_access(principal, tenant_id)
+
+    db = get_database_manager()
+    tenant = await TenantRepository(db).get_by_id(str(tenant_id))
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+
+    try:
+        candidate = tenant_config_from_data(request.config)
+    except (KeyError, ValueError) as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid config payload: {e}",
+        )
+    if str(candidate.id) != str(tenant_id) or candidate.slug != tenant["slug"]:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Config id/slug must match the tenant",
+        )
+
+    row = await TenantConfigVersionRepository(db).create_draft(
+        str(tenant_id), request.config, promoted_by=principal.key_id
+    )
+    await AuditRepository(db).add(
+        action="config_version.created",
+        resource_type="tenant_config_version",
+        resource_id=row["id"],
+        tenant_id=str(tenant_id),
+        actor_type="api_key",
+        actor_id=principal.key_id,
+        details={"version": row["version"], "status": row["status"]},
+    )
+    return ConfigVersionResponse(
+        tenant_id=str(tenant_id),
+        version=row["version"],
+        status=row["status"],
+        published_at=row["published_at"],
+        promoted_by=row["promoted_by"],
+    )
+
+
+@router.post(
+    "/tenants/{tenant_id}/config-versions/{version}/publish",
+    response_model=ConfigVersionResponse,
+)
+async def publish_tenant_config_version(
+    tenant_id: UUID,
+    version: int,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Publish a draft (or re-promote any version); supersedes the old one.
+
+    Runtime behavior switches on the next request; in-memory caches are
+    invalidated and an audit event is recorded.
+    """
+    assert_tenant_access(principal, tenant_id)
+
+    db = get_database_manager()
+    row = await TenantConfigVersionRepository(db).promote(
+        str(tenant_id), version, promoted_by=principal.key_id
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Config version not found: {tenant_id} v{version}",
+        )
+
+    get_tenant_config_service().invalidate_cache(tenant_id)
+    await AuditRepository(db).add(
+        action="config_version.published",
+        resource_type="tenant_config_version",
+        resource_id=row["id"],
+        tenant_id=str(tenant_id),
+        actor_type="api_key",
+        actor_id=principal.key_id,
+        details={"version": row["version"], "status": row["status"]},
+    )
+    logger.info(
+        "tenant_config_version_published",
+        tenant_id=str(tenant_id),
+        version=row["version"],
+    )
+    return ConfigVersionResponse(
+        tenant_id=str(tenant_id),
+        version=row["version"],
+        status=row["status"],
+        published_at=row["published_at"],
+        promoted_by=row["promoted_by"],
+    )
+
+
+@router.post(
+    "/tenants/{tenant_id}/config-versions/{version}/rollback",
+    response_model=ConfigVersionResponse,
+)
+async def rollback_tenant_config_version(
+    tenant_id: UUID,
+    version: int,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Rollback: re-promote a previously published (superseded) version."""
+    return await publish_tenant_config_version(tenant_id, version, principal)
 
 
 @router.get("/tenants/{tenant_id}/gdpr/export")

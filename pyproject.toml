@@ -22,10 +22,7 @@ dependencies = [
     
     # Observability
     "langfuse>=3.0",
-    
-    # RAG evaluation
-    "ragas>=0.2",
-    
+
     # Embeddings for governance classifiers
     "sentence-transformers>=2.7",
     "torch>=2.4",
@@ -49,6 +46,9 @@ dependencies = [
 
     # Validation
     "jsonschema>=4.0",
+
+    # Provider credential encryption (envelope, KMS-ready)
+    "cryptography>=42.0",
 
     # Utilities
     "python-dotenv>=1.0",

@@ -70,10 +70,24 @@ class PolicySet:
         Returns ``(action, matching_rules)`` where ``matching_rules`` is a list
         of dicts with rule id/name/action/conditions/priority, suitable for an
         audit evidence packet.
+
+        Deny by default (Arch 2.5): an unconfigured policy set (no rules) or
+        a configured set with no matching rule resolves to BLOCK, so an
+        uncovered request is never implicitly allowed.
         """
         matching = [r for r in self.rules if r.matches(context)]
         if not matching:
-            return PolicyAction.ALLOW, []
+            return PolicyAction.BLOCK, [
+                {
+                    "rule_id": None,
+                    "name": "deny-by-default",
+                    "action": PolicyAction.BLOCK.value,
+                    "policy_type": None,
+                    "conditions": {},
+                    "priority": 0,
+                    "reason": "no_policy_configured" if not self.rules else "no_rule_matched",
+                }
+            ]
 
         # Sort by priority (higher first)
         matching.sort(key=lambda r: r.priority, reverse=True)

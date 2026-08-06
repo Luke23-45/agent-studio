@@ -110,6 +110,12 @@ class TenantConfigService:
                     logger.error("config_load_error", file=str(config_file), error=str(e))
         return None
 
+    def invalidate_cache(self, tenant_id: UUID) -> None:
+        """Drop cached config/policy for a tenant (called on publish/rollback)."""
+        self._config_cache.pop(tenant_id, None)
+        self._policy_cache.pop(tenant_id, None)
+        logger.info("tenant_config_cache_invalidated", tenant_id=tenant_id)
+
     @staticmethod
     def _config_from_data(data: dict[str, Any]) -> TenantConfig:
         """Rehydrate a TenantConfig from stored JSON data."""

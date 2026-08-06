@@ -30,17 +30,21 @@ neryva_studio/
 │   ├── adapters/          # External service adapters (LLM, vector store, DLP)
 │   ├── api/               # FastAPI routes, middleware, dependencies
 │   ├── application/       # Application services (orchestration, handoff, ingestion, retrieval, validation)
+│   ├── context/           # Context engineering stack: assembler, memory, compaction (Arch §8)
 │   ├── domain/            # Domain models (tenant, policy, conversation, knowledge)
+│   ├── gateway/           # LLM gateway: router, fallbacks, breakers, usage, ledger, quota, caches (Arch §10)
 │   ├── infrastructure/    # Infrastructure (database, cache, queue, storage)
 │   ├── modules/           # Feature modules (guardrails, RAG, observability, tenant config, escalation)
+│   ├── session/           # Session engine: thread store, parts, coordinator, fork (Arch §7)
 │   └── settings/          # Configuration management
 ├── backend/tests/         # Test suite
 ├── contracts/             # API schemas and event contracts
 ├── frontend/              # Admin UI (React 19 + TanStack Router)
 ├── widget/                # Embeddable chat widget
-├── worker/                # Background job processor
 └── ops/                   # Deployment configurations
 ```
+
+The implementation is governed by the architecture in `docs/implementation/architecture-v2.md` (Hybrid Architecture v3) and the task ledger in `docs/implementation/ledger.md`. Where the code and the architecture conflict, the architecture wins and the conflicting implementation is replaced; aligned components are kept and extended in place.
 
 ## Quick Start
 

@@ -79,6 +79,61 @@ class BaseLLMAdapter(ABC):
         pass
 
 
+# Canonical usage keys (Arch 10 usage contract, P0-10): every adapter maps
+# provider-specific usage to input/output/reasoning/cached tokens.
+USAGE_INPUT = "input_tokens"
+USAGE_OUTPUT = "output_tokens"
+USAGE_REASONING = "reasoning_tokens"
+USAGE_CACHED = "cached_tokens"
+
+
+def _openai_usage(response: Any) -> dict[str, int]:
+    """Normalize an OpenAI-family usage object (None-safe)."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {
+            USAGE_INPUT: 0,
+            USAGE_OUTPUT: 0,
+            USAGE_REASONING: 0,
+            USAGE_CACHED: 0,
+        }
+    completion_details = getattr(usage, "completion_tokens_details", None)
+    prompt_details = getattr(usage, "prompt_tokens_details", None)
+    return {
+        USAGE_INPUT: getattr(usage, "prompt_tokens", 0) or 0,
+        USAGE_OUTPUT: getattr(usage, "completion_tokens", 0) or 0,
+        USAGE_REASONING: getattr(completion_details, "reasoning_tokens", 0) or 0,
+        USAGE_CACHED: getattr(prompt_details, "cached_tokens", 0) or 0,
+    }
+
+
+def _anthropic_usage(usage: Any) -> dict[str, int]:
+    """Normalize an Anthropic usage object (None-safe)."""
+    if usage is None:
+        return {
+            USAGE_INPUT: 0,
+            USAGE_OUTPUT: 0,
+            USAGE_REASONING: 0,
+            USAGE_CACHED: 0,
+        }
+    cached = (getattr(usage, "cache_read_input_tokens", 0) or 0) + (
+        getattr(usage, "cache_creation_input_tokens", 0) or 0
+    )
+    return {
+        USAGE_INPUT: getattr(usage, "input_tokens", 0) or 0,
+        USAGE_OUTPUT: getattr(usage, "output_tokens", 0) or 0,
+        USAGE_REASONING: getattr(usage, "reasoning_tokens", 0) or 0,
+        USAGE_CACHED: cached,
+    }
+
+
+def _extract_usage(provider_type: LLMProviderType, response: Any) -> dict[str, int]:
+    """Extract canonical usage from a raw chat or stream chunk response."""
+    if provider_type == LLMProviderType.ANTHROPIC:
+        return _anthropic_usage(getattr(response, "usage", None))
+    return _openai_usage(response)
+
+
 class OpenAIAdapter(BaseLLMAdapter):
     """OpenAI provider adapter."""
 
@@ -123,11 +178,7 @@ class OpenAIAdapter(BaseLLMAdapter):
         return LLMResponse(
             content=choice.message.content or "",
             model=response.model,
-            usage={
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            },
+            usage=_openai_usage(response),
             finish_reason=choice.finish_reason,
             raw_response=response,
         )
@@ -148,6 +199,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
             stream=True,
+            stream_options={"include_usage": True},
         )
 
         return stream
@@ -197,10 +249,7 @@ class AnthropicAdapter(BaseLLMAdapter):
         return LLMResponse(
             content=response.content[0].text,
             model=response.model,
-            usage={
-                "input_tokens": response.usage.input_tokens,
-                "output_tokens": response.usage.output_tokens,
-            },
+            usage=_anthropic_usage(response.usage),
             finish_reason=response.stop_reason,
             raw_response=response,
         )
@@ -273,11 +322,7 @@ class AzureAdapter(BaseLLMAdapter):
         return LLMResponse(
             content=choice.message.content or "",
             model=response.model,
-            usage={
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
-            },
+            usage=_openai_usage(response),
             finish_reason=choice.finish_reason,
             raw_response=response,
         )
@@ -292,6 +337,7 @@ class AzureAdapter(BaseLLMAdapter):
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
             stream=True,
+            stream_options={"include_usage": True},
         )
 
 
@@ -341,11 +387,7 @@ class OpenAIBasedAdapter(BaseLLMAdapter):
         return LLMResponse(
             content=choice.message.content or "",
             model=response.model,
-            usage={
-                "prompt_tokens": getattr(response.usage, "prompt_tokens", 0),
-                "completion_tokens": getattr(response.usage, "completion_tokens", 0),
-                "total_tokens": getattr(response.usage, "total_tokens", 0),
-            },
+            usage=_openai_usage(response),
             finish_reason=choice.finish_reason,
             raw_response=response,
         )

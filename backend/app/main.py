@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.app.api.dependencies.auth import (
     generate_api_key,
     hash_api_key,
+    get_rate_limiter,
     initialize_rate_limiter,
 )
 from backend.app.api.middleware import (
@@ -29,6 +30,7 @@ from backend.app.api.routes import (
     operations_router,
     webhooks_router,
 )
+from backend.app.gateway.admission import get_admission_gate, init_admission
 from backend.app.infrastructure.cache import get_cache_manager, init_cache
 from backend.app.infrastructure.db import (
     ApiKeyRepository,
@@ -102,10 +104,18 @@ async def lifespan(app: FastAPI):
     cache = init_cache(settings.REDIS_URL)
     queue = init_queue(settings.REDIS_URL)
     storage = init_storage()
+    admission = init_admission(
+        settings.REDIS_URL,
+        max_concurrent_per_tenant=settings.ADMISSION_MAX_CONCURRENT_PER_TENANT,
+        max_concurrent_platform=settings.ADMISSION_MAX_CONCURRENT_PLATFORM,
+        wait_seconds=settings.ADMISSION_WAIT_SECONDS,
+        lease_seconds=settings.ADMISSION_LEASE_SECONDS,
+    )
     await asyncio.gather(
         cache.initialize(),
         queue.initialize(),
         storage.initialize(),
+        admission.initialize(),
         initialize_rate_limiter(),
     )
 
@@ -119,7 +129,7 @@ async def lifespan(app: FastAPI):
     )
     yield
     await asyncio.gather(
-        db.close(), cache.close(), queue.close(), storage.close()
+        db.close(), cache.close(), queue.close(), storage.close(), admission.close()
     )
     logger.info("application_shutdown")
 
@@ -159,6 +169,11 @@ def create_application() -> FastAPI:
     app.include_router(model_catalog_router, prefix="/api/v1")
     app.include_router(operations_router, prefix="/api/v1")
 
+    @app.get("/health/live")
+    async def liveness_check():
+        """Liveness: process + ASGI reachable, no external dependencies."""
+        return {"status": "alive"}
+
     @app.get("/health")
     async def health_check():
         from backend.app.adapters.tracing import get_langfuse_adapter
@@ -182,6 +197,8 @@ def create_application() -> FastAPI:
             ("queue", get_queue_manager()),
             ("cache", get_cache_manager()),
             ("storage", get_storage_manager()),
+            ("admission", get_admission_gate()),
+            ("rate_limiter", get_rate_limiter()),
         ):
             components[name] = (await manager.health_check()).to_dict()
 

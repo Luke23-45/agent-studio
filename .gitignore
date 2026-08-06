@@ -41,6 +41,9 @@ logs/
 .env.local
 .env.*
 
+# Provider credential master key (dev fallback; KMS in production)
+provider_master.key
+
 # Coverage reports
 .coverage
 htmlcov/

@@ -96,6 +96,21 @@ class Settings(BaseSettings):
     RATE_LIMIT_MAX_REQUESTS: int = 300
     RATE_LIMIT_WINDOW_SECONDS: float = 60.0
 
+    # Admission control (concurrent in-flight generations per tenant)
+    ADMISSION_MAX_CONCURRENT_PER_TENANT: int = 5
+    ADMISSION_MAX_CONCURRENT_PLATFORM: int = 50
+    ADMISSION_WAIT_SECONDS: float = 5.0
+    ADMISSION_LEASE_SECONDS: int = 300
+
+    # Provider credential encryption (envelope, KMS-ready)
+    # Fernet key (urlsafe base64); KMS-injected in production.
+    PROVIDER_KEY_ENCRYPTION_KEY: str | None = None
+    # Dev fallback: file holding the Fernet key, auto-created on first use.
+    PROVIDER_KEY_ENCRYPTION_KEY_FILE: str = "provider_master.key"
+    # Platform-managed (global) provider keys allowed as fallback when a
+    # tenant has no key row. Production must set False (BYOK only).
+    PLATFORM_MANAGED_KEYS_ENABLED: bool = True
+
     @property
     def is_production(self) -> bool:
         return not self.DEBUG

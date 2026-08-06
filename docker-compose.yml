@@ -1,0 +1,81 @@
+# Neryva Agent Studio - dev parity compose stack (Arch 16, P0-12)
+# Usage: docker compose up --build
+# Production: replace SQLite/SQLite defaults via .env; Langfuse behind a profile.
+services:
+  api:
+    build:
+      context: .
+      dockerfile: ops/docker/backend.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://neryva:neryva@postgres:5432/neryva
+      REDIS_URL: redis://redis:6379
+      RUN_MIGRATIONS_ON_STARTUP: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: ops/docker/worker.Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+asyncpg://neryva:neryva@postgres:5432/neryva
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: pgvector/pgvector:pg18
+    environment:
+      POSTGRES_USER: neryva
+      POSTGRES_PASSWORD: neryva
+      POSTGRES_DB: neryva
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neryva -d neryva"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  langfuse:
+    image: langfuse/langfuse:2
+    profiles: ["observability"]
+    environment:
+      DATABASE_URL: postgresql://neryva:neryva@postgres:5432/neryva
+      NEXTAUTH_SECRET: dev-only-change-me
+      SALT: dev-only-change-me
+      ENCRYPTION_KEY: dev-only-change-me
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

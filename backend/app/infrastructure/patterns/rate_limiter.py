@@ -1,10 +1,46 @@
 import asyncio
 import structlog
 import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+from backend.app.infrastructure.patterns.health import (
+    HealthComponent,
+    HealthStatus,
+)
 
 logger = structlog.get_logger(__name__)
+
+# Distributed token bucket (single key -> Redis Cluster safe). Refills
+# continuously at max/window; returns {allowed, remaining}.
+_TOKEN_BUCKET_LUA = """
+local key = KEYS[1]
+local max = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local cost = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+
+local bucket = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(bucket[1])
+local ts = tonumber(bucket[2])
+
+if tokens == nil or ts == nil or now - ts >= window then
+    tokens = max
+else
+    tokens = math.min(max, tokens + (now - ts) * (max / window))
+end
+
+if tokens >= cost then
+    tokens = tokens - cost
+    redis.call('HMSET', key, 'tokens', tostring(tokens), 'ts', tostring(now))
+    redis.call('PEXPIRE', key, math.floor(window * 1000))
+    return {1, tokens}
+else
+    redis.call('HMSET', key, 'tokens', tostring(tokens), 'ts', tostring(now))
+    redis.call('PEXPIRE', key, math.floor(window * 1000))
+    return {0, tokens}
+end
+"""
 
 
 class RateLimitExceeded(Exception):
@@ -30,20 +66,29 @@ class _Bucket:
 
 
 class RateLimiter:
-    """Rate limiter with a distributed (Redis) fast path.
+    """Distributed token-bucket rate limiter with a visible fallback.
 
-    When Redis is available a fixed-window counter is shared across all
-    worker processes (multi-worker safe). Without Redis (or on Redis
-    failure) it degrades to the per-process token bucket so a limiter
-    outage can never take the API down.
+    Redis path (P0-9): a Lua token bucket shared across worker processes,
+    refilling continuously and Cluster-safe (one key per bucket). When
+    Redis is unavailable or fails, the limiter degrades to the per-process
+    token bucket — never taking the API down — but the degradation is
+    always visible: an alert-level log on the transition and a DEGRADED
+    health component (never silent).
     """
 
     def __init__(self, config: RateLimitConfig, redis_url: Optional[str] = None):
         self.config = config
         self._redis_url = redis_url
         self._redis: Any = None
+        self._script: Any = None
         self._buckets: Dict[str, _Bucket] = {}
         self._lock = asyncio.Lock()
+        self._degraded = False
+
+    @property
+    def degraded(self) -> bool:
+        """True while the limiter runs on the per-process fallback."""
+        return self._degraded
 
     async def initialize(self) -> None:
         if not self._redis_url:
@@ -57,32 +102,64 @@ class RateLimiter:
                 socket_timeout=1.0,
             )
             await self._redis.ping()
+            self._script = self._redis.register_script(_TOKEN_BUCKET_LUA)
+            self._degraded = False
             logger.info("rate_limiter_initialized", url=self._redis_url)
         except Exception as e:
-            logger.warning(
-                "rate_limiter_falling_back_to_memory",
+            self._redis = None
+            self._script = None
+            self._degraded = True
+            logger.error(
+                "rate_limiter_redis_unavailable_degraded",
                 url=self._redis_url,
                 error=str(e),
+                hint="rate limits are per-process until Redis recovers",
             )
-            self._redis = None
+
+    async def _try_redis_reconnect(self) -> None:
+        """Self-heal: re-ping once while degraded; clear the flag on success."""
+        if not self._redis or not self._degraded:
+            return
+        try:
+            await self._redis.ping()
+            self._script = self._redis.register_script(_TOKEN_BUCKET_LUA)
+            self._degraded = False
+            logger.info("rate_limiter_recovered", url=self._redis_url)
+        except Exception:
+            pass
 
     def _key(self, key: str) -> str:
         return f"{self.config.key_prefix}{key}"
 
     async def acquire(self, key: str, tokens: int = 1) -> bool:
         if self._redis:
+            await self._try_redis_reconnect()
             try:
                 return await self._redis_acquire(key, tokens)
             except Exception as e:
-                logger.warning("rate_limiter_redis_error_fallback", key=key, error=str(e))
+                if not self._degraded:
+                    self._degraded = True
+                    logger.error(
+                        "rate_limiter_redis_down_degraded",
+                        key=key,
+                        error=str(e),
+                        hint="rate limits are per-process until Redis recovers",
+                    )
         return await self._memory_acquire(key, tokens)
 
     async def _redis_acquire(self, key: str, tokens: int = 1) -> bool:
-        full_key = self._key(key)
-        count = await self._redis.incrby(full_key, tokens)
-        if count == tokens:
-            await self._redis.expire(full_key, int(self.config.window_seconds))
-        return count <= self.config.max_requests
+        now_ms = time.time() * 1000.0
+        allowed, _remaining = await self._script(
+            keys=[self._key(key)],
+            args=[
+                self.config.max_requests,
+                self.config.window_seconds,
+                tokens,
+                now_ms,
+            ],
+        )
+        # decode_responses=True: elements arrive as strings.
+        return int(allowed) == 1
 
     async def _memory_acquire(self, key: str, tokens: int = 1) -> bool:
         async with self._lock:
@@ -121,10 +198,15 @@ class RateLimiter:
     async def get_remaining(self, key: str) -> float:
         if self._redis:
             try:
-                count = await self._redis.get(self._key(key))
-                if count is None:
+                bucket = await self._redis.hgetall(self._key(key))
+                if not bucket:
                     return float(self.config.max_requests)
-                return max(0.0, float(self.config.max_requests) - float(count))
+                tokens = float(bucket.get("tokens", 0.0))
+                ts = float(bucket.get("ts", 0.0))
+                now_ms = time.time() * 1000.0
+                if now_ms - ts >= self.config.window_seconds * 1000.0:
+                    return float(self.config.max_requests)
+                return max(0.0, min(float(self.config.max_requests), tokens))
             except Exception:
                 pass
         bucket = self._buckets.get(key)
@@ -140,3 +222,12 @@ class RateLimiter:
                 pass
         async with self._lock:
             self._buckets.pop(key, None)
+
+    async def health_check(self) -> HealthComponent:
+        if self._degraded:
+            return HealthComponent(
+                name="rate_limiter",
+                status=HealthStatus.DEGRADED,
+                message="Redis unavailable; limits are per-process only",
+            )
+        return HealthComponent(name="rate_limiter", status=HealthStatus.HEALTHY)

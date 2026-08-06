@@ -24,7 +24,10 @@ from .models import (
     ModelCatalogModel,
     PolicyRuleModel,
     PolicySetModel,
+    SpendEventModel,
     TenantModel,
+    TenantConfigVersionModel,
+    TenantProviderKeyModel,
     WebhookDeliveryModel,
     WebhookEventModel,
     WebhookSubscriptionModel,
@@ -375,6 +378,180 @@ class ApiKeyRepository:
                 .where(ApiKeyModel.revoked.is_(False))
             )
             return int(result.scalar_one())
+
+
+class SpendEventRepository:
+    """Append-only usage/spend events (Arch 10 cost ledger, P0-10)."""
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def add(self, record: dict[str, Any]) -> dict[str, Any]:
+        record = dict(record)
+        record.setdefault("id", str(uuid4()))
+        async with self.db.get_session() as session:
+            model = SpendEventModel(**record)
+            session.add(model)
+            await session.flush()
+            return _row_to_dict(model)
+
+
+class TenantConfigVersionRepository:
+    """Immutable, versioned tenant config (Arch 12, P0-11).
+
+    Versions are append-only: creating a draft writes a new row and
+    promoting one publishes it (superseding any previously published
+    version). The runtime reads the latest published version.
+    """
+
+    STATUS_DRAFT = "draft"
+    STATUS_PUBLISHED = "published"
+    STATUS_SUPERSEDED = "superseded"
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def list_versions(self, tenant_id: str) -> list[dict[str, Any]]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(TenantConfigVersionModel)
+                .where(TenantConfigVersionModel.tenant_id == tenant_id)
+                .order_by(TenantConfigVersionModel.version.desc())
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def get_latest_published(self, tenant_id: str) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(TenantConfigVersionModel)
+                .where(
+                    TenantConfigVersionModel.tenant_id == tenant_id,
+                    TenantConfigVersionModel.status == self.STATUS_PUBLISHED,
+                )
+                .order_by(TenantConfigVersionModel.version.desc())
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def create_draft(
+        self, tenant_id: str, config: dict[str, Any], promoted_by: str | None = None
+    ) -> dict[str, Any]:
+        """Append a new immutable draft (version = latest + 1)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(func.max(TenantConfigVersionModel.version)).where(
+                    TenantConfigVersionModel.tenant_id == tenant_id
+                )
+            )
+            next_version = (result.scalar() or 0) + 1
+            model = TenantConfigVersionModel(
+                id=str(uuid4()),
+                tenant_id=tenant_id,
+                version=next_version,
+                config=config,
+                status=self.STATUS_DRAFT,
+                promoted_by=promoted_by,
+            )
+            session.add(model)
+            await session.flush()
+            return _row_to_dict(model)
+
+    async def promote(
+        self, tenant_id: str, version: int, promoted_by: str | None = None
+    ) -> dict[str, Any] | None:
+        """Publish/rollback: promote a version, supersede the previous one."""
+        async with self.db.get_session() as session:
+            await session.execute(
+                update(TenantConfigVersionModel)
+                .where(
+                    TenantConfigVersionModel.tenant_id == tenant_id,
+                    TenantConfigVersionModel.status == self.STATUS_PUBLISHED,
+                )
+                .values(status=self.STATUS_SUPERSEDED)
+            )
+            result = await session.execute(
+                select(TenantConfigVersionModel).where(
+                    TenantConfigVersionModel.tenant_id == tenant_id,
+                    TenantConfigVersionModel.version == version,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            row.status = self.STATUS_PUBLISHED
+            row.published_at = _now()
+            row.promoted_by = promoted_by
+            await session.flush()
+            return _row_to_dict(row)
+
+
+class TenantProviderKeyRepository:
+    """Per-tenant provider credentials (Arch 6.3.9, P0-8).
+
+    Encrypted secrets only; decryption happens in the keys service.
+    ``upsert`` bumps ``key_version`` (rotation) and never returns the secret.
+    """
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def get(self, tenant_id: str, provider: str) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(TenantProviderKeyModel).where(
+                    TenantProviderKeyModel.tenant_id == tenant_id,
+                    TenantProviderKeyModel.provider == provider,
+                )
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def upsert(
+        self,
+        tenant_id: str,
+        provider: str,
+        encrypted_key: str,
+        key_source: str,
+        kms_ref: str | None = None,
+    ) -> dict[str, Any]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(TenantProviderKeyModel).where(
+                    TenantProviderKeyModel.tenant_id == tenant_id,
+                    TenantProviderKeyModel.provider == provider,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row:
+                row.encrypted_key = encrypted_key
+                row.kms_ref = kms_ref
+                row.key_source = key_source
+                row.key_version = row.key_version + 1
+                await session.flush()
+                return _row_to_dict(row)
+            model = TenantProviderKeyModel(
+                id=str(uuid4()),
+                tenant_id=tenant_id,
+                provider=provider,
+                encrypted_key=encrypted_key,
+                kms_ref=kms_ref,
+                key_source=key_source,
+                key_version=1,
+            )
+            session.add(model)
+            await session.flush()
+            return _row_to_dict(model)
+
+    async def delete(self, tenant_id: str, provider: str) -> bool:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                delete(TenantProviderKeyModel).where(
+                    TenantProviderKeyModel.tenant_id == tenant_id,
+                    TenantProviderKeyModel.provider == provider,
+                )
+            )
+            return result.rowcount > 0
 
 
 class EscalationRepository:

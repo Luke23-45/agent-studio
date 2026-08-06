@@ -8,6 +8,9 @@ from .repositories import (
     EvidenceRepository,
     ModelCatalogRepository,
     PolicyRepository,
+    SpendEventRepository,
+    TenantConfigVersionRepository,
+    TenantProviderKeyRepository,
     TenantRepository,
     WebhookRepository,
 )
@@ -25,6 +28,9 @@ __all__ = [
     "EvidenceRepository",
     "ModelCatalogRepository",
     "PolicyRepository",
+    "SpendEventRepository",
+    "TenantConfigVersionRepository",
+    "TenantProviderKeyRepository",
     "TenantRepository",
     "WebhookRepository",
 ]
