@@ -1,0 +1,19 @@
+[
+  {
+    "name": "retention-sweep-daily",
+    "job_type": "cleanup.run",
+    "interval_seconds": 86400,
+    "payload": {
+      "limit": 1000,
+      "requeue_dead_letter": true
+    }
+  },
+  {
+    "name": "redteam-weekly",
+    "job_type": "redteam.run",
+    "interval_seconds": 604800,
+    "payload": {
+      "tenant_id": null
+    }
+  }
+]

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neryva.dev/contracts/schemas/tenant-config.v1.schema.json",
+  "title": "Tenant configuration (v1)",
+  "description": "Payload for POST /api/v1/tenants and the shape stored in the tenants table + JSON cache. Defaults are merged by tenant_config_from_data.",
+  "type": "object",
+  "required": ["slug", "name"],
+  "properties": {
+    "slug": { "type": "string", "minLength": 1, "pattern": "^[a-z0-9-]+$" },
+    "name": { "type": "string", "minLength": 1 },
+    "allowed_topics": { "type": "array", "items": { "type": "string" } },
+    "blocked_topics": { "type": "array", "items": { "type": "string" } },
+    "escalation_threshold": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+    "knowledge_allowlist": { "type": "array", "items": { "type": "string" } },
+    "default_provider": {
+      "type": "string",
+      "enum": ["openai", "anthropic", "google", "azure", "custom"]
+    },
+    "default_model": { "type": "string" },
+    "features": { "type": "object", "additionalProperties": { "type": "boolean" } },
+    "guardrail_config": {
+      "type": "object",
+      "additionalProperties": { "type": "boolean" }
+    },
+    "guardrail_thresholds": {
+      "type": "object",
+      "additionalProperties": { "type": "number" }
+    },
+    "budgets": {
+      "type": "object",
+      "properties": {
+        "max_redact_iterations": { "type": "number", "minimum": 0 },
+        "max_graph_steps": { "type": "number", "minimum": 1 },
+        "max_duration_s": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

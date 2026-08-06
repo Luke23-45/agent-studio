@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neryva.dev/contracts/events/webhook-envelope.v1.schema.json",
+  "title": "Neryva webhook envelope (v1)",
+  "description": "The signed payload POSTed to every webhook subscriber. See the X-Neryva-Signature header for HMAC verification (signer.py).",
+  "type": "object",
+  "required": ["event_id", "event_type", "tenant_id", "occurred_at", "data"],
+  "properties": {
+    "event_id": { "type": "string", "format": "uuid" },
+    "event_type": {
+      "type": "string",
+      "enum": ["conversation.completed", "guardrail.blocked"]
+    },
+    "tenant_id": { "type": "string", "format": "uuid" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "data": {
+      "type": "object",
+      "description": "Event-specific payload; see conversation.completed.schema.json / guardrail.blocked.schema.json"
+    }
+  }
+}

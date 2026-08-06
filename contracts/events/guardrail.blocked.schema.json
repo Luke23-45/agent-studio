@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neryva.dev/contracts/events/guardrail.blocked.v1.schema.json",
+  "title": "guardrail.blocked event data (v1)",
+  "description": "Published when a message is blocked by input guardrails (EVENT_GUARDRAIL_BLOCKED). Delivered inside the webhook envelope's data field.",
+  "type": "object",
+  "required": ["session_id", "violations"],
+  "properties": {
+    "session_id": { "type": "string" },
+    "violations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["category", "severity"],
+        "properties": {
+          "category": { "type": "string" },
+          "severity": {
+            "type": "string",
+            "enum": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+          },
+          "description": { "type": ["string", "null"] },
+          "matched_text": { "type": ["string", "null"] },
+          "position": { "type": ["array", "null"] },
+          "metadata": { "type": "object" }
+        }
+      }
+    }
+  }
+}

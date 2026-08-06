@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neryva.dev/contracts/schemas/evidence-packet.v1.schema.json",
+  "title": "Guardrail decision evidence packet (v1)",
+  "description": "One packet persisted per processed message (direction=policy), recording the decision and the rule-level detail needed for ISO-42001 A.9 / audit export.",
+  "type": "object",
+  "required": [
+    "tenant_id", "conversation_id", "session_id", "direction",
+    "decision", "allowed", "input_hash", "violations",
+    "layers_evaluated", "processing_time_ms"
+  ],
+  "properties": {
+    "tenant_id": { "type": "string", "format": "uuid" },
+    "conversation_id": { "type": ["string", "null"] },
+    "session_id": { "type": "string" },
+    "direction": { "type": "string", "enum": ["policy"] },
+    "decision": { "type": "string", "enum": ["ALLOW", "BLOCK", "ESCALATE", "REDACT"] },
+    "allowed": { "type": "boolean" },
+    "input_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "violations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["rule_id", "name", "action", "policy_type", "conditions", "priority"],
+        "properties": {
+          "rule_id": { "type": "string" },
+          "name": { "type": "string" },
+          "action": { "type": "string" },
+          "policy_type": { "type": "string" },
+          "conditions": { "type": "object" },
+          "priority": { "type": "integer" }
+        }
+      }
+    },
+    "layers_evaluated": { "type": "array", "items": { "type": "string" } },
+    "processing_time_ms": { "type": "number", "minimum": 0 },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "confidence": { "type": "number" },
+        "escalation_threshold": { "type": "number" },
+        "handoff_required": { "type": "boolean" },
+        "redact_attempts": { "type": "integer" },
+        "has_response": { "type": "boolean" }
+      }
+    }
+  }
+}

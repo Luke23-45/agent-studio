@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neryva.dev/contracts/events/sse-stream.v1.schema.json",
+  "title": "SSE conversation stream events (v1)",
+  "description": "Server-Sent Events emitted by POST /conversations/stream. Each frame is 'event: <name>\\ndata: <json>\\n\\n'. All events below are versioned together.",
+  "oneOf": [
+    {
+      "title": "session",
+      "type": "object",
+      "required": ["session_id"],
+      "properties": { "session_id": { "type": "string" } },
+      "additionalProperties": false
+    },
+    {
+      "title": "guardrails",
+      "type": "object",
+      "required": ["valid", "blocked", "violations"],
+      "properties": {
+        "valid": { "type": "boolean" },
+        "blocked": { "type": "boolean" },
+        "violations": { "type": "array" }
+      }
+    },
+    {
+      "title": "delta",
+      "type": "object",
+      "required": ["content"],
+      "properties": { "content": { "type": "string" } },
+      "additionalProperties": false
+    },
+    {
+      "title": "result",
+      "type": "object",
+      "required": ["response", "confidence", "handoff_required"],
+      "properties": {
+        "response": { "type": "string" },
+        "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+        "handoff_required": { "type": "boolean" },
+        "budget_exceeded": { "type": "boolean" },
+        "citations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "source": { "type": ["string", "null"] },
+              "document_id": { "type": ["string", "null"] },
+              "chunk_id": { "type": ["string", "null"] },
+              "score": { "type": "number" }
+            }
+          }
+        },
+        "faithfulness": {
+          "type": ["object", "null"],
+          "properties": {
+            "score": { "type": "number" },
+            "grounded": { "type": "boolean" },
+            "source_count": { "type": "integer" },
+            "matches": { "type": "array", "items": { "type": "string" } },
+            "checked": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    {
+      "title": "error",
+      "type": "object",
+      "required": ["error"],
+      "properties": { "error": { "type": "string" } },
+      "additionalProperties": false
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Neryva Widget — playground</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 0;
+        padding: 40px;
+        background: #f9fafb;
+      }
+      h1 {
+        font-size: 20px;
+        margin-bottom: 8px;
+      }
+      p {
+        color: #6b7280;
+        font-size: 14px;
+      }
+      code {
+        background: #eef2ff;
+        padding: 2px 6px;
+        border-radius: 4px;
+        font-size: 13px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Neryva Widget playground</h1>
+    <p>
+      Configure the attributes below; the widget talks to the backend through the
+      <code>/api</code> dev proxy (backend on :8000).
+    </p>
+
+    <neryva-widget
+      tenant="acme"
+      api-key="nrv_live_dev"
+      title="Support Assistant"
+    ></neryva-widget>
+
+    <script type="module" src="/src/index.ts"></script>
+  </body>
+</html>

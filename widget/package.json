@@ -1,0 +1,18 @@
+{
+  "name": "neryva-widget",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Neryva Agent Studio - customer-facing embeddable chat widget",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vite": "^6.0.0"
+  }
+}

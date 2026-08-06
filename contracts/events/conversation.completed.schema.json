@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neryva.dev/contracts/events/conversation.completed.v1.schema.json",
+  "title": "conversation.completed event data (v1)",
+  "description": "Published on every successfully processed conversation message (EVENT_CONVERSATION_COMPLETED). Delivered inside the webhook envelope's data field.",
+  "type": "object",
+  "required": ["session_id", "handoff_required", "confidence"],
+  "properties": {
+    "session_id": { "type": "string" },
+    "handoff_required": { "type": "boolean" },
+    "confidence": {
+      "type": "number",
+      "minimum": 0.0,
+      "maximum": 1.0
+    }
+  }
+}
