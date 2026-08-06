@@ -242,6 +242,10 @@ def tenant_config_from_data(data: dict[str, Any]) -> TenantConfig:
     default_tool_clearing = {
         "keep_recent_turns": 2.0,
     }
+    default_memory = {
+        "max_facts": 20.0,
+        "expiry_days": 30.0,
+    }
     return TenantConfig(
         id=UUID(data["id"]),
         name=data["name"],
@@ -262,6 +266,7 @@ def tenant_config_from_data(data: dict[str, Any]) -> TenantConfig:
         },
         budgets={**default_budgets, **data.get("budgets", {})},
         tool_clearing={**default_tool_clearing, **data.get("tool_clearing", {})},
+        memory={**default_memory, **data.get("memory", {})},
     )
 
 

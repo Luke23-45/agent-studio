@@ -459,37 +459,72 @@ Each row: current implementation component vs its architecture requirement → v
 - Full suite: 289 passed, 16 skipped (Redis down); failures = the 6 known pre-existing only.
 
 ### P2-7 — Tool-result clearing (+ thinking clearing)
-**Status:** `[ ]` · **Depends:** P2-1 · **Arch:** §8.3
+**Status:** `[x]` · **Depends:** P2-1 · **Arch:** §8.3
 **Subtasks:**
-- [ ] Sub-transcript op: superseded, re-fetchable tool results → placeholders (keep `tool_use` record, drop payload); configurable trigger.
-- [ ] Thinking-block clearing for extended-thinking traffic — evaluate Anthropic context-editing API (`clear_thinking_20251015`, beta `context-management-2025-06-27`) vs bespoke; record decision (D-12).
-- [ ] Tests: space reclaimed; re-fetch works; audit shows placeholders.
+- [x] Sub-transcript op: superseded, re-fetchable tool results → placeholders (keep `tool_use` record, drop payload); configurable trigger.
+- [x] Thinking-block clearing for extended-thinking traffic — evaluate Anthropic context-editing API (`clear_thinking_20251015`, beta `context-management-2025-06-27`) vs bespoke; record decision (D-12).
+- [x] Tests: space reclaimed; re-fetch works; audit shows placeholders.
 **Acceptance:** agentic turns cannot bloat context via stale tool payloads.
+**Notes (2026-08-06):**
+- **Durable sub-transcript op.** `ThreadRepository.clear_tool_results` (one transaction: thread row locked → parts updated → `tool_result.clear` event appended). Every `tool_result` part with `seq <= latest_seq - keep_recent_turns` has its content replaced by `{"tool_use_id", "cleared": True}` — the payload is dropped but `tool_use_id` survives so the tool can be re-fetched on demand; `tool_use` parts are untouched (the record remains, only the payload is reclaimed). `redacted_content` carries `placeholder` (`TOOL_RESULT_PLACEHOLDER`, "[tool result cleared; re-fetch on demand]") for audit. Idempotent: already-cleared parts are skipped and no event is written when nothing was cleared (re-runs are free).
+- **Configurable trigger.** Tenant feature `features["clear_tool_results"]` (off by default) gates everything; per-tenant `tool_clearing["keep_recent_turns"]` (default 2, new `TenantConfig.tool_clearing` field + `tenant_config_from_data` default-merge) keeps the newest turns fully legible. `backend/app/application/clearing/` (`clear_stale_tool_results`, `tool_clearing_config`) — missing tenant/thread degrade to a reason dict, never raise from a background job.
+- **Render-time enforcement.** `_load_history_turns` flags turns via `list_tool_result_seqs` (live = non-cleared parts only); the orchestrator passes `clear_tool_payloads` from the tenant feature so the assembler substitutes `TOOL_RESULT_PLACEHOLDER`. Stale payloads can never reach the model even before the background op runs — this is the primary defense (Arch 8.3), the durable op is the reclaim.
+- **Background job.** `tool_result.clear` worker handler (targeted tenant+thread, feature-checked, skips logged) registered in `build_handlers`; the route enqueues it on turn completion (Arch 9.1 step 8) with idempotency key `tool-clear:{thread_id}`; enqueue failures never break the turn.
+- **Bugfix (latent, found while wiring):** the route passes `ContextTurn` instances in `conversation_history` but `_assemble_context` and the handoff renderer called `.get()` on them (AttributeError on any real session with history > 0); both now accept dicts AND `ContextTurn`.
+- **D-12 resolved:** thinking clearing adopts Anthropic's context-editing API `clear_thinking_20251015` (beta `context-management-2025-06-27`) for Claude-routed extended-thinking traffic — enabled alongside tool-result clearing per Arch §8.3, not a bespoke equivalent; store-side clearable parts remain the provider-agnostic fallback + audit.
+- Tests `backend/tests/test_tool_clearing.py` (22): durable op (reclaim keeps `tool_use` record + audit placeholder, idempotent re-run writes no event, recency guard, multi-message reclaim, unknown thread raises), render-time marker (live-only seqs; route turns flagged then unflagged after the op), service (config derivation, disabled noop, config from DB row, keep_recent override, missing thread/tenant degrade), orchestration swap gated by feature (on → placeholder, off → passthrough, `ContextTurn` instances accepted), worker handler (targeted clear, disabled skip, missing thread benign, missing payload raises, job registered). `test_worker.py` handler-set updated with `tool_result.clear`.
+- Targeted suites (worker, compaction, refresh, assembler, orchestration, cache-discipline): 107 passed + 22 new, zero regressions; full suite deferred to a quiet window (6 known pre-existing failures unchanged).
 
 ### P2-8 — Memory (opt-in, tenant-gated)
-**Status:** `[ ]` · **Depends:** P2-1 · **Arch:** §8.4
+**Status:** `[x]` · **Depends:** P2-1 · **Arch:** §8.4
 **Subtasks:**
-- [ ] Background worker extracts durable structured facts from closed turns → per-tenant/per-end-user memory store; versioned, retrievable, PII-filtered.
-- [ ] Assembler fetches top-k relevant facts on demand; tenant controls read scope + expiry.
-- [ ] Erasure support (ties P5-10).
-- [ ] Build-vs-adopt spike (D-2): Anthropic first-party memory tool for Claude-routed traffic vs bespoke store.
+- [x] Background worker extracts durable structured facts from closed turns → per-tenant/per-end-user memory store; versioned, retrievable, PII-filtered.
+- [x] Assembler fetches top-k relevant facts on demand; tenant controls read scope + expiry.
+- [x] Erasure support (ties P5-10).
+- [x] Build-vs-adopt spike (D-2): Anthropic first-party memory tool for Claude-routed traffic vs bespoke store.
 **Acceptance:** memory ships gated behind tenant consent; PII-filtered; fully erasable.
+**Notes (2026-08-06):**
+- **Store.** `MemoryModel` (`memories` table) + `MemoryRepository`: per-tenant, optional per-end-user scoping (`end_user_id` NULL = tenant-global facts for API-key sessions), `version` (1 today; bump path for P3-x dedup/refresh), `expires_at` (tenant `memory.expiry_days`, 0 = no expiry), `erased` soft-delete. Reads never surface erased or expired facts. `list_threads_pending_extraction` (LEFT JOIN of max message seq vs max extracted source_seq) is the sweep source.
+- **Extraction.** `backend/app/application/memory/` — `MemoryExtractor` (LLM, JSON-array-of-strings, strict validation; malformed output raises `MemoryExtractionError` so the queue retries/DLQs — garbage never stored). `extract_thread_memory`: reads REDACTED turns only (P0-5), newest message excluded (in-flight turn is not closed), watermark = `max(source_seq)` per thread → idempotent re-runs (no LLM call when nothing new). Every fact is re-passed through the PII service before storage — only the redacted text is ever persisted (fail-closed). `source_seq` of the batch = newest closed turn, so the watermark advances with the batch.
+- **Read path.** `retrieve_facts` (top-k on demand, never a raw dump): keyword relevance scored against the current message (query-token hits, recency tiebreak), bound by tenant `memory.max_facts`, scoped to the end-user. The orchestrator's `memory_retriever` hook (route-wired) feeds the existing `memory_facts` block of the assembler; used only when `features["memory"]` is on; retrieval failures are logged and never break a turn.
+- **Background job.** `memory.extract` worker handler (targeted or sweep), feature-gated, key-checked like `summary.refresh`; PII pass gated on `ENABLE_PRESIDIO` with a logged skip when presidio is absent (facts still originate from redacted turns + the extraction prompt forbids personal data). Route enqueues on turn completion (Arch 9.1 step 8) with idempotency key `memory-extract:{thread_id}`; enqueue failures never break the turn.
+- **Erasure.** `erase_end_user_memory` service + repo `erase_by_user`/`erase_by_thread`/`erase_by_id`/`prune_expired` — soft deletes (audit-safe), the cross-cutting P5-10 sweep can reuse them.
+- **D-2 resolved:** bespoke provider-agnostic store now (Arch §8.4: the store is required for non-Claude traffic regardless); the Anthropic first-party memory tool is NOT a replacement — prototype it as an adapter option for Claude-routed traffic in the P2-9 runtime loop, not a parallel store.
+- Tests `backend/tests/test_memory.py` (22): store scoping per end-user, erased+expired exclusion, soft-erase counts, prune, watermark + pending-thread sweep query, config derivation (feature gate + max_facts/expiry_days + `tenant_config_from_data` default-merge), extractor JSON parsing + strict rejection, extraction e2e (PII redaction of a stored fact, watermark advance, idempotent re-run without a second LLM call, latest-message exclusion, missing thread), top-k relevance ordering, erasure service, orchestration (memory block rendered when feature on / skipped when off / survives retriever failure), worker handler (targeted, disabled skip, sweep, registration). `test_worker.py` handler-set updated with `memory.extract`.
+- Targeted suites (worker, tool-clearing, orchestration, compaction, cache-discipline): 97 passed + 22 new, zero regressions; full suite deferred to a quiet window (6 known pre-existing failures unchanged).
 
 ### P2-9 — Orchestration loop on the session engine
-**Status:** `[ ]` · **Depends:** P2-1, P2-3 · **Arch:** §8, §9.3
+**Status:** `[x]` · **Depends:** P2-1, P2-3 · **Arch:** §8, §9.3
 **Subtasks:**
-- [ ] New runtime loop (screen → retrieve → generate → authorize → verify → reply/escalate) consumes assembler output; tool parts flow through the loop and persist as first-class parts each turn (ties P5-3).
-- [ ] Bounded re-ask on verify failure; escalate on repeated failure.
-- [ ] End-to-end tests through the real pipeline.
+- [x] New runtime loop (screen → retrieve → generate → authorize → verify → reply/escalate) consumes assembler output; tool parts flow through the loop and persist as first-class parts each turn (ties P5-3).
+- [x] Bounded re-ask on verify failure; escalate on repeated failure.
+- [x] End-to-end tests through the real pipeline.
 **Acceptance:** one assembly path; parts persisted; provider prompt fully redacted.
 
+**Notes (2026-08-07):**
+- **Adapter tool protocol** (`app/adapters/llm/provider.py`): `LLMResponse.tool_calls` (`[{id, name, arguments}]`, arguments decoded dict, malformed JSON kept verbatim) + `LLMConfig.tools` (OpenAI function format). OpenAI/OpenAI-compat/Azure send `tools=` when configured and parse `message.tool_calls`; Anthropic sends `tools` only when non-empty (empty-list bug fixed) and parses content blocks via `_parse_anthropic_content` (text + tool_use) — this also fixes the latent AttributeError when the model replies tool-only (old code read `content[0].text`).
+- **Tool registry** (new `app/application/tools/registry.py`): `ToolRegistry` (register/get/list/schemas/execute), `ToolSpec` (sync or async executor), `ToolAlreadyRegisteredError`; `execute()` never raises — unknown tool → `is_error` result, executor exceptions captured as error results, non-dict outcomes normalized.
+- **Orchestrator** (`app/application/orchestration/service.py`): graph now `generate_response → execute_tools (conditional) → generate_response`; `AgentState` gains `tool_calls/tool_parts/tool_results/tool_steps/tool_budget_exhausted/verify_retries/verify_note/verify_exhausted`. `_generate_response` runs the bounded tool loop inside the while: tool results from prior steps rendered as `[tool_result ...]` user-role text blocks, tool schemas advertised per generation (client cached per tenant/provider/model), late tool calls dropped once `tool_budget_exhausted` (default `budgets.max_tool_steps` = 4). `_execute_tools` authorizes each call through `tool_authorizer` (fail-closed: exceptions deny), runs calls concurrently via `asyncio.gather`, emits `tool_use`/`tool_result` parts through `tool_callback` (failures logged, never raised). Verification bounded re-ask: invalid → `verify_note` user message (faithfulness via FaithfulnessChecker when docs retrieved, empty-response guard); after `budgets.max_verify_retries` (default 2) → `verify_exhausted` + handoff. Streaming: `_generate_response_streaming` reconstructs tool calls per provider (OpenAI-family `delta.tool_calls`, Anthropic `content_block_start`/`input_json_delta`, Gemini native `function_call` fallback); malformed fragments raise `StreamToolParseError` → one non-streaming retry; a stale inner `break` (pre-P2-9) that skipped tool-call routing was removed.
+- **Route wiring** (`app/api/routes/conversations.py`): `_build_tool_callback` — each tool part persists as its own first-class assistant message (part_index 0 = canonical text part, tool part follows), `request_id` = `{request_id}:tool:{hex8}` (dedup-safe), PII-redaction of tool-result payloads before storage when `ENABLE_PRESIDIO` (get_pii_service RuntimeError → logged warning, raw preserved). Wired into both `/conversations` and `/conversations/stream` after the evidence callback.
+- **Tests** (`backend/tests/test_tool_loop.py`, 28 passed): registry semantics, full loop round trip, budget exhaustion (final regeneration advertises no tools), authorizer deny/raise fail-closed, unknown tool, concurrent calls, malformed args, stream fragment reconstruction (OpenAI/Anthropic) + malformed → chat fallback, `_finalize_stream_tool_calls` strictness, verify re-ask / escalation / grounded pass, adapter tool protocol (send/parse/omit-when-empty/tool-only round trip), route-level part persistence via real ThreadRepository (test double fixes: adapter script off-by-one, `_Retrieval` result missing `.context`, `TenantRepository` import path, parts at index 1 after the canonical text part).
+- **Verification:** `tests/test_tool_loop.py` 28 passed; regression sweep (streaming, orchestration, rag-isolation, compaction, cache-discipline, memory, worker, tool-clearing) 144 passed with the single pre-existing known failure (`test_deltas_and_result` — deny-by-default BLOCK on an empty rule set reaching handoff, pre-existing, untouched); py_compile clean on all changed files.
+
 ### P2-10 — Compaction quality evals
-**Status:** `[ ]` · **Depends:** P2-3 · **Arch:** §8.2, §17
+**Status:** `[x]` · **Depends:** P2-3 · **Arch:** §8.2, §17
 **Subtasks:**
-- [ ] Round-trip eval: facts present before compaction answerable after; per-tenant summary prompt + keep/buffer tuning harness.
-- [ ] Bad-compaction detection surfaced to operators (context-rot alert, ties P6-4).
-- [ ] Baseline datasets in `evals/datasets/`.
+- [x] Round-trip eval: facts present before compaction answerable after; per-tenant summary prompt + keep/buffer tuning harness.
+- [x] Bad-compaction detection surfaced to operators (context-rot alert, ties P6-4).
+- [x] Baseline datasets in `evals/datasets/`.
 **Acceptance:** compaction quality measured per tenant, never assumed.
+
+**Notes (2026-08-07):**
+- **Round-trip fact retention** (new `app/application/compaction/eval.py`): a probe passes when a fact answerable from the pre-compaction head stays answerable from the rendered summary. `LexicalFactScorer` (exact-fact, normalization-insensitive, deterministic) and `LLMJudgeScorer` (paraphrase-tolerant, one LLM call per probe) — both fail closed (empty summary, judge errors, garbage verdicts all count as failed, never assumed retained).
+- **Harness** (`CompactionQualityEvaluator`): per-case summarize → schema-validate → render → score; keep-tokens split mirrors `CompactionService._split` (facts lying in the kept-live tail are skipped — their absence is not a retention failure; ungrounded probes are rejected at dataset load); `aggregate_results` (per-fact ratio, min, degraded count); `run_tuning_harness` runs a prompt × keep-tokens matrix for per-tenant prompt/keep tuning. `LLMSummaryGenerator` gained a `prompt` override (must keep the `{conversation}` placeholder; defaults to the stock prompt; per-tenant prompt wiring hooks here in P6-4).
+- **Context-rot detection surfaced to operators**: (1) `CompactionService` config flags `quality_check` (default False — production behavior unchanged) + `quality_threshold` (0.6): when enabled, `compact()` generates probes from the turns the new layer covers (one extra LLM call, hallucination-guarded: every answer must appear verbatim in the turns) and logs `compaction_quality_low`/`compaction_quality_ok` — the checkpoint still commits, quality is measured, never blocks; a failed check logs `compaction_quality_check_failed` and is ignored. (2) `CompactionQualityMonitor.evaluate_thread` — on-demand operator check of a live thread's summary checkpoint with a retention threshold (low → warning + `low_quality` flag; the signal P6-4's alert transport consumes).
+- **Baseline dataset** `evals/datasets/compaction/baseline.jsonl`: 5 labeled cases (refund window, shipping delay, subscription upgrade, password reset, billing dispute), 4-5 probes each, every answer verbatim in the turns (grounding enforced by the loader).
+- **CLI** `evals/run_compaction_eval.py`: dataset → provider adapter (env or flags) → per-case report → aggregate; exits non-zero below `--threshold` (CI-able); `--prompt-file`, `--keep-tokens`, `--judge`, `--verbose` knobs.
+- **Tests** (`backend/tests/test_compaction_evals.py`, 33 passed): scorer semantics/normalization/fail-closed, judge yes/no parsing + inconclusive/error fail-closed, dataset loader + validation + duplicate ids + baseline grounding, perfect/lossy/degraded round trips, probe skipping (ungrounded + tail-excluded), keep-tokens split, tuning matrix ordering, prompt override flows into the summarizer prompt, probe extraction (hallucination guard, loose-schema tolerance, max cap, fail-closed), monitor threshold/degraded/scorer-failure, and CompactionService integration (flag off → no probe calls; on → low warning + commit still happens; check failure never blocks the swap).
+- **Verification:** eval suite 33 passed; compaction + refresh + orchestration + streaming + tool-loop + rag-isolation + worker regression 156 passed (single pre-existing known failure `test_deltas_and_result` unchanged); ruff clean on new/changed files (2 pre-existing findings in untouched lines); CLI smoke-tested end-to-end against a fake OpenAI-compatible server (report + exit code path; the provider call itself needs the declared `openai`/`anthropic` runtime deps, absent in the sandbox).
 
 ---
 
@@ -966,7 +1001,7 @@ Each row: current implementation component vs its architecture requirement → v
 | ID | Decision | Blocks | Status |
 |---|---|---|---|
 | D-1 | Gateway: build bespoke vs adopt LiteLLM (re-costed vs Rust core) | P3-2…P3-8 | [ ] |
-| D-2 | Memory: bespoke worker vs Anthropic first-party memory tool | P2-8 | [ ] |
+| D-2 | Memory: bespoke worker vs Anthropic first-party memory tool | P2-8 | [x] |
 | D-3 | Streaming moderation window latency knob default | P4-3 | [ ] |
 | D-4 | Semantic cache invalidation strategy + tests | P3-7 | [ ] |
 | D-5 | Multi-region timing (L2+ trigger) | P8-5 | [ ] |
@@ -976,7 +1011,7 @@ Each row: current implementation component vs its architecture requirement → v
 | D-9 | RLS timing (now vs L2) | P5-6 | [ ] |
 | D-10 | Harness fork/replay: OpenCode-derived vs Claude Agent SDK | P7-5 | [ ] |
 | D-11 | Guardrail service registries: per-process (L1) vs Redis-backed now | P0-13/P5-5 | [ ] |
-| D-12 | Thinking clearing: Anthropic context-editing API vs bespoke | P2-7 | [ ] |
+| D-12 | Thinking clearing: Anthropic context-editing API vs bespoke | P2-7 | [x] |
 
 ---
 

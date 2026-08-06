@@ -10,6 +10,9 @@ from typing import Any, Callable, Dict
 
 from backend.app.infrastructure.queue.manager import Job, get_queue_manager
 
+from backend.app.application.clearing import JOB_TOOL_RESULT_CLEAR
+from backend.app.application.memory import JOB_MEMORY_EXTRACT
+
 logger = structlog.get_logger(__name__)
 
 JOB_INGESTION_PROCESS = "ingestion.process"
@@ -339,6 +342,157 @@ async def handle_summary_refresh(
         )
 
 
+async def handle_tool_result_clear(
+    payload: dict[str, Any],
+) -> None:
+    """Background tool-result reclaim for one thread (Arch 8.3, P2-7).
+
+    Feature-gated: tenants without ``features["clear_tool_results"]`` are
+    skipped (logged, never raised). Idempotent by construction: already
+    cleared parts are skipped and no event is written when nothing was
+    cleared, so re-runs are free.
+    """
+    from backend.app.application.clearing import clear_stale_tool_results
+    from backend.app.application.compaction.refresh import (
+        load_effective_tenant_config,
+    )
+    from backend.app.infrastructure.db import TenantRepository, get_database_manager
+
+    tenant_id = payload.get("tenant_id")
+    thread_id = payload.get("thread_id")
+    if not tenant_id or not thread_id:
+        raise ValueError(
+            f"tool_result.clear requires tenant_id + thread_id: {payload}"
+        )
+
+    tenant_id = str(tenant_id)
+    thread_id = str(thread_id)
+    db = get_database_manager()
+    tenant_row = await TenantRepository(db).get_by_id(tenant_id)
+    if not tenant_row:
+        logger.warning("tool_clear_tenant_missing", tenant_id=tenant_id)
+        return
+    tenant_config = await load_effective_tenant_config(db, tenant_row)
+
+    result = await clear_stale_tool_results(
+        db,
+        tenant_id,
+        thread_id,
+        tenant_config=tenant_config,
+        request_id=f"tool-clear:{thread_id}",
+    )
+    logger.info(
+        "tool_clear_done",
+        tenant_id=tenant_id,
+        thread_id=thread_id,
+        cleared=result.get("cleared"),
+        messages_affected=result.get("messages_affected"),
+        reason=result.get("reason"),
+    )
+
+
+async def handle_memory_extract(
+    payload: dict[str, Any],
+    *,
+    generator_builder: Callable | None = None,
+) -> None:
+    """Background memory extraction (Arch 8.4, P2-8).
+
+    With ``tenant_id`` + ``thread_id`` extracts one thread's closed turns;
+    otherwise sweeps the threads with unextracted turns. Feature-gated:
+    tenants without ``features["memory"]`` are skipped (logged, never
+    raised). Extraction reads redacted turns only and re-passes every fact
+    through the PII service before storage. Extraction failures raise so
+    the queue can retry/DLQ them.
+    """
+    from backend.app.adapters.dlp import get_pii_service
+    from backend.app.application.compaction.refresh import (
+        load_effective_tenant_config,
+    )
+    from backend.app.application.memory import (
+        default_memory_generator_builder,
+        extract_thread_memory,
+        memory_config,
+    )
+    from backend.app.infrastructure.db import TenantRepository, get_database_manager
+    from backend.app.infrastructure.db.memory import MemoryRepository
+    from backend.app.infrastructure.keys.service import (
+        ProviderKeyNotFoundError,
+        ProviderKeyService,
+    )
+    from backend.app.settings.feature_flags import feature_flags
+
+    db = get_database_manager()
+    builder = generator_builder or default_memory_generator_builder
+    tenant_id = payload.get("tenant_id")
+    thread_id = payload.get("thread_id")
+
+    # PII pass is optional infrastructure: when disabled (or uninstalled)
+    # the facts still originate from redacted turns and the extraction
+    # prompt forbids personal data; the flag mirrors the request path.
+    pii_service = None
+    if feature_flags.ENABLE_PRESIDIO:
+        try:
+            pii_service = get_pii_service()
+        except RuntimeError as e:
+            logger.warning("memory_extract_pii_unavailable", error=str(e))
+
+    if tenant_id and thread_id:
+        targets = [(str(tenant_id), str(thread_id))]
+    else:
+        targets = [
+            (str(thread["tenant_id"]), str(thread["id"]))
+            for thread in await MemoryRepository(db).list_threads_pending_extraction(
+                limit=50
+            )
+        ]
+    if not targets:
+        logger.info("memory_extract_no_targets")
+        return
+
+    for tenant_id, thread_id in targets:
+        tenant_row = await TenantRepository(db).get_by_id(tenant_id)
+        if not tenant_row:
+            logger.warning("memory_extract_tenant_missing", tenant_id=tenant_id)
+            continue
+        tenant_config = await load_effective_tenant_config(db, tenant_row)
+        if not memory_config(tenant_config).enabled:
+            logger.info(
+                "memory_extract_disabled", tenant_id=tenant_id, thread_id=thread_id
+            )
+            continue
+        try:
+            api_key = await ProviderKeyService(db).resolve(tenant_config)
+        except ProviderKeyNotFoundError:
+            logger.warning(
+                "memory_extract_no_key",
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                hint="set a tenant provider key or enable platform-managed keys",
+            )
+            continue
+        if not api_key:
+            continue
+
+        generator = builder(tenant_config, api_key)
+        result = await extract_thread_memory(
+            db,
+            tenant_id,
+            thread_id,
+            generator=generator,
+            pii_service=pii_service,
+            request_id=f"memory-extract:{thread_id}",
+        )
+        logger.info(
+            "memory_extract_done",
+            tenant_id=tenant_id,
+            thread_id=thread_id,
+            extracted=result.get("extracted"),
+            reason=result.get("reason"),
+            source_seq=result.get("source_seq"),
+        )
+
+
 def build_handlers() -> Dict[str, Callable]:
     """Register every job handler with the shared queue manager."""
     handlers: Dict[str, Callable] = {
@@ -350,6 +504,8 @@ def build_handlers() -> Dict[str, Callable]:
         JOB_REDTEAM_RUN: handle_redteam_run,
         JOB_WEBHOOK_DELIVER: handle_webhook_deliver,
         JOB_SUMMARY_REFRESH: handle_summary_refresh,
+        JOB_TOOL_RESULT_CLEAR: handle_tool_result_clear,
+        JOB_MEMORY_EXTRACT: handle_memory_extract,
     }
     manager = get_queue_manager()
     for job_type, handler in handlers.items():

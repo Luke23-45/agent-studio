@@ -127,6 +127,8 @@ class TestHandlerRegistration:
             "redteam.run",
             "webhook.deliver",
             "summary.refresh",
+            "tool_result.clear",
+            "memory.extract",
         }
         assert qm._handlers == handlers
 

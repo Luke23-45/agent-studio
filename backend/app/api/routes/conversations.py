@@ -12,7 +12,7 @@ cache for the tenant config service and are never consulted on the hot path.
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -233,6 +233,156 @@ async def _refresh_hot_tail(
         )
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("hot_tail_refresh_failed", thread_id=thread_id, error=str(e))
+
+
+async def _enqueue_tool_clear(
+    tenant_config: TenantConfig, thread_id: str
+) -> bool:
+    """Schedule the background tool-result reclaim (Arch 8.3, P2-7).
+
+    Only for tenants with the feature enabled. Runs on turn completion
+    (Arch 9.1 step 8) so reclaim is incremental, never on the request path;
+    failures are logged and never break the turn (the render-time
+    placeholder still protects context). Idempotency key keeps one pending
+    job per thread.
+    """
+    if not tenant_config.features.get("clear_tool_results", False):
+        return False
+    from backend.app.application.clearing import JOB_TOOL_RESULT_CLEAR
+    from backend.app.infrastructure.queue.manager import Job, get_queue_manager
+
+    try:
+        manager = get_queue_manager()
+        await manager.enqueue(
+            Job(
+                type=JOB_TOOL_RESULT_CLEAR,
+                payload={
+                    "tenant_id": str(tenant_config.id),
+                    "thread_id": thread_id,
+                },
+            ),
+            idempotency_key=f"tool-clear:{thread_id}",
+        )
+        return True
+    except Exception as e:  # pragma: no cover - queue outage path
+        logger.warning("tool_clear_enqueue_failed", thread_id=thread_id, error=str(e))
+        return False
+
+
+def _build_memory_retriever(
+    db: Any, tenant_config: TenantConfig, end_user_id: str | None
+) -> Callable[[str], Awaitable[list[str]]]:
+    """Build the top-k memory-facts hook (Arch 8.4, P2-8).
+
+    Read scope is the end-user's own facts when the session has one
+    (per-tenant, per-end-user store), otherwise tenant-global facts. The
+    tenant controls the read bound via ``memory.max_facts``; retrieval
+    never raises (the orchestrator swallows failures).
+    """
+    from backend.app.application.memory import memory_config, retrieve_facts
+
+    limit = memory_config(tenant_config).max_facts
+
+    async def _retriever(query: str) -> list[str]:
+        return await retrieve_facts(
+            db,
+            str(tenant_config.id),
+            end_user_id=end_user_id,
+            query=query,
+            limit=limit,
+        )
+
+    return _retriever
+
+
+def _build_tool_callback(
+    threads: ThreadRepository,
+    tenant_id: str,
+    thread_id: str,
+    conversation_id: str,
+    parent_message_id: str,
+    request_id: str,
+) -> Callable[[dict[str, Any]], Awaitable[None]]:
+    """Build the orchestration tool-part persistence hook (P2-9).
+
+    Each tool part (``tool_use`` then ``tool_result``, per executed call)
+    is appended as its own assistant message in the durable thread log —
+    first-class parts per turn (ties P5-3). Tool results are PII-redacted
+    before storage when Presidio is enabled (the raw output never reaches
+    the store unredacted); the loop never depends on the outcome (the
+    orchestrator swallows callback failures).
+    """
+
+    async def _persist(part: dict[str, Any]) -> None:
+        content = part.get("content") or {}
+        redacted_content = content
+        if feature_flags.ENABLE_PRESIDIO:
+            payload_text = content.get("content")
+            if isinstance(payload_text, str) and payload_text:
+                try:
+                    pii_result = get_pii_service().process_message(payload_text)
+                    redacted_content = {
+                        **content,
+                        "content": pii_result.redacted_text,
+                    }
+                except RuntimeError as e:
+                    logger.warning(
+                        "tool_part_redaction_unavailable",
+                        thread_id=thread_id,
+                        error=str(e),
+                    )
+        await threads.append_message(
+            tenant_id,
+            thread_id,
+            role="assistant",
+            content="",
+            redacted_content="",
+            conversation_id=conversation_id,
+            parent_message_id=parent_message_id,
+            request_id=f"{request_id}:tool:{uuid4().hex[:8]}",
+            extra_parts=[
+                {
+                    "part_type": part["part_type"],
+                    "content": content,
+                    "redacted_content": redacted_content,
+                }
+            ],
+        )
+
+    return _persist
+
+
+async def _enqueue_memory_extract(
+    tenant_config: TenantConfig, thread_id: str
+) -> bool:
+    """Schedule background memory extraction (Arch 8.4, P2-8).
+
+    Only for tenants with the feature enabled. Runs on turn completion
+    (Arch 9.1 step 8); failures are logged and never break the turn.
+    Idempotency key keeps one pending job per thread; the extraction
+    watermark makes re-runs free.
+    """
+    if not tenant_config.features.get("memory", False):
+        return False
+    from backend.app.application.memory import JOB_MEMORY_EXTRACT
+    from backend.app.infrastructure.queue.manager import Job, get_queue_manager
+
+    try:
+        manager = get_queue_manager()
+        await manager.enqueue(
+            Job(
+                type=JOB_MEMORY_EXTRACT,
+                payload={
+                    "tenant_id": str(tenant_config.id),
+                    "thread_id": thread_id,
+                },
+            ),
+            idempotency_key=f"memory-extract:{thread_id}",
+        )
+        return True
+    except Exception as e:  # pragma: no cover - queue outage path
+        logger.warning("memory_extract_enqueue_failed", thread_id=thread_id, error=str(e))
+        return False
 
 
 @router.get("/auth/me", response_model=PrincipalResponse)
@@ -583,6 +733,9 @@ async def process_conversation(
         retrieval_service=retrieval_service,
         escalation_service=escalation_service,
         model_override=model_override,
+        memory_retriever=_build_memory_retriever(
+            db, tenant_config, principal.end_user_id
+        ),
     )
     orchestration.compaction_callback = _build_compaction_callback(
         db,
@@ -594,6 +747,14 @@ async def process_conversation(
         thread,
     )
     orchestration.evidence_callback = lambda record: evidence_repo.add(record)
+    orchestration.tool_callback = _build_tool_callback(
+        threads,
+        str(tenant_config.id),
+        thread["id"],
+        conversation["id"],
+        user_turn["id"],
+        request_id,
+    )
     spend_repo = SpendEventRepository(db)
     end_user_limits = get_end_user_limits()
 
@@ -710,6 +871,8 @@ async def process_conversation(
             },
         )
         await _refresh_hot_tail(db, str(tenant_config.id), thread["id"])
+        await _enqueue_tool_clear(tenant_config, thread["id"])
+        await _enqueue_memory_extract(tenant_config, thread["id"])
         if handoff_required:
             await conversation_repo.mark_escalated(conversation["id"])
 
@@ -972,6 +1135,9 @@ async def stream_conversation(
         retrieval_service=retrieval_service,
         escalation_service=escalation_service,
         model_override=model_override,
+        memory_retriever=_build_memory_retriever(
+            db, tenant_config, principal.end_user_id
+        ),
     )
     orchestration.compaction_callback = _build_compaction_callback(
         db,
@@ -983,6 +1149,14 @@ async def stream_conversation(
         thread,
     )
     orchestration.evidence_callback = lambda record: evidence_repo.add(record)
+    orchestration.tool_callback = _build_tool_callback(
+        threads,
+        str(tenant_config.id),
+        thread["id"],
+        conversation["id"],
+        user_turn["id"],
+        request_id,
+    )
     spend_repo = SpendEventRepository(db)
     end_user_limits = get_end_user_limits()
 
@@ -1134,6 +1308,8 @@ async def stream_conversation(
                 },
             )
             await _refresh_hot_tail(db, str(tenant_config.id), thread["id"])
+            await _enqueue_tool_clear(tenant_config, thread["id"])
+            await _enqueue_memory_extract(tenant_config, thread["id"])
             if handoff_required:
                 await conversation_repo.mark_escalated(conversation["id"])
 
@@ -1194,12 +1370,14 @@ async def _load_history_turns(
     rows = await threads.read_tail(tenant_id, thread_id, limit=limit + 1)
     if exclude_latest and rows:
         rows = rows[:-1]
+    tool_seqs = await threads.list_tool_result_seqs(tenant_id, thread_id)
     return [
         ContextTurn(
             role=m["role"],
             content=m["redacted_content"] or "",
             seq=m.get("seq"),
             message_id=m.get("id"),
+            has_tool_payload=m.get("seq") in tool_seqs,
         )
         for m in rows
         if m["role"] in ("user", "assistant") and m.get("redacted_content")

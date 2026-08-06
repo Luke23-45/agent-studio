@@ -47,6 +47,14 @@ class TenantConfig:
         "keep_recent_turns": 2.0,
     })
 
+    # Durable memory (Arch 8.4, P2-8): max_facts = top-k read bound per
+    # turn; expiry_days = how long a fact may be read (0 = no expiry).
+    # Extraction runs in the background when features["memory"] is on.
+    memory: dict[str, float] = field(default_factory=lambda: {
+        "max_facts": 20.0,
+        "expiry_days": 30.0,
+    })
+
     # Guardrail configuration
     guardrail_config: dict[str, bool] = field(default_factory=lambda: {
         "regex_fastpath": True,

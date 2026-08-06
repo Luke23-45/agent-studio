@@ -389,6 +389,39 @@ class MessagePartModel(Base):
     )
 
 
+class MemoryModel(Base, TimestampMixin):
+    """A durable, PII-filtered memory fact (Arch 8.4, P2-8).
+
+    Background extraction (memory.extract worker job) pulls durable facts
+    from closed turns into this per-tenant / per-end-user store. ``content``
+    is ALWAYS redacted text (the extractor reads redacted turns only and
+    re-passes facts through the PII service before storage). ``erased`` is
+    a soft-delete flag for erasure support (ties P5-10): erased facts are
+    never retrieved but remain for audit trails. ``expires_at`` (tenant
+    ``memory.expiry_days``) bounds how long a fact may be read.
+    """
+
+    __tablename__ = "memories"
+    __table_args__ = (
+        Index("ix_memories_tenant_user", "tenant_id", "end_user_id"),
+        Index("ix_memories_thread_source", "thread_id", "source_seq"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    end_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    thread_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("threads.id", ondelete="CASCADE"), nullable=False
+    )
+    source_seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    erased: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+
 class SurfaceModel(Base, TimestampMixin):
     """A surface deployment of the agent (Arch 6.1).
 

@@ -24,11 +24,13 @@ service falls back to lossy truncation with a visible degraded marker.
 from __future__ import annotations
 
 import json
-import structlog
-from dataclasses import dataclass, field
-from typing import Any, Callable, Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from typing import Any
 
-from backend.app.adapters.llm import BaseLLMAdapter, LLMConfig, LLMMessage
+import structlog
+
+from backend.app.adapters.llm import BaseLLMAdapter, LLMMessage
 from backend.app.application.compaction.breaker import (
     CompactionBreaker,
     get_compaction_breaker,
@@ -80,6 +82,10 @@ class CompactionConfig:
     # layers the summary is consolidated into a single rewritten layer
     # (bounded cache invalidation — at most once per N boundaries).
     max_summary_layers: int = 5
+    # P2-10: post-summarization context-rot check (off by default; measured
+    # quality never blocks the checkpoint swap).
+    quality_check: bool = False
+    quality_threshold: float = 0.6
 
 
 DEGRADED_SUMMARY_CONTENT = (
@@ -172,11 +178,15 @@ class LLMSummaryGenerator:
         config: CompactionConfig | None = None,
         estimator: TokenEstimator | None = None,
         model_catalog: ModelCatalog | None = None,
+        prompt: str | None = None,
     ):
         self.adapter = adapter
         self.config = config or CompactionConfig()
         self.estimator = estimator or TokenEstimator()
         self.model_catalog = model_catalog or get_default_catalog()
+        # P2-10: per-tenant/prompt-tuning override; must contain the
+        # {conversation} placeholder (defaults to the stock prompt).
+        self.prompt = prompt or _SUMMARY_PROMPT
 
     def summarizer_window(self) -> int:
         """Tokens available to the summarizer for the head (window - out - reserve)."""
@@ -256,12 +266,7 @@ class LLMSummaryGenerator:
             for turn in turns
             if turn.get("redacted_content")
         )
-        prompt = _SUMMARY_PROMPT.format(conversation=conversation)
-        config = LLMConfig(
-            model=self.adapter.config.model,
-            temperature=0.0,
-            max_tokens=self.config.max_output_tokens,
-        )
+        prompt = self.prompt.format(conversation=conversation)
         # Tools disabled: the adapter is used bare (no tool wiring) and the
         # prompt demands JSON-only output.
         try:
@@ -397,6 +402,7 @@ class CompactionService:
                 # Consolidate: one layer covering the ENTIRE head (whole-log
                 # rewrite, bounded by max_summary_layers; chunk-and-merge
                 # inside the generator handles any size).
+                source_turns = head
                 payload = await self.generator.summarize(head)
                 layers = [
                     {
@@ -408,6 +414,7 @@ class CompactionService:
             else:
                 # Append: summarize only the growth since the last boundary;
                 # earlier layers stay immutable (P2-6 cache discipline).
+                source_turns = head_slice
                 payload = await self.generator.summarize(head_slice)
                 layers = old_layers + [
                     {
@@ -422,6 +429,10 @@ class CompactionService:
             if errors:
                 raise SummaryValidationError("; ".join(errors))
             rendered = layers[-1]["content"]
+            if self.config.quality_check:
+                await self._quality_check(
+                    tenant_id, thread_id, source_turns, rendered
+                )
             checkpoint = await self.threads.set_summary(
                 tenant_id,
                 thread_id,
@@ -435,7 +446,7 @@ class CompactionService:
                 boundary_message_id=boundary_message_id,
                 request_id=request_id,
             )
-        except Exception as e:
+        except Exception:
             await self.breaker.record_failure(breaker_key)
             raise
         await self.breaker.record_success(breaker_key)
@@ -457,6 +468,59 @@ class CompactionService:
             "degraded": False,
             "layers": layers,
         }
+
+    async def _quality_check(
+        self,
+        tenant_id: str,
+        thread_id: str,
+        source_turns: Sequence[dict[str, Any]],
+        rendered: str,
+    ) -> None:
+        """Post-summarization context-rot check (P2-10).
+
+        Extracts verifiable probes from the turns the new layer covers and
+        measures exact-fact retention in the rendered summary. The
+        checkpoint still commits — quality is measured and surfaced to
+        operators (``compaction_quality_low``), never blocks compaction.
+        Never raises: a failed check is logged and ignored.
+        """
+        from backend.app.application.compaction.eval import (
+            LexicalFactScorer,
+            generate_probes_from_turns,
+        )
+
+        try:
+            probes = await generate_probes_from_turns(
+                source_turns, self.generator.adapter
+            )
+            verdicts = await LexicalFactScorer().score(rendered, probes)
+            passed = [v.probe_id for v in verdicts if v.passed]
+            ratio = len(passed) / len(verdicts) if verdicts else 0.0
+            if not verdicts or ratio < self.config.quality_threshold:
+                logger.warning(
+                    "compaction_quality_low",
+                    tenant_id=tenant_id,
+                    thread_id=thread_id,
+                    retention_ratio=round(ratio, 3),
+                    probed=len(verdicts),
+                    threshold=self.config.quality_threshold,
+                    failed=[v.probe_id for v in verdicts if not v.passed],
+                )
+            else:
+                logger.info(
+                    "compaction_quality_ok",
+                    tenant_id=tenant_id,
+                    thread_id=thread_id,
+                    retention_ratio=round(ratio, 3),
+                    probed=len(verdicts),
+                )
+        except Exception as e:
+            logger.warning(
+                "compaction_quality_check_failed",
+                tenant_id=tenant_id,
+                thread_id=thread_id,
+                error=str(e),
+            )
 
     async def _truncate_fallback(
         self,

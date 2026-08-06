@@ -4,6 +4,7 @@ LLM Provider adapters.
 Provides unified interface for different LLM providers (OpenAI, Anthropic, etc.).
 """
 
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
@@ -38,6 +39,10 @@ class LLMResponse:
     usage: dict[str, int] = field(default_factory=dict)
     finish_reason: str | None = None
     raw_response: Any = None
+    # P2-9: provider-agnostic tool calls, each {"id", "name", "arguments"}
+    # with ``arguments`` decoded to a dict (raw string kept when the model
+    # emitted malformed JSON -- the runtime treats that as an error result).
+    tool_calls: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -51,6 +56,10 @@ class LLMConfig:
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     stop_sequences: list[str] = field(default_factory=list)
+    # P2-9: tool schemas advertised on the request, OpenAI function format:
+    # [{"type": "function", "function": {"name", "description", "parameters"}}].
+    # Adapters translate to their provider's wire format; empty = no tools.
+    tools: list[dict[str, Any]] = field(default_factory=list)
 
 
 class BaseLLMAdapter(ABC):
@@ -134,6 +143,75 @@ def _extract_usage(provider_type: LLMProviderType, response: Any) -> dict[str, i
     return _openai_usage(response)
 
 
+def _parse_openai_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
+    """Normalize an OpenAI-family ``message.tool_calls`` list (None-safe).
+
+    Each entry becomes {"id", "name", "arguments"}; the arguments JSON
+    string is decoded when possible, kept verbatim otherwise (malformed
+    JSON is surfaced to the runtime as an error result, never dropped).
+    """
+    parsed: list[dict[str, Any]] = []
+    for tc in tool_calls or []:
+        fn = getattr(tc, "function", None)
+        fn_name = getattr(fn, "name", None) or "" if fn else ""
+        raw_arguments = getattr(fn, "arguments", "") or "" if fn else ""
+        try:
+            decoded: Any = json.loads(raw_arguments) if raw_arguments else {}
+            if not isinstance(decoded, dict):
+                decoded = raw_arguments
+        except (TypeError, ValueError):
+            decoded = raw_arguments
+        parsed.append(
+            {
+                "id": getattr(tc, "id", None) or "",
+                "name": fn_name,
+                "arguments": decoded,
+            }
+        )
+    return [p for p in parsed if p["name"]]
+
+
+def _parse_anthropic_content(content_blocks: Any) -> tuple[str, list[dict[str, Any]]]:
+    """Split Anthropic content blocks into (text, tool_calls).
+
+    Text blocks are joined in order; ``tool_use`` blocks become canonical
+    tool calls. Tool-only responses (previously an AttributeError on
+    ``content[0].text``) now round-trip cleanly.
+    """
+    text_parts: list[str] = []
+    calls: list[dict[str, Any]] = []
+    for block in content_blocks or []:
+        block_type = getattr(block, "type", None)
+        if block_type == "tool_use":
+            calls.append(
+                {
+                    "id": getattr(block, "id", None) or "",
+                    "name": getattr(block, "name", None) or "",
+                    "arguments": getattr(block, "input", None) or {},
+                }
+            )
+        elif block_type == "text":
+            text_parts.append(getattr(block, "text", "") or "")
+    return "".join(text_parts), calls
+
+
+def _anthropic_tools_param(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate OpenAI-style schemas to the Anthropic ``tools`` format."""
+    if not tools:
+        return []
+    translated: list[dict[str, Any]] = []
+    for tool in tools:
+        fn = tool.get("function", tool)
+        translated.append(
+            {
+                "name": fn.get("name", ""),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters", {"type": "object"}),
+            }
+        )
+    return translated
+
+
 class OpenAIAdapter(BaseLLMAdapter):
     """OpenAI provider adapter."""
 
@@ -172,6 +250,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             frequency_penalty=self.config.frequency_penalty,
             presence_penalty=self.config.presence_penalty,
             stop=self.config.stop_sequences,
+            tools=self.config.tools or None,
         )
 
         choice = response.choices[0]
@@ -181,6 +260,7 @@ class OpenAIAdapter(BaseLLMAdapter):
             usage=_openai_usage(response),
             finish_reason=choice.finish_reason,
             raw_response=response,
+            tool_calls=_parse_openai_tool_calls(choice.message.tool_calls),
         )
 
     async def stream_chat(
@@ -280,19 +360,26 @@ class AnthropicAdapter(BaseLLMAdapter):
         """Send chat request to Anthropic."""
         client = self._get_client()
 
-        response = await client.messages.create(
+        params: dict[str, Any] = dict(
             model=self.config.model,
             max_tokens=self.config.max_tokens or 1024,
             system=self._system_param(messages),
             messages=self._chat_params(messages),
         )
+        tools = _anthropic_tools_param(self.config.tools)
+        if tools:
+            params["tools"] = tools
 
+        response = await client.messages.create(**params)
+
+        content, tool_calls = _parse_anthropic_content(response.content)
         return LLMResponse(
-            content=response.content[0].text,
+            content=content,
             model=response.model,
             usage=_anthropic_usage(response.usage),
             finish_reason=response.stop_reason,
             raw_response=response,
+            tool_calls=tool_calls or None,
         )
 
     async def stream_chat(
@@ -350,6 +437,7 @@ class AzureAdapter(BaseLLMAdapter):
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
             top_p=self.config.top_p,
+            tools=self.config.tools or None,
         )
         choice = response.choices[0]
         return LLMResponse(
@@ -358,6 +446,7 @@ class AzureAdapter(BaseLLMAdapter):
             usage=_openai_usage(response),
             finish_reason=choice.finish_reason,
             raw_response=response,
+            tool_calls=_parse_openai_tool_calls(choice.message.tool_calls),
         )
 
     async def stream_chat(self, messages: list[LLMMessage]) -> Any:
@@ -415,6 +504,7 @@ class OpenAIBasedAdapter(BaseLLMAdapter):
             temperature=self.config.temperature,
             max_tokens=self.config.max_tokens,
             top_p=self.config.top_p,
+            tools=self.config.tools or None,
         )
         choice = response.choices[0]
         return LLMResponse(
@@ -423,6 +513,7 @@ class OpenAIBasedAdapter(BaseLLMAdapter):
             usage=_openai_usage(response),
             finish_reason=choice.finish_reason,
             raw_response=response,
+            tool_calls=_parse_openai_tool_calls(choice.message.tool_calls),
         )
 
     async def stream_chat(self, messages: list[LLMMessage]) -> Any:

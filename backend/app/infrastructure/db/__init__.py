@@ -17,6 +17,7 @@ from .repositories import (
     TenantRepository,
     WebhookRepository,
 )
+from .memory import MemoryRepository
 from .threads import ThreadRepository
 
 __all__ = [
@@ -41,4 +42,5 @@ __all__ = [
     "TenantRepository",
     "WebhookRepository",
     "ThreadRepository",
+    "MemoryRepository",
 ]
