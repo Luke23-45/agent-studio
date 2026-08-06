@@ -18,6 +18,7 @@ from .manager import DatabaseManager
 from .models import (
     ApiKeyModel,
     AuditEventModel,
+    CacheInvalidationLogModel,
     ConversationModel,
     EndUserModel,
     EscalationModel,
@@ -26,6 +27,7 @@ from .models import (
     ModelCatalogModel,
     PolicyRuleModel,
     PolicySetModel,
+    QuotaStateModel,
     SessionTokenModel,
     SpendEventModel,
     SurfaceModel,
@@ -401,6 +403,119 @@ class SpendEventRepository:
             session.add(model)
             await session.flush()
             return _row_to_dict(model)
+
+
+class QuotaStateRepository:
+    """Durable USD quota state (Arch 10, P3-6) — one row per
+    (scope_type, tenant, surface, end_user, window).
+
+    Written by the cost-ledger consumer (``cost_ledger.write`` handler)
+    from the same spend event that feeds ``spend_events``, so a window's
+    spend is reconstructable from durable rows even if Redis state is
+    lost. This repository only appends spent amounts; reservations live
+    in the Redis fast path (``gateway.quota``).
+    """
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def record_spend(
+        self,
+        *,
+        scope_type: str,
+        tenant_id: str,
+        surface_id: str | None,
+        end_user_id: str | None,
+        window_started_at: datetime,
+        spent_usd: float,
+    ) -> dict[str, Any]:
+        """Upsert: add ``spent_usd`` to the scope's window row."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(QuotaStateModel).where(
+                    QuotaStateModel.scope_type == scope_type,
+                    QuotaStateModel.tenant_id == tenant_id,
+                    QuotaStateModel.surface_id == surface_id,
+                    QuotaStateModel.end_user_id == end_user_id,
+                    QuotaStateModel.window_started_at == window_started_at,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                row = QuotaStateModel(
+                    id=str(uuid4()),
+                    scope_type=scope_type,
+                    tenant_id=tenant_id,
+                    surface_id=surface_id,
+                    end_user_id=end_user_id,
+                    window_started_at=window_started_at,
+                    spent_usd=spent_usd,
+                    reserved_usd=0.0,
+                )
+                session.add(row)
+            else:
+                row.spent_usd += spent_usd
+            await session.flush()
+            return _row_to_dict(row)
+
+    async def get_window(
+        self,
+        *,
+        scope_type: str,
+        tenant_id: str,
+        surface_id: str | None,
+        end_user_id: str | None,
+        window_started_at: datetime,
+    ) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(QuotaStateModel).where(
+                    QuotaStateModel.scope_type == scope_type,
+                    QuotaStateModel.tenant_id == tenant_id,
+                    QuotaStateModel.surface_id == surface_id,
+                    QuotaStateModel.end_user_id == end_user_id,
+                    QuotaStateModel.window_started_at == window_started_at,
+                )
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+
+class CacheInvalidationRepository:
+    """Durable record of cache invalidations (Arch 10, P3-7)."""
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def add(
+        self,
+        *,
+        tenant_id: str,
+        scope: str,
+        resource_id: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        async with self.db.get_session() as session:
+            row = CacheInvalidationLogModel(
+                id=str(uuid4()),
+                tenant_id=tenant_id,
+                scope=scope,
+                resource_id=resource_id,
+                reason=reason,
+            )
+            session.add(row)
+            await session.flush()
+            return _row_to_dict(row)
+
+    async def list_recent(self, tenant_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(CacheInvalidationLogModel)
+                .where(CacheInvalidationLogModel.tenant_id == tenant_id)
+                .order_by(CacheInvalidationLogModel.created_at.desc())
+                .limit(limit)
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
 
 
 class TenantConfigVersionRepository:

@@ -38,6 +38,7 @@ from backend.app.domain.tenant import TenantConfig
 from backend.app.gateway.catalog import ModelCatalog, ModelSpec
 from backend.app.infrastructure.db import ConversationRepository, ThreadRepository, init_database
 from backend.app.infrastructure.db.models import Base
+from backend.tests.gateway_fakes import FakeGateway
 
 VALID_PAYLOAD = {
     "objective": "Resolve billing question",
@@ -680,7 +681,7 @@ async def test_orchestration_preemptive_trigger_once_per_turn():
     service = create_orchestration_service(
         tenant_config=_tenant(),
         policy_set=PolicySet(tenant_id=uuid4(), name="default"),
-        llm_api_key="test-key",
+        gateway=FakeGateway(),
         model_catalog=catalog,
         context_loader=SessionContextLoader(model_catalog=catalog, output_reserve_tokens=0),
         compaction_callback=fake_callback,
@@ -693,7 +694,7 @@ async def test_orchestration_preemptive_trigger_once_per_turn():
             content="Here is your answer", model="gpt-4", usage={}, finish_reason="stop"
         )
 
-    service._get_llm_adapter = lambda: _AdapterStub(chat=fake_chat, model="gpt-4")
+    service.gateway = FakeGateway(chat_stub=_AdapterStub(chat=fake_chat, model="gpt-4"))
 
     # One long turn pushes the estimate past 70% of 200 but stays under 200.
     state = await _run_generate(
@@ -721,7 +722,7 @@ async def test_orchestration_overflow_recovery_retries_once():
     service = create_orchestration_service(
         tenant_config=_tenant(),
         policy_set=PolicySet(tenant_id=uuid4(), name="default"),
-        llm_api_key="test-key",
+        gateway=FakeGateway(),
         compaction_callback=fake_callback,
     )
     chat_calls = []
@@ -734,7 +735,7 @@ async def test_orchestration_overflow_recovery_retries_once():
             content="recovered answer", model="fake", usage={}, finish_reason="stop"
         )
 
-    service._get_llm_adapter = lambda: _AdapterStub(chat=fake_chat, model="fake-model")
+    service.gateway = FakeGateway(chat_stub=_AdapterStub(chat=fake_chat, model="fake-model"))
 
     state = await _run_generate(service)
 
@@ -758,7 +759,7 @@ async def test_orchestration_second_overflow_is_hard_error():
     service = create_orchestration_service(
         tenant_config=_tenant(),
         policy_set=PolicySet(tenant_id=uuid4(), name="default"),
-        llm_api_key="test-key",
+        gateway=FakeGateway(),
         compaction_callback=fake_callback,
     )
     chat_calls = []
@@ -767,7 +768,7 @@ async def test_orchestration_second_overflow_is_hard_error():
         chat_calls.append(messages)
         raise RuntimeError("maximum context length exceeded")
 
-    service._get_llm_adapter = lambda: _AdapterStub(chat=fake_chat, model="fake-model")
+    service.gateway = FakeGateway(chat_stub=_AdapterStub(chat=fake_chat, model="fake-model"))
 
     state = await _run_generate(service)
 
@@ -782,10 +783,10 @@ async def test_orchestration_no_compaction_without_callback():
     service = create_orchestration_service(
         tenant_config=_tenant(),
         policy_set=PolicySet(tenant_id=uuid4(), name="default"),
-        llm_api_key="test-key",
+        gateway=FakeGateway(),
     )
-    service._get_llm_adapter = lambda: _AdapterStub(
-        chat=None, model="fake-model", fail="maximum context length exceeded"
+    service.gateway = FakeGateway(
+        chat_stub=_AdapterStub(chat=None, model="fake-model", fail="maximum context length exceeded")
     )
     state = await _run_generate(service)
     assert state["error"] is not None

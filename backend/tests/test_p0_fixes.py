@@ -21,6 +21,7 @@ from backend.app.modules.guardrails.config import (
     build_config_from_tenant,
 )
 from backend.app.modules.guardrails.errors import GuardrailConfigurationError
+from backend.tests.gateway_fakes import FakeGateway
 
 
 class TestGuardrailsConfigFailClosed:
@@ -267,7 +268,8 @@ class TestTenantPolicyHydration:
         policy_set = policy_set_from_db(row)
         assert policy_set.version == 1
         assert policy_set.evaluate({"topic": "adult"}) == PolicyAction.BLOCK
-        assert policy_set.evaluate({"topic": "billing"}) == PolicyAction.ALLOW
+        # Deny-by-default (Arch 2.5): an uncovered topic is blocked, not allowed.
+        assert policy_set.evaluate({"topic": "billing"}) == PolicyAction.BLOCK
 
 
 class TestLLMProviderFactory:
@@ -310,7 +312,7 @@ class TestSessionMemory:
         service = create_orchestration_service(
             tenant_config=tenant,
             policy_set=PolicySet(tenant_id=tenant.id, name="default"),
-            llm_api_key="test-key",
+            gateway=FakeGateway(),
         )
 
         captured = {}
@@ -326,7 +328,7 @@ class TestSessionMemory:
 
         fake_adapter = Mock()
         fake_adapter.chat = fake_chat
-        service._get_llm_adapter = lambda: fake_adapter
+        service.gateway = FakeGateway(chat_stub=fake_adapter)
 
         state = {
             "tenant_id": tenant.id,

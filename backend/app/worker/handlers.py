@@ -23,6 +23,7 @@ JOB_EVAL_REPLAY = "eval.replay"
 JOB_REDTEAM_RUN = "redteam.run"
 JOB_WEBHOOK_DELIVER = "webhook.deliver"
 JOB_SUMMARY_REFRESH = "summary.refresh"
+JOB_COST_LEDGER_WRITE = "cost_ledger.write"
 
 
 async def handle_ingestion_process(payload: dict[str, Any]) -> None:
@@ -391,6 +392,71 @@ async def handle_tool_result_clear(
     )
 
 
+async def handle_cost_ledger_write(payload: dict[str, Any]) -> None:
+    """Persist one spend event + its durable quota-state rows (Arch 10,
+    P3-5/P3-6).
+
+    Append-only: one ``spend_events`` row per request, then one
+    ``quota_state`` upsert per budget level on the request's path
+    (platform + tenant + surface + end-user when present). Raised errors
+    retry/DLQ — a spend event is never dropped silently.
+    """
+    import datetime
+
+    from backend.app.gateway.ledger import UsageRecord
+    from backend.app.infrastructure.db import get_database_manager
+    from backend.app.infrastructure.db.repositories import (
+        QuotaStateRepository,
+        SpendEventRepository,
+    )
+
+    db = get_database_manager()
+    record = UsageRecord(**payload)
+
+    async def window_started_at() -> datetime.datetime:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return datetime.datetime(now.year, now.month, 1, tzinfo=datetime.timezone.utc)
+
+    await SpendEventRepository(db).add(asdict_for_model(record))
+
+    quota = QuotaStateRepository(db)
+    window = await window_started_at()
+    levels: list[tuple[str, str | None, str | None]] = [
+        ("platform", None, None),
+        ("tenant", record.tenant_id, None),
+        ("surface", record.tenant_id, record.surface_id),
+        ("end_user", record.tenant_id, record.end_user_id),
+    ]
+    for scope_type, tenant_id, scope_id in levels:
+        if scope_type == "surface" and not record.surface_id:
+            continue
+        if scope_type == "end_user" and not record.end_user_id:
+            continue
+        await quota.record_spend(
+            scope_type=scope_type,
+            tenant_id=tenant_id or "",
+            surface_id=(record.surface_id if scope_type == "surface" else None),
+            end_user_id=(record.end_user_id if scope_type == "end_user" else None),
+            window_started_at=window,
+            spent_usd=record.usd,
+        )
+    logger.info(
+        "cost_ledger_written",
+        tenant_id=record.tenant_id,
+        provider=record.provider,
+        model=record.model,
+        usd=record.usd,
+        request_id=record.request_id,
+    )
+
+
+def asdict_for_model(record: Any) -> dict[str, Any]:
+    """SpendEventModel-compatible dict for ``SpendEventRepository.add``."""
+    from dataclasses import asdict
+
+    return asdict(record)
+
+
 async def handle_memory_extract(
     payload: dict[str, Any],
     *,
@@ -504,6 +570,7 @@ def build_handlers() -> Dict[str, Callable]:
         JOB_REDTEAM_RUN: handle_redteam_run,
         JOB_WEBHOOK_DELIVER: handle_webhook_deliver,
         JOB_SUMMARY_REFRESH: handle_summary_refresh,
+        JOB_COST_LEDGER_WRITE: handle_cost_ledger_write,
         JOB_TOOL_RESULT_CLEAR: handle_tool_result_clear,
         JOB_MEMORY_EXTRACT: handle_memory_extract,
     }

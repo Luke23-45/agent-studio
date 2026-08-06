@@ -39,6 +39,8 @@ from backend.app.application.tools import (
 )
 from backend.app.domain.policy import PolicyAction, PolicyRule, PolicySet, PolicyType
 from backend.app.domain.tenant import TenantConfig
+from backend.app.gateway.types import GatewayStreamEvent
+from backend.tests.gateway_fakes import FakeGateway, delta, done, usage_event
 
 LOOKUP_SCHEMA = {
     "type": "function",
@@ -86,7 +88,7 @@ def _service(tenant, policy, **kwargs):
     return create_orchestration_service(
         tenant_config=tenant,
         policy_set=policy,
-        llm_api_key="fake-key",
+        gateway=kwargs.pop("gateway", FakeGateway()),
         **kwargs,
     )
 
@@ -119,31 +121,6 @@ class _ScriptedAdapter:
         self.messages_by_call.append(list(messages))
         self.tools_seen.append(list(self.config.tools))
         return self._script()
-
-
-class _StreamScriptedAdapter(_ScriptedAdapter):
-    """Chat + stream adapter: each stream_chat pops a chunk script."""
-
-    def __init__(self, stream_scripts, chat_responses=None,
-                 provider_type=LLMProviderType.OPENAI):
-        super().__init__(chat_responses or [], provider_type=provider_type)
-        self.stream_scripts = [list(s) for s in stream_scripts]
-        self.stream_calls = 0
-
-    async def stream_chat(self, messages):
-        self.calls += 1
-        self.messages_by_call.append(list(messages))
-        self.tools_seen.append(list(self.config.tools))
-        script = self.stream_scripts[
-            min(self.stream_calls, len(self.stream_scripts) - 1)
-        ]
-        self.stream_calls += 1
-
-        async def _gen():
-            for chunk in script:
-                yield chunk
-
-        return _gen()
 
 
 def _lookup_registry(calls: list | None = None):
@@ -233,7 +210,7 @@ class TestToolLoop:
             tenant, allow_policy, tool_registry=registry,
             tool_callback=parts.append,
         )
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -273,7 +250,7 @@ class TestToolLoop:
             + [LLMResponse(content="final without tools", model="gpt-4")]
         )
         service = _service(tenant, allow_policy, tool_registry=registry)
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -308,7 +285,7 @@ class TestToolLoop:
             tenant, allow_policy, tool_registry=registry,
             tool_authorizer=deny, tool_callback=parts.append,
         )
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -343,7 +320,7 @@ class TestToolLoop:
         service = _service(
             tenant, allow_policy, tool_registry=registry, tool_authorizer=boom
         )
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -368,7 +345,7 @@ class TestToolLoop:
         service = _service(
             tenant, allow_policy, tool_registry=registry, tool_callback=parts.append
         )
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -393,7 +370,7 @@ class TestToolLoop:
         service = _service(
             tenant, allow_policy, tool_registry=registry, tool_callback=parts.append
         )
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -417,7 +394,7 @@ class TestToolLoop:
             ]
         )
         service = _service(tenant, allow_policy, tool_registry=registry)
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -432,7 +409,7 @@ class TestToolLoop:
     async def test_no_registry_means_no_tools_advertised(self, tenant, allow_policy):
         adapter = _ScriptedAdapter([LLMResponse(content="plain", model="gpt-4")])
         service = _service(tenant, allow_policy)
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -444,51 +421,32 @@ class TestToolLoop:
 # ---- streaming tool detection -----------------------------------------------
 
 
-def _openai_tool_chunk(index, id=None, name=None, args=None):
-    return SimpleNamespace(
-        choices=[
-            SimpleNamespace(
-                delta=SimpleNamespace(
-                    content=None,
-                    tool_calls=[
-                        SimpleNamespace(
-                            index=index,
-                            id=id,
-                            function=SimpleNamespace(name=name, arguments=args),
-                        )
-                    ],
-                )
-            )
-        ]
-    )
-
-
-def _openai_text_chunk(text):
-    return SimpleNamespace(
-        choices=[SimpleNamespace(delta=SimpleNamespace(content=text, tool_calls=None))]
-    )
-
-
 class TestStreamToolDetection:
     @pytest.mark.asyncio
-    async def test_stream_openai_fragments_reconstruct_and_loop(
+    async def test_stream_tool_fragments_reconstruct_and_loop(
         self, tenant, allow_policy
     ):
         registry, recorded = _lookup_registry()
         parts: list[dict] = []
-        stream = _StreamScriptedAdapter(
-            stream_scripts=[
-                [
-                    _openai_tool_chunk(0, id="call_1", name="lookup", args='{"q":'),
-                    _openai_tool_chunk(0, id=None, name=None, args='"hi"}'),
-                ],
-                [_openai_text_chunk("final streamed answer")],
-            ]
-        )
         service = _service(
             tenant, allow_policy, tool_registry=registry, tool_callback=parts.append
         )
-        service._get_llm_adapter = lambda: stream
+        service.gateway = FakeGateway(
+            stream_scripts=[
+                [
+                    GatewayStreamEvent(type="tool_use_start", index=0, id="call_1", name="lookup"),
+                    GatewayStreamEvent(type="tool_use_delta", index=0, args='{"q":'),
+                    GatewayStreamEvent(type="tool_use_delta", index=0, args='"hi"}'),
+                    usage_event({"input_tokens": 5, "output_tokens": 1, "reasoning_tokens": 0, "cached_tokens": 0}),
+                    done(finish_reason="tool_use"),
+                ],
+                [
+                    delta("final streamed answer"),
+                    usage_event({"input_tokens": 5, "output_tokens": 1, "reasoning_tokens": 0, "cached_tokens": 0}),
+                    done(),
+                ],
+            ]
+        )
 
         deltas = []
         async for event in service.stream_message(
@@ -499,7 +457,7 @@ class TestStreamToolDetection:
 
         assert recorded == [{"q": "hi"}]
         assert deltas == ["final streamed answer"]
-        assert stream.calls == 2
+        assert service.gateway.stream_calls == 2
         assert [p["part_type"] for p in parts] == ["tool_use", "tool_result"]
 
     @pytest.mark.asyncio
@@ -507,38 +465,22 @@ class TestStreamToolDetection:
         self, tenant, allow_policy
     ):
         registry, recorded = _lookup_registry()
-
-        def _block_start(index, id, name):
-            return SimpleNamespace(
-                type="content_block_start",
-                index=index,
-                delta=SimpleNamespace(
-                    type="content_block_start",
-                    content_block=SimpleNamespace(type="tool_use", id=id, name=name),
-                ),
-            )
-
-        def _json_delta(index, partial):
-            return SimpleNamespace(
-                type="content_block_delta",
-                index=index,
-                delta=SimpleNamespace(type="input_json_delta", partial_json=partial),
-            )
-
-        def _text(text):
-            return SimpleNamespace(
-                delta=SimpleNamespace(type="text_delta", text=text)
-            )
-
-        stream = _StreamScriptedAdapter(
-            stream_scripts=[
-                [_block_start(0, "toolu_1", "lookup"), _json_delta(0, '{"q": "hi"}')],
-                [_text("claude answer")],
-            ],
-            provider_type=LLMProviderType.ANTHROPIC,
-        )
         service = _service(tenant, allow_policy, tool_registry=registry)
-        service._get_llm_adapter = lambda: stream
+        service.gateway = FakeGateway(
+            stream_scripts=[
+                [
+                    GatewayStreamEvent(type="tool_use_start", index=0, id="toolu_1", name="lookup"),
+                    GatewayStreamEvent(type="tool_use_delta", index=0, args='{"q": "hi"}'),
+                    usage_event({"input_tokens": 5, "output_tokens": 1, "reasoning_tokens": 0, "cached_tokens": 0}),
+                    done(finish_reason="tool_use"),
+                ],
+                [
+                    delta("claude answer"),
+                    usage_event({"input_tokens": 5, "output_tokens": 1, "reasoning_tokens": 0, "cached_tokens": 0}),
+                    done(),
+                ],
+            ]
+        )
 
         deltas = []
         async for event in service.stream_message(
@@ -555,16 +497,18 @@ class TestStreamToolDetection:
         self, tenant, allow_policy
     ):
         registry, recorded = _lookup_registry()
-        stream = _StreamScriptedAdapter(
+        stub = _ScriptedAdapter([LLMResponse(content="recovered via chat", model="gpt-4")])
+        service = _service(tenant, allow_policy, tool_registry=registry)
+        service.gateway = FakeGateway(
             stream_scripts=[
                 [
-                    _openai_tool_chunk(0, id="call_1", name="lookup", args="{not json"),
+                    GatewayStreamEvent(type="tool_use_start", index=0, id="call_1", name="lookup"),
+                    GatewayStreamEvent(type="tool_use_delta", index=0, args="{not json"),
+                    done(finish_reason="tool_use"),
                 ]
             ],
-            chat_responses=[LLMResponse(content="recovered via chat", model="gpt-4")],
+            chat_stub=stub,
         )
-        service = _service(tenant, allow_policy, tool_registry=registry)
-        service._get_llm_adapter = lambda: stream
 
         async for event in service.stream_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -572,9 +516,10 @@ class TestStreamToolDetection:
             pass
 
         assert recorded == []
-        assert stream.chat_called == 1
+        assert stub.chat_called == 1
         # stream attempted once, then chat fallback produced the answer
-        assert stream.calls == 2
+        assert service.gateway.stream_calls == 1
+        assert service.gateway.generate_calls == 1
 
     def test_finalize_stream_tool_calls_strict(self):
         acc = {
@@ -641,7 +586,7 @@ class TestVerifyReask:
                 "The refund policy allows returns within 30 days of purchase."
             )
         )
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="refund policy", redacted_message="refund policy",
@@ -672,7 +617,7 @@ class TestVerifyReask:
             ),
             escalation_service=escalation,
         )
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="refund policy", redacted_message="refund policy",
@@ -692,7 +637,7 @@ class TestVerifyReask:
             [LLMResponse(content="", model="gpt-4")]
         )
         service = _service(tenant, allow_policy, escalation_service=escalation)
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="hi", redacted_message="hi", session_id="s1"
@@ -714,7 +659,7 @@ class TestVerifyReask:
                 "The refund policy allows returns within 30 days of purchase."
             )
         )
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
 
         result = await service.process_message(
             user_message="refund policy", redacted_message="refund policy",

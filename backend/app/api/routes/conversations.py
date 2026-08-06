@@ -12,6 +12,7 @@ cache for the tenant config service and are never consulted on the hot path.
 from datetime import datetime, timezone
 from uuid import UUID, uuid4
 
+import asyncio
 from typing import Any, Awaitable, Callable
 
 import structlog
@@ -20,7 +21,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from backend.app.adapters.dlp import get_pii_service
-from backend.app.adapters.llm import LLMConfig, LLMProviderType, create_llm_adapter
 from backend.app.adapters.tracing import get_langfuse_adapter
 from backend.app.api.dependencies.auth import (
     ApiKeyPrincipal,
@@ -40,12 +40,20 @@ from backend.app.application.compaction import (
 )
 from backend.app.application.orchestration import create_orchestration_service
 from backend.app.application.retrieval import create_retrieval_service
+from backend.app.application.validation.streaming import StreamingModerationWindow
 from backend.app.context import ContextTurn, TokenEstimator
 from backend.app.domain.policy import PolicySet
 from backend.app.domain.tenant import TenantConfig
 from backend.app.gateway.admission import (
     AdmissionLimitExceeded,
     get_admission_gate,
+)
+from backend.app.gateway.service import GatewayBackedAdapter, get_gateway
+from backend.app.gateway.types import (
+    GatewayChainExhausted,
+    GatewayConfigurationError,
+    GatewayError,
+    GatewayQuotaExceeded,
 )
 from backend.app.infrastructure.db import (
     ApiKeyRepository,
@@ -54,12 +62,12 @@ from backend.app.infrastructure.db import (
     EscalationRepository,
     EvidenceRepository,
     PolicyRepository,
-    SpendEventRepository,
     TenantConfigVersionRepository,
     TenantRepository,
     ThreadRepository,
     get_database_manager,
 )
+from backend.app.infrastructure.stream import get_stream_buffer
 from backend.app.context import ContextTurn
 from backend.app.modules.escalation import create_escalation_service
 from backend.app.modules.guardrails import get_guardrails_service
@@ -706,8 +714,9 @@ async def process_conversation(
         else:
             model_override = pin.strip()
 
-    # Resolve the LLM API key for the tenant's configured provider
-    llm_api_key = await _resolve_llm_api_key(tenant_config, db)
+    # P3-9: the gateway resolves provider keys internally; the route never
+    # sees or handles a key.
+    gateway = get_gateway()
 
     escalation_repository = EscalationRepository(db)
     escalation_service = create_escalation_service(
@@ -729,19 +738,20 @@ async def process_conversation(
     orchestration = create_orchestration_service(
         tenant_config=tenant_config,
         policy_set=policy_set,
-        llm_api_key=llm_api_key,
+        gateway=gateway,
         retrieval_service=retrieval_service,
         escalation_service=escalation_service,
         model_override=model_override,
         memory_retriever=_build_memory_retriever(
             db, tenant_config, principal.end_user_id
         ),
+        surface_id=surface["id"] if surface else None,
+        end_user_id=principal.end_user_id,
     )
     orchestration.compaction_callback = _build_compaction_callback(
         db,
         threads,
         tenant_config,
-        llm_api_key,
         provider,
         model_override or tenant_config.default_model,
         thread,
@@ -755,11 +765,11 @@ async def process_conversation(
         user_turn["id"],
         request_id,
     )
-    spend_repo = SpendEventRepository(db)
     end_user_limits = get_end_user_limits()
 
     async def _usage(record: dict[str, Any]) -> None:
-        await spend_repo.add(record)
+        # P3-5: spend_events is written exclusively by the gateway cost
+        # ledger; this callback only tracks the end-user spend cap.
         if principal.end_user_id:
             await end_user_limits.record_spend(
                 str(tenant_config.id), principal.end_user_id,
@@ -915,6 +925,14 @@ async def process_conversation(
         if trace:
             adapter.flush()
         raise
+    except GatewayError as e:
+        if trace:
+            adapter.update(trace, output={"error": str(e)})
+            adapter.flush()
+        raise HTTPException(
+            status_code=_gateway_http_status(e),
+            detail=str(e),
+        ) from e
     except Exception as e:
         logger.error("conversation_error", error=str(e))
         if trace:
@@ -930,11 +948,30 @@ async def process_conversation(
         await thread_lease.release()
 
 
-def _sse(event: str, data: dict) -> str:
-    """Format a Server-Sent Events frame."""
+def _sse(event: str, data: dict, event_id: int | None = None) -> str:
+    """Format a Server-Sent Events frame. ``event_id`` emits ``id:`` for
+    ``Last-Event-ID`` reconnect replay (Arch 9.1, Phase 4)."""
     import json as _json
 
-    return f"event: {event}\ndata: {_json.dumps(data)}\n\n"
+    header = f"id: {event_id}\n" if event_id is not None else ""
+    return f"{header}event: {event}\ndata: {_json.dumps(data)}\n\n"
+
+
+def _gateway_http_status(exc: GatewayError) -> int:
+    """Map a gateway failure kind to an HTTP status (Arch 10, P3-9).
+
+    - quota_exceeded -> 402 Payment Required (monthly USD budget levels)
+    - gateway_configuration -> 503 (no usable deployment / missing key)
+    - chain_exhausted -> 502 (every fallback target failed)
+    - everything else -> 500
+    """
+    if isinstance(exc, GatewayQuotaExceeded):
+        return status.HTTP_402_PAYMENT_REQUIRED
+    if isinstance(exc, GatewayConfigurationError):
+        return status.HTTP_503_SERVICE_UNAVAILABLE
+    if isinstance(exc, GatewayChainExhausted):
+        return status.HTTP_502_BAD_GATEWAY
+    return status.HTTP_500_INTERNAL_SERVER_ERROR
 
 
 async def _store_idempotent_response(
@@ -1068,6 +1105,50 @@ async def stream_conversation(
         surface_id=surface["id"] if surface else None,
     )
     request_id = idempotency_key or f"req-{uuid4()}"
+    stream_id = request_id
+
+    # Phase 4 reconnect replay (Arch 9.1 step 9 + P4-5): a client that dropped
+    # mid-stream and reconnects with ``Last-Event-ID`` replays the already-
+    # buffered (validated) chunks plus the terminal event from the server-
+    # side stream buffer — no duplicate user message, no re-generation.
+    # Idempotency (P4-5): a retry that reuses ``Idempotency-Key`` after a
+    # 5xx/interruption never duplicates — if the same request already produced
+    # a terminal result, that buffer is replayed instead of calling the model.
+    last_event_id = 0
+    raw_last = request_ctx.headers.get("Last-Event-ID")
+    if raw_last:
+        try:
+            last_event_id = int(raw_last)
+        except (TypeError, ValueError):
+            last_event_id = 0
+    stream_buffer = get_stream_buffer()
+    want_replay = last_event_id > 0
+    idempotency_hit = False
+    if idempotency_key and not want_replay:
+        idempotency_hit = await stream_buffer.get_terminal(
+            str(tenant_config.id), stream_id
+        ) is not None
+        want_replay = idempotency_hit
+    if want_replay:
+        records = await stream_buffer.replay(
+            str(tenant_config.id), stream_id, after_event_id=last_event_id
+        )
+
+        async def _replay_generator():
+            for record in records:
+                seq = record["id"]
+                if record["type"] == "delta":
+                    yield _sse("delta", {"content": record["data"]["content"]}, event_id=seq)
+                elif record["type"] == "result":
+                    yield _sse("result", record["data"], event_id=seq)
+                elif record["type"] == "error":
+                    yield _sse("error", record["data"], event_id=seq)
+
+        return StreamingResponse(
+            _replay_generator(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     if feature_flags.ENABLE_PRESIDIO:
         try:
@@ -1127,23 +1208,24 @@ async def stream_conversation(
             provider, model_override = pin_provider.strip(), pin_model.strip()
         else:
             model_override = pin.strip()
-    llm_api_key = await _resolve_llm_api_key(tenant_config, db)
+    gateway = get_gateway()
     orchestration = create_orchestration_service(
         tenant_config=tenant_config,
         policy_set=policy_set,
-        llm_api_key=llm_api_key,
+        gateway=gateway,
         retrieval_service=retrieval_service,
         escalation_service=escalation_service,
         model_override=model_override,
         memory_retriever=_build_memory_retriever(
             db, tenant_config, principal.end_user_id
         ),
+        surface_id=surface["id"] if surface else None,
+        end_user_id=principal.end_user_id,
     )
     orchestration.compaction_callback = _build_compaction_callback(
         db,
         threads,
         tenant_config,
-        llm_api_key,
         provider,
         model_override or tenant_config.default_model,
         thread,
@@ -1157,11 +1239,11 @@ async def stream_conversation(
         user_turn["id"],
         request_id,
     )
-    spend_repo = SpendEventRepository(db)
     end_user_limits = get_end_user_limits()
 
     async def _usage(record: dict[str, Any]) -> None:
-        await spend_repo.add(record)
+        # P3-5: spend_events is written exclusively by the gateway cost
+        # ledger; this callback only tracks the end-user spend cap.
         if principal.end_user_id:
             await end_user_limits.record_spend(
                 str(tenant_config.id), principal.end_user_id,
@@ -1169,6 +1251,35 @@ async def stream_conversation(
             )
 
     orchestration.usage_callback = _usage
+
+    stream_buffer = get_stream_buffer()
+
+    # Phase 4: rolling-window output moderation (Arch 9.1 step 7). The window
+    # is staged per request; deltas are held and validated before release.
+    # The window size is a per-tenant latency/safety knob (P4-3, D-3):
+    # ``tenant_config.stream_moderation_window_chars`` overrides the platform
+    # default when set, so strict PII/policy tenants can hold larger windows
+    # before release without a platform-wide change.
+    moderation_window = (
+        tenant_config.stream_moderation_window_chars
+        or settings.STREAM_MODERATION_WINDOW_CHARS
+    )
+    if feature_flags.ENABLE_PRESIDIO:
+
+        async def _stream_validator(text: str):
+            return await guardrails_service.evaluate_output(
+                text,
+                tenant_config=tenant_config,
+                conversation_id=conversation["id"],
+                session_id=session_id,
+            )
+
+        moderation = StreamingModerationWindow(
+            _stream_validator,
+            window_size=moderation_window,
+        )
+    else:
+        moderation = StreamingModerationWindow(None)
 
     async def event_generator():
         yield _sse("session", {"session_id": session_id, "thread_id": thread["id"]})
@@ -1249,27 +1360,153 @@ async def stream_conversation(
             )
             return
 
+        result: dict[str, Any] | None = None
         try:
-            async for event in orchestration.stream_message(
-                user_message=request.message,
-                redacted_message=redacted_message,
-                session_id=session_id,
-                conversation_history=history_turns,
-                context={"conversation_id": conversation["id"]},
-                context_summary=context_summary,
-                context_summary_position=context_summary_position,
-                context_summary_layers=context_summary_layers,
-            ):
-                if event["type"] == "delta":
-                    yield _sse("delta", {"content": event["content"]})
-                elif event["type"] == "error":
-                    yield _sse("error", {"error": event["error"]})
-                else:
-                    result = event
-                    break
+            # Heartbeats (P4-1): the producer+consumer loop funnels upstream
+            # events through an asyncio.Queue while a timer injects `heartbeat`
+            # frames when the model is quiet — CDN/proxy idle timeouts stay
+            # satisfied without delaying real deltas. Cancellation of the
+            # consumer cancels the producer, which propagates into the
+            # gateway stream (P4-4: no orphaned in-flight generation).
+            from asyncio import Queue as _Queue
+
+            stream_q: _Queue = asyncio.Queue()
+
+            async def _produce() -> None:
+                try:
+                    async for event in orchestration.stream_message(
+                        user_message=request.message,
+                        redacted_message=redacted_message,
+                        session_id=session_id,
+                        conversation_history=history_turns,
+                        context={"conversation_id": conversation["id"]},
+                        context_summary=context_summary,
+                        context_summary_position=context_summary_position,
+                        context_summary_layers=context_summary_layers,
+                    ):
+                        await stream_q.put(("event", event))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # surface upstream failure in-band
+                    await stream_q.put(("exception", exc))
+                finally:
+                    await stream_q.put(("done", None))
+
+            async def _heartbeat_loop() -> None:
+                try:
+                    while True:
+                        await asyncio.sleep(settings.STREAM_HEARTBEAT_SECONDS)
+                        await stream_q.put(("heartbeat", None))
+                except asyncio.CancelledError:
+                    pass
+
+            producer = asyncio.create_task(_produce())
+            heartbeat_task = asyncio.create_task(_heartbeat_loop())
+            try:
+                while True:
+                    kind, payload = await stream_q.get()
+                    if kind == "heartbeat":
+                        yield _sse("heartbeat", {})
+                        continue
+                    if kind == "exception":
+                        raise payload
+                    if kind == "done":
+                        break
+                    event = payload
+                    if event["type"] == "delta":
+                        release = await moderation.push(event["content"])
+                        if release is None:
+                            continue  # held until a full window accumulates
+                        if release.truncated:
+                            # Output moderation flagged blocked content mid-
+                            # stream: emit a redaction event and truncate the
+                            # stream (never release the tail to the client).
+                            await stream_buffer.mark_terminal(
+                                str(tenant_config.id), stream_id, "error",
+                                {
+                                    "error": "output_moderation_redaction",
+                                    "reason": "content_moderation",
+                                    "violations": [
+                                        getattr(v, "to_dict", lambda: v)()
+                                        for v in release.violations
+                                    ],
+                                },
+                            )
+                            yield _sse(
+                                "redaction",
+                                {"violations": [getattr(v, "to_dict", lambda: v)() for v in release.violations]},
+                            )
+                            await _publish_webhook_event(
+                                EVENT_GUARDRAIL_BLOCKED,
+                                tenant_config,
+                                {
+                                    "reason": "content_moderation",
+                                    "violations": [
+                                        getattr(v, "to_dict", lambda: v)()
+                                        for v in release.violations
+                                    ],
+                                },
+                                session_id,
+                            )
+                            return
+                        seq = await stream_buffer.append(
+                            str(tenant_config.id), stream_id, "delta",
+                            {"content": release.text},
+                        )
+                        yield _sse("delta", {"content": release.text}, event_id=seq)
+                    elif event["type"] == "error":
+                        await stream_buffer.mark_terminal(
+                            str(tenant_config.id), stream_id, "error",
+                            {"error": event["error"]},
+                        )
+                        yield _sse("error", {"error": event["error"]})
+                        break
+                    else:
+                        result = event
+                        break
+            finally:
+                producer.cancel()
+                heartbeat_task.cancel()
 
             if result is None:
                 return
+
+            # Flush whatever the window still holds before the result frame.
+            tail = await moderation.finish()
+            if tail is not None and tail.truncated:
+                await stream_buffer.mark_terminal(
+                    str(tenant_config.id), stream_id, "error",
+                    {
+                        "error": "output_moderation_redaction",
+                        "reason": "content_moderation_tail",
+                        "violations": [
+                            getattr(v, "to_dict", lambda: v)()
+                            for v in tail.violations
+                        ],
+                    },
+                )
+                yield _sse(
+                    "redaction",
+                    {"violations": [getattr(v, "to_dict", lambda: v)() for v in tail.violations]},
+                )
+                await _publish_webhook_event(
+                    EVENT_GUARDRAIL_BLOCKED,
+                    tenant_config,
+                    {
+                        "reason": "content_moderation_tail",
+                        "violations": [
+                            getattr(v, "to_dict", lambda: v)() for v in tail.violations
+                        ],
+                    },
+                    session_id,
+                )
+                return
+            if tail is not None and tail.text:
+                seq = await stream_buffer.append(
+                    str(tenant_config.id), stream_id, "delta",
+                    {"content": tail.text},
+                )
+                yield _sse("delta", {"content": tail.text}, event_id=seq)
 
             response_text = result["response"]
             response_raw = response_text
@@ -1313,22 +1550,44 @@ async def stream_conversation(
             if handoff_required:
                 await conversation_repo.mark_escalated(conversation["id"])
 
-            yield _sse(
-                "result",
+            result_payload: dict[str, Any] = {
+                "response": response_text,
+                "confidence": result.get("confidence", 0.0),
+                "handoff_required": handoff_required,
+                "citations": result.get("citations") or [],
+                "faithfulness": result.get("faithfulness"),
+                "thread_id": thread["id"],
+            }
+            # Turn completion (P4-7): fire the durable event contract exactly
+            # as the non-streaming path does. Best-effort — a webhook outage
+            # must never fail the SSE stream that already persisted the turn.
+            await _publish_webhook_event(
+                EVENT_CONVERSATION_COMPLETED,
+                tenant_config,
                 {
-                    "response": response_text,
-                    "confidence": result.get("confidence", 0.0),
+                    "session_id": session_id,
+                    "streamed": True,
                     "handoff_required": handoff_required,
-                    "citations": result.get("citations") or [],
-                    "faithfulness": result.get("faithfulness"),
-                    "thread_id": thread["id"],
+                    "confidence": result.get("confidence", 0.0),
                 },
+                session_id,
             )
+            await stream_buffer.mark_terminal(
+                str(tenant_config.id), stream_id, "result", result_payload
+            )
+            yield _sse("result", result_payload)
         except HTTPException:
             raise
         except Exception as e:
             logger.error("conversation_stream_error", error=str(e))
-            yield _sse("error", {"error": str(e)})
+            payload: dict[str, Any] = {"error": str(e)}
+            if isinstance(e, GatewayError):
+                payload["kind"] = e.kind
+                payload["status"] = _gateway_http_status(e)
+            await stream_buffer.mark_terminal(
+                str(tenant_config.id), stream_id, "error", payload
+            )
+            yield _sse("error", payload)
         finally:
             await admission_handle.release()
             await thread_lease.release()
@@ -1425,7 +1684,6 @@ def _build_compaction_callback(
     db: Any,
     threads: ThreadRepository,
     tenant_config: TenantConfig,
-    llm_api_key: str,
     provider: str,
     summarizer_model: str,
     thread: dict[str, Any],
@@ -1439,14 +1697,16 @@ def _build_compaction_callback(
     failure path where a synchronous checkpoint is the only option.
     Failures return None so the turn continues un-compacted — compaction
     never breaks a turn.
+
+    P3-9: the summarizer runs through the gateway (``GatewayBackedAdapter``)
+    — same routing, quota, ledger and caching path as chat; the route no
+    longer resolves provider keys.
     """
     compaction = CompactionService(
         threads=threads,
         generator=LLMSummaryGenerator(
-            adapter=create_llm_adapter(
-                LLMProviderType(provider),
-                llm_api_key,
-                LLMConfig(model=summarizer_model),
+            adapter=GatewayBackedAdapter(
+                get_gateway(), tenant_config, provider, summarizer_model
             ),
         ),
         estimator=TokenEstimator(),
@@ -1553,26 +1813,6 @@ def _get_retrieval_service(tenant_id: UUID):
     _rag_services[key] = retrieval_service
     logger.info("retrieval_service_ready", tenant_id=key)
     return retrieval_service
-
-
-async def _resolve_llm_api_key(tenant_config: TenantConfig, db: Any) -> str:
-    """Resolve the tenant's provider key (DB row first, platform fallback).
-
-    Keys are stored envelope-encrypted; the fallback is only the
-    platform-managed settings key while PLATFORM_MANAGED_KEYS_ENABLED is on.
-    """
-    from backend.app.infrastructure.keys.service import (
-        ProviderKeyNotFoundError,
-        ProviderKeyService,
-    )
-
-    try:
-        return await ProviderKeyService(db).resolve(tenant_config)
-    except ProviderKeyNotFoundError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(e),
-        )
 
 
 @router.post("/tenants", response_model=TenantResponse)

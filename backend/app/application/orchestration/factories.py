@@ -2,17 +2,14 @@
 
 Used by both the conversation API route (request path) and the eval
 replay worker so replayed runs are built exactly like live runs.
+Key handling lives in the gateway (P3-9); this module only wires
+non-provider dependencies.
 """
-
-import structlog
-from typing import Any
 
 from backend.app.domain.policy import PolicySet
 from backend.app.domain.tenant import TenantConfig
 from backend.app.infrastructure.db import PolicyRepository
 from backend.app.modules.tenant_config import policy_set_from_db
-
-logger = structlog.get_logger(__name__)
 
 
 async def load_or_create_policy_set(db, tenant_config: TenantConfig) -> PolicySet:
@@ -34,21 +31,3 @@ def get_retrieval_service(tenant_id):
     vector_store = create_vector_store_from_settings()
     rag_service = create_rag_service(vector_store, tenant_id=tenant_id)
     return create_retrieval_service(rag_service)
-
-
-def resolve_llm_api_key(tenant_config: TenantConfig) -> str:
-    """Resolve the LLM API key for the tenant's configured provider."""
-    from backend.app.settings.env import settings
-
-    provider = tenant_config.default_provider
-    if provider in ("openai", "azure", "google"):
-        key = getattr(settings, f"{provider.upper()}_API_KEY", None)
-    elif provider == "custom":
-        key = settings.CUSTOM_LLM_API_KEY
-    elif provider in ("anthropic",):
-        key = settings.ANTHROPIC_API_KEY
-    else:
-        key = None
-    if not key:
-        logger.warning("no_llm_api_key_configured", provider=provider)
-    return key or ""

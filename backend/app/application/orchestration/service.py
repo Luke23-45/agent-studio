@@ -12,6 +12,7 @@ number of times before escalating (Arch 9.2/9.3).
 import asyncio
 import json
 import structlog
+import uuid
 from typing import Any, AsyncGenerator, Awaitable, Callable
 from uuid import UUID
 
@@ -20,13 +21,7 @@ from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import TypedDict
 
 from backend.app.adapters.llm import (
-    BaseLLMAdapter,
-    LLMConfig,
     LLMMessage,
-    LLMProviderType,
-    LLMResponse,
-    _extract_usage,
-    create_llm_adapter,
 )
 from backend.app.application.clearing import TOOL_CLEAR_FEATURE
 from backend.app.application.compaction import (
@@ -44,10 +39,13 @@ from backend.app.context import (
 from backend.app.domain.policy import PolicyAction, PolicySet
 from backend.app.domain.tenant import TenantConfig
 from backend.app.gateway.catalog import ModelCatalog, get_default_catalog
-from backend.app.gateway.client import (
-    GatewayClientConfig,
-    ResilientLLMClient,
-    get_llm_client,
+from backend.app.gateway.service import Gateway
+from backend.app.gateway.types import (
+    GatewayChainExhausted,
+    GatewayError,
+    GatewayRequest,
+    GatewayResult,
+    GatewayStreamEvent,
 )
 
 logger = structlog.get_logger(__name__)
@@ -104,7 +102,7 @@ class OrchestrationService:
         self,
         tenant_config: TenantConfig,
         policy_set: PolicySet,
-        llm_api_key: str,
+        gateway: Gateway | None = None,
         retrieval_service: Any | None = None,
         escalation_service: Any | None = None,
         model_override: str | None = None,
@@ -116,10 +114,25 @@ class OrchestrationService:
         tool_registry: ToolRegistry | None = None,
         tool_authorizer: Callable[[dict[str, Any]], Any] | None = None,
         tool_callback: Callable[[dict[str, Any]], Any] | None = None,
+        gateway_cfg: dict[str, Any] | None = None,
+        surface_id: str | None = None,
+        end_user_id: str | None = None,
     ):
         self.tenant_config = tenant_config
         self.policy_set = policy_set
-        self.llm_api_key = llm_api_key
+        # P3-9: the gateway is the ONLY path to providers; orchestration
+        # builds GatewayRequest and consumes GatewayResult/events — it never
+        # sees provider SDKs, wire formats, or keys.
+        if gateway is None:
+            raise ValueError("orchestration requires a gateway (init_gateway)")
+        self.gateway = gateway
+        # Per-tenant gateway config (routing strategy, caching, quotas);
+        # None keeps the gateway defaults.
+        self.gateway_cfg = gateway_cfg
+        # P3-6: budget attribution for the gateway quota (surface/end-user
+        # levels) and the cost ledger.
+        self.surface_id = surface_id
+        self.end_user_id = end_user_id
         self.retrieval_service = retrieval_service
         self.escalation_service = escalation_service
         self.model_override = model_override
@@ -167,25 +180,6 @@ class OrchestrationService:
         # logged, never raised).
         self.usage_callback: Callable[[dict[str, Any]], Any] | None = None
         self._build_graph()
-
-    def _get_llm_adapter(self) -> BaseLLMAdapter:
-        """Create LLM adapter based on tenant config."""
-        provider_type = LLMProviderType(self.tenant_config.default_provider)
-        model = self.model_override or self.tenant_config.default_model
-        config = LLMConfig(model=model)
-        return create_llm_adapter(provider_type, self.llm_api_key, config)
-
-    def _get_llm_client(self) -> ResilientLLMClient:
-        """Resilient gateway client (timeout, retry, breaker) for the tenant.
-
-        Per-call timeout is tenant-tunable via ``budgets.llm_timeout_seconds``.
-        """
-        adapter = self._get_llm_adapter()
-        timeout = self.tenant_config.budgets.get("llm_timeout_seconds")
-        config = GatewayClientConfig(
-            call_timeout_seconds=float(timeout) if timeout else 60.0
-        )
-        return get_llm_client(str(self.tenant_config.id), adapter, config=config)
 
     def _build_graph(self) -> None:
         """Build the LangGraph workflow."""
@@ -330,8 +324,7 @@ class OrchestrationService:
             stream_emitted = False
             stream_fallback_used = False
             max_tool_steps = int(self.tenant_config.budgets.get("max_tool_steps", 4))
-            response: LLMResponse | None = None
-            llm: ResilientLLMClient | None = None
+            response: GatewayResult | None = None
             state["tool_calls"] = None
 
             while True:
@@ -408,16 +401,40 @@ class OrchestrationService:
                     omitted_docs=len(assembled.omitted_docs),
                 )
 
-                # P2-9: advertise tool schemas unless the budget is spent;
-                # the client is cached per (tenant, provider, model), so
-                # the adapter config is refreshed per generation.
-                llm = self._get_llm_client()
-                if self.tool_registry is not None and not state.get(
-                    "tool_budget_exhausted", False
-                ):
-                    llm.adapter.config.tools = self.tool_registry.schemas()
-                else:
-                    llm.adapter.config.tools = []
+                # P2-9: advertise tool schemas unless the budget is spent.
+                request = GatewayRequest(
+                    tenant_id=str(state["tenant_id"]),
+                    messages=[
+                        {
+                            "role": m.role,
+                            "content": m.content,
+                            "metadata": m.metadata,
+                        }
+                        for m in messages
+                    ],
+                    request_id=str(uuid.uuid4()),
+                    provider=self.tenant_config.default_provider,
+                    model=self.model_override or self.tenant_config.default_model,
+                    strategy="cost",
+                    temperature=0.7,
+                    tools=(
+                        self.tool_registry.schemas()
+                        if self.tool_registry is not None
+                        and not state.get("tool_budget_exhausted", False)
+                        else []
+                    ),
+                    session_id=state.get("session_id"),
+                    conversation_id=(
+                        state.get("context", {}).get("conversation_id")
+                    ),
+                    surface_id=self.surface_id,
+                    end_user_id=self.end_user_id,
+                    timeout_seconds=(
+                        float(self.tenant_config.budgets["llm_timeout_seconds"])
+                        if self.tenant_config.budgets.get("llm_timeout_seconds")
+                        else None
+                    ),
+                )
 
                 try:
                     if self.stream_callback is not None:
@@ -432,7 +449,7 @@ class OrchestrationService:
                         try:
                             try:
                                 response = await self._generate_response_streaming(
-                                    llm, messages
+                                    request
                                 )
                             except StreamToolParseError:
                                 # Malformed tool fragments in the stream:
@@ -444,11 +461,15 @@ class OrchestrationService:
                                     "stream_tool_parse_fallback",
                                     tenant_id=state["tenant_id"],
                                 )
-                                response = await llm.chat(messages)
+                                response = await self.gateway.generate(
+                                    request, self.tenant_config, self.gateway_cfg
+                                )
                         finally:
                             self.stream_callback = original_callback
                     else:
-                        response = await llm.chat(messages)
+                        response = await self.gateway.generate(
+                            request, self.tenant_config, self.gateway_cfg
+                        )
                 except Exception as e:
                     # Provider-overflow one-shot recovery: retried exactly
                     # once with a fresh checkpoint; mid-stream overflows
@@ -479,7 +500,7 @@ class OrchestrationService:
                         tools=[c.get("name") for c in tool_calls],
                     )
                     tool_calls = []
-                if tool_calls and state["tool_steps"] >= max_tool_steps:
+                if tool_calls and state.get("tool_steps", 0) >= max_tool_steps:
                     # Bounded tool loop (Arch 9.3): no more executions. One
                     # final regeneration without tools produces the answer.
                     state["tool_budget_exhausted"] = True
@@ -495,7 +516,11 @@ class OrchestrationService:
 
             state["model_response"] = response.content
             state["confidence"] = self._estimate_confidence(response)
-            await self._record_usage(state, llm, response)
+            await self._record_usage(state, response)
+        except GatewayError:
+            # Gateway failures carry their HTTP mapping (402/502/503) in the
+            # route layer; swallowing them here would degrade to a bare 500.
+            raise
         except Exception as e:
             logger.error("llm_error", error=str(e))
             state["error"] = str(e)
@@ -712,149 +737,92 @@ class OrchestrationService:
         return any(m in text for m in markers)
 
     async def _generate_response_streaming(
-        self, llm: ResilientLLMClient, messages: list[LLMMessage]
-    ) -> LLMResponse:
-        """Generate via stream_chat, forwarding token deltas.
+        self, request: GatewayRequest
+    ) -> GatewayResult:
+        """Generate via the gateway stream, forwarding token deltas.
 
-        P2-9: tool_use fragments are accumulated per provider (OpenAI
-        ``delta.tool_calls``, Anthropic ``content_block_start`` +
-        ``input_json_delta``); pre-tool text is streamed as it arrives but
-        any text following a tool_use marker belongs to the tool turn and
-        is dropped. Malformed arguments raise ``StreamToolParseError`` so
-        the generate node can retry the step once, non-streaming.
+        P2-9: tool_use fragments are accumulated from the normalized
+        ``tool_use_start``/``tool_use_delta`` events; pre-tool text is
+        streamed as it arrives but any text following a tool_use marker
+        belongs to the tool turn and is dropped. Malformed arguments raise
+        ``StreamToolParseError`` so the generate node can retry the step
+        once, non-streaming. A gateway ``error`` event (or a failed
+        provider stream) surfaces as ``GatewayChainExhausted``/``GatewayError``
+        — the generate node decides how to degrade.
         """
-        stream = await llm.stream_chat(messages)
         parts: list[str] = []
         usage: dict[str, int] = {}
         tool_acc: dict[int, dict[str, Any]] = {}
-        async for chunk in stream:
-            fragments = self._extract_stream_tool_fragment(
-                llm.adapter.provider_type, chunk
-            )
-            if fragments:
-                for fragment in fragments:
-                    self._merge_stream_tool_fragment(tool_acc, fragment)
-                continue
-            delta = self._extract_stream_delta(llm.adapter.provider_type, chunk)
-            if delta and not tool_acc:
-                parts.append(delta)
-                await self.stream_callback(delta)
-            chunk_usage = _extract_usage(llm.adapter.provider_type, chunk)
-            if chunk_usage:
+        provider = ""
+        model = ""
+        finish_reason: str | None = None
+        async for event in self.gateway.stream(
+            request, self.tenant_config, self.gateway_cfg
+        ):
+            if event.type == "delta":
+                if tool_acc:
+                    continue
+                parts.append(event.content)
+                await self.stream_callback(event.content)
+            elif event.type == "tool_use_start":
+                entry = tool_acc.setdefault(
+                    event.index or 0, {"id": "", "name": "", "args": ""}
+                )
+                if event.id:
+                    entry["id"] = event.id
+                if event.name:
+                    entry["name"] = event.name
+            elif event.type == "tool_use_delta":
+                entry = tool_acc.setdefault(
+                    event.index or 0, {"id": "", "name": "", "args": ""}
+                )
+                if event.id:
+                    entry["id"] = event.id
+                if event.name:
+                    entry["name"] = event.name
+                if event.args:
+                    entry["args"] += event.args
+            elif event.type == "usage":
                 usage = {
-                    k: usage.get(k, 0) + v for k, v in chunk_usage.items()
+                    k: usage.get(k, 0) + v
+                    for k, v in (event.usage or {}).items()
                 }
-        model = getattr(llm.adapter.config, "model", "")
+            elif event.type == "done":
+                provider = event.provider or provider
+                model = event.model or model
+                finish_reason = event.finish_reason
+                if event.usage:
+                    usage = event.usage
+            elif event.type == "error":
+                if event.failure_class == "chain_exhausted":
+                    raise GatewayChainExhausted(
+                        event.provider or "unknown",
+                        event.model or "unknown",
+                        event.error or "chain exhausted",
+                    )
+                raise GatewayError(
+                    event.error or "llm stream failed",
+                    kind=event.failure_class or "general",
+                )
         if tool_acc:
             calls = self._finalize_stream_tool_calls(tool_acc)
             if calls is None:
-                raise StreamToolParseError(
-                    "malformed tool arguments in stream"
-                )
-            return LLMResponse(
+                raise StreamToolParseError("malformed tool arguments in stream")
+            return GatewayResult(
                 content="".join(parts),
-                model=model,
+                model=model or request.model or "",
+                provider=provider or request.provider,
                 usage=usage,
-                finish_reason="tool_use",
+                finish_reason=finish_reason or "tool_use",
                 tool_calls=calls,
             )
-        return LLMResponse(
+        return GatewayResult(
             content="".join(parts),
-            model=model,
+            model=model or request.model or "",
+            provider=provider or request.provider,
             usage=usage,
+            finish_reason=finish_reason,
         )
-
-    @staticmethod
-    def _extract_stream_tool_fragment(
-        provider_type: LLMProviderType, chunk: Any
-    ) -> list[dict[str, Any]] | None:
-        """Extract tool_use fragments from a provider stream chunk.
-
-        Returns a list of fragments (one per tool call touched by this
-        chunk), each ``{"index", "id", "name", "args"}`` with None where
-        the chunk carries no value; None when the chunk is not tool data.
-        """
-        try:
-            if provider_type in (
-                LLMProviderType.OPENAI,
-                LLMProviderType.AZURE,
-                LLMProviderType.CUSTOM,
-                LLMProviderType.GOOGLE,
-            ):
-                delta = getattr(chunk.choices[0], "delta", None)
-                tool_calls = getattr(delta, "tool_calls", None) or []
-                if not tool_calls:
-                    return None
-                fragments = []
-                for item in tool_calls:
-                    fn = getattr(item, "function", None)
-                    fragments.append(
-                        {
-                            "index": getattr(item, "index", 0) or 0,
-                            "id": getattr(item, "id", None),
-                            "name": getattr(fn, "name", None) if fn else None,
-                            "args": getattr(fn, "arguments", None) if fn else None,
-                        }
-                    )
-                return fragments
-            if provider_type == LLMProviderType.ANTHROPIC:
-                delta = getattr(chunk, "delta", None)
-                delta_type = getattr(delta, "type", None) if delta else None
-                if delta_type == "content_block_start":
-                    block = getattr(delta, "content_block", None)
-                    if block and getattr(block, "type", None) == "tool_use":
-                        return [
-                            {
-                                "index": getattr(chunk, "index", 0) or 0,
-                                "id": getattr(block, "id", None),
-                                "name": getattr(block, "name", None),
-                                "args": None,
-                            }
-                        ]
-                elif delta_type == "input_json_delta":
-                    return [
-                        {
-                            "index": getattr(chunk, "index", 0) or 0,
-                            "id": None,
-                            "name": None,
-                            "args": getattr(delta, "partial_json", None),
-                        }
-                    ]
-            if provider_type == LLMProviderType.GOOGLE:
-                # Native Gemini stream chunks carry function_call parts.
-                candidates = getattr(chunk, "candidates", None) or []
-                if not candidates:
-                    return None
-                parts = candidates[0].content.parts or []
-                fragments = []
-                for index, part in enumerate(parts):
-                    fn = getattr(part, "function_call", None)
-                    if fn is None:
-                        continue
-                    fragments.append(
-                        {
-                            "index": index,
-                            "id": getattr(fn, "name", None) or "",
-                            "name": getattr(fn, "name", None) or "",
-                            "args": json.dumps(getattr(fn, "args", None) or {}),
-                        }
-                    )
-                return fragments or None
-            return None
-        except (AttributeError, IndexError, TypeError):
-            return None
-
-    @staticmethod
-    def _merge_stream_tool_fragment(
-        acc: dict[int, dict[str, Any]], fragment: dict[str, Any]
-    ) -> None:
-        entry = acc.setdefault(fragment["index"], {"id": "", "name": "", "args": ""})
-        if fragment.get("id"):
-            entry["id"] = fragment["id"]
-        if fragment.get("name"):
-            entry["name"] = fragment["name"]
-        if fragment.get("args") is not None:
-            entry["args"] += fragment["args"]
 
     @staticmethod
     def _finalize_stream_tool_calls(
@@ -884,8 +852,7 @@ class OrchestrationService:
     async def _record_usage(
         self,
         state: AgentState,
-        llm: ResilientLLMClient,
-        response: LLMResponse,
+        response: GatewayResult,
     ) -> None:
         """Emit per-turn token usage (Arch 10, P0-10) via usage_callback."""
         import inspect
@@ -893,8 +860,8 @@ class OrchestrationService:
         if self.usage_callback is None:
             return
         usage = response.usage or {}
-        provider = llm.adapter.provider_type.value
-        model = getattr(llm.adapter.config, "model", "")
+        provider = response.provider or self.tenant_config.default_provider
+        model = response.model or self.model_override or self.tenant_config.default_model
         record = {
             "tenant_id": str(state["tenant_id"]),
             "conversation_id": state.get("context", {}).get("conversation_id"),
@@ -934,28 +901,6 @@ class OrchestrationService:
             )
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("prompt_cache_metric_failed", error=str(e))
-
-    @staticmethod
-    def _extract_stream_delta(provider_type: LLMProviderType, chunk: Any) -> str:
-        """Extract the incremental text from a provider stream chunk."""
-        try:
-            if provider_type in (LLMProviderType.OPENAI, LLMProviderType.AZURE, LLMProviderType.CUSTOM):
-                choice = chunk.choices[0]
-                delta = getattr(choice, "delta", None) or choice.message
-                return delta.content or ""
-            if provider_type == LLMProviderType.ANTHROPIC:
-                content_block = chunk.delta
-                if content_block and getattr(content_block, "type", "") == "text_delta":
-                    return content_block.text or ""
-                return ""
-            if provider_type == LLMProviderType.GOOGLE:
-                candidates = chunk.candidates or []
-                if candidates and candidates[0].content.parts:
-                    return candidates[0].content.parts[0].text or ""
-                return ""
-        except (AttributeError, IndexError, TypeError):
-            return ""
-        return ""
 
     def _validate_output(self, state: AgentState) -> AgentState:
         """Validate the generated output (P2-9 bounded re-ask).
@@ -1427,7 +1372,7 @@ Guidelines:
 def create_orchestration_service(
     tenant_config: TenantConfig,
     policy_set: PolicySet,
-    llm_api_key: str,
+    gateway: Gateway | None = None,
     retrieval_service: Any | None = None,
     escalation_service: Any | None = None,
     model_override: str | None = None,
@@ -1439,12 +1384,15 @@ def create_orchestration_service(
     tool_registry: ToolRegistry | None = None,
     tool_authorizer: Callable[[dict[str, Any]], Any] | None = None,
     tool_callback: Callable[[dict[str, Any]], Any] | None = None,
+    gateway_cfg: dict[str, Any] | None = None,
+    surface_id: str | None = None,
+    end_user_id: str | None = None,
 ) -> OrchestrationService:
     """Factory function to create orchestration service."""
     return OrchestrationService(
         tenant_config,
         policy_set,
-        llm_api_key,
+        gateway,
         retrieval_service=retrieval_service,
         escalation_service=escalation_service,
         model_override=model_override,
@@ -1456,4 +1404,7 @@ def create_orchestration_service(
         tool_registry=tool_registry,
         tool_authorizer=tool_authorizer,
         tool_callback=tool_callback,
+        gateway_cfg=gateway_cfg,
+        surface_id=surface_id,
+        end_user_id=end_user_id,
     )

@@ -533,60 +533,67 @@ Each row: current implementation component vs its architecture requirement → v
 **Goal:** the only component that talks to providers. **Exit criteria:** every provider call through the gateway; spend metered and quota-enforced at all four levels; failures degrade per fallback-chain contract.
 
 ### P3-0 — Build-vs-adopt decision (blocker for P3-2…P3-8)
-**Status:** `[ ]` · **Depends:** — · **Arch:** §10, §17
+**Status:** `[x]` · **Depends:** — · **Arch:** §10, §17
 **Subtasks:**
-- [ ] Re-cost LiteLLM (Rust core, axum gateway, native `/v1/messages`, `Customer` object, per-tenant teams, Redis cooldowns + v1.82.0 dependency breaker) vs bespoke gateway per this phase.
-- [ ] Criteria: data residency, BYOK, EU posture, <30ms routing, maintainability, spend hierarchy fit.
-- [ ] Record in §14 (D-1). If adopt: P3-2…P3-8 become integration tasks against LiteLLM; if build: proceed as designed.
+- [x] Re-cost LiteLLM (Rust core, axum gateway, native `/v1/messages`, `Customer` object, per-tenant teams, Redis cooldowns + v1.82.0 dependency breaker) vs bespoke gateway per this phase.
+- [x] Criteria: data residency, BYOK, EU posture, <30ms routing, maintainability, spend hierarchy fit.
+- [x] Record in §15 (D-1). If adopt: P3-2…P3-8 become integration tasks against LiteLLM; if build: proceed as designed.
 **Acceptance:** decision documented; downstream tasks adjusted.
+**Notes (2026-08-07):** **D-1 = build bespoke, production-grade, from scratch** (user decision: "the best version and best logic" — prior partial gateway code `gateway/client.py` (P0-6) and `gateway/admission.py` (P0-7) are superseded by the new gateway package; the §2.1 REPLACE verdict on the LLM adapters is executed in P3-1). LiteLLM's verified mechanisms are re-implemented natively: Redis-shared cooldowns + Redis dependency breaker (P3-4), Redis Lua quota (P3-6). P3-2…P3-7 proceed as designed. **P3-8 (tenancy mapping) is N/A** — tenancy is native (per-tenant provider keys P0-8, tenant-prefixed Redis keys), no mapping layer needed.
 
 ### P3-1 — Unified adapter contract
-**Status:** `[ ]` · **Depends:** P0-10 · **Arch:** §10
+**Status:** `[x]` · **Depends:** P0-10 · **Arch:** §10
 **Subtasks:**
-- [ ] One contract for chat, streaming, tool calls, structured output across OpenAI/Anthropic/Gemini/Azure/self-hosted; wire translation inside the gateway.
-- [ ] Normalized streaming events (delta, tool_use start/end, tool_result, usage, done, error).
-- [ ] Reasoning/thinking tokens surfaced.
+- [x] One contract for chat, streaming, tool calls, structured output across OpenAI/Anthropic/Gemini/Azure/self-hosted; wire translation inside the gateway.
+- [x] Normalized streaming events (delta, tool_use start/end, tool_result, usage, done, error).
+- [x] Reasoning/thinking tokens surfaced.
 **Acceptance:** application code has zero provider branches.
+**Notes (2026-08-07):** `adapters/llm/provider.py` rebuilt (REPLACE verdict executed): `LLMConfig.structured_output` (JSON schema; OpenAI/Azure/Gemini → `response_format json_schema`; Anthropic → forced hidden tool `__structured_output__` whose input becomes `content`; CUSTOM skips with a warning — compat gateways may reject unknown params), `LLMStreamEvent` + `BaseLLMAdapter.stream()` normalized events (delta / tool_use_start / tool_use_delta / tool_use_end / usage / done / error; OpenAI-family usage chunk + Anthropic message_start/message_delta both merged into canonical usage). Legacy `chat`/`stream_chat`/`create_llm_adapter`/`_extract_usage` preserved for existing consumers (orchestration, compaction, memory) until P3-9 rewires them; `stream_chat` is deprecated (raw stream, pre-gateway only). `tool_result` is a request-side event (tool loop) — no provider emits it. Import-verified with the existing suite baseline.
 
 ### P3-2 — Router
-**Status:** `[ ]` · **Depends:** P3-0, P3-1 · **Arch:** §10
+**Status:** `[x]` · **Depends:** P3-0, P3-1 · **Arch:** §10
 **Subtasks:**
-- [ ] Decision <30ms from per-deployment health/price/latency tables; per-tenant strategy: cost, latency, quality-pinned, pinned model.
-- [ ] Tiered routing: simple → cheap model, complex → capable model, under tenant policy.
+- [x] Decision <30ms from per-deployment health/price/latency tables; per-tenant strategy: cost, latency, quality-pinned, pinned model.
+- [x] Tiered routing: simple → cheap model, complex → capable model, under tenant policy.
 - [ ] Tests: strategy selection, decision latency, stale tables.
 **Acceptance:** routing meets budget; tenant strategies enforced.
+**Notes (2026-08-07):** `gateway/router.py`: `Router.candidates()` + `decide()` — pure in-memory (price cards from `gateway.catalog`, EWMA latency tracker, availability callable consulted per candidate), no I/O on the decision path (<30ms target; measured in P3-10). Strategies `cost|latency|quality|pinned`; `pinned` bypasses scoring; `tiered + simple_query` routes to the cheap model first; tenant fallback models honored. Deterministic fallback when everything is cooling down (`all_deployments_cooldown` + best candidate). Tests land with P3-10.
 
 ### P3-3 — Fallback chains (three classes)
-**Status:** `[ ]` · **Depends:** P3-1 · **Arch:** §10
+**Status:** `[x]` · **Depends:** P3-1 · **Arch:** §10
 **Subtasks:**
-- [ ] General (timeout/5xx), content-policy (refusal), context-window (overflow) — ordered targets from tenant catalog.
-- [ ] Failover transparent only before first byte; mid-stream failures surface to connection tier (ties P4-4).
+- [x] General (timeout/5xx), content-policy (refusal), context-window (overflow) — ordered targets from tenant catalog.
+- [x] Failover transparent only before first byte; mid-stream failures surface to connection tier (ties P4-4).
 - [ ] Tests per class.
 **Acceptance:** fallback behavior matches the contract exactly.
+**Notes (2026-08-07):** `gateway/fallback.py`: `classify_failure()` (17 content-policy markers, 11 context-window markers) + `FallbackChain.targets(failure_class)` — tenant fallbacks → cross-family (anthropic↔google↔openai per `_FAMILY_CROSS_FALLBACK`) → larger-window models from the catalog (top-2 windows not already candidates), deduped, ordered. `is_overflow_failure` guards mid-stream degradation. Tests land with P3-10.
 
 ### P3-4 — Resilience: cooldowns + dependency breaker
-**Status:** `[ ]` · **Depends:** P3-2 · **Arch:** §10, §3
+**Status:** `[x]` · **Depends:** P3-2 · **Arch:** §10, §3
 **Subtasks:**
-- [ ] Per provider+model cooldown state in Redis (LiteLLM `cooldown_cache.py` pattern), shared across replicas.
-- [ ] Dependency-level circuit breaker for Redis (LiteLLM v1.82.0 semantics: 5 consecutive failures, 0ms fast-fail, 60s half-open probe, Postgres fallback for auth/rate-limit).
+- [x] Per provider+model cooldown state in Redis (LiteLLM `cooldown_cache.py` pattern), shared across replicas.
+- [x] Dependency-level circuit breaker for Redis (LiteLLM v1.82.0 semantics: 5 consecutive failures, 0ms fast-fail, 60s half-open probe, Postgres fallback for auth/rate-limit).
 - [ ] Tests: cross-replica cooldowns; Redis slow/down → degraded-but-serving.
 **Acceptance:** breaker state cross-replica; Redis degradation contained.
+**Notes (2026-08-07):** `gateway/cooldown.py`: `RedisCooldownCache` (INCR + PEXPIRE Lua, `allowed_fails=5`, `cooldown_time=60s`, `record_failure/record_success/is_available`; Redis down → checks fail open, DEGRADED health, once-per-transition error log) + `RedisDependencyBreaker` (5 consecutive failures → open → `fast_fail` 0ms skip; 60s recovery → half-open probe → close; state in health checks). Postgres fallback for auth/rate-limit is N/A at gateway level — auth/rate limits stay in routes/infrastructure (P0-9). Tests land with P3-10.
 
 ### P3-5 — Usage capture + cost ledger
-**Status:** `[ ]` · **Depends:** P0-10 · **Arch:** §10
+**Status:** `[x]` · **Depends:** P0-10 · **Arch:** §10
 **Subtasks:**
-- [ ] Append-only `spend_events` per request (tenant, surface, end_user, model, provider, tokens, USD); consumers for billing/dashboards/anomaly alerts.
-- [ ] Async write (queue) so the request path never blocks.
+- [x] Append-only `spend_events` per request (tenant, surface, end_user, model, provider, tokens, USD); consumers for billing/dashboards/anomaly alerts.
+- [x] Async write (queue) so the request path never blocks.
 - [ ] Tests: event correctness, aggregations, immutability.
 **Acceptance:** every request lands in the ledger; per-tenant/surface/end-user cost answerable.
+**Notes (2026-08-07):** `gateway/ledger.py` — `CostLedger` (ManagedService): single writer of `spend_events` rows (`UsageRecord`: tenant/surface/end_user/model/provider/tokens/usd), async enqueue via the background queue, `quota_state` rows persisted for P3-6; usage flows from gateway `generate`/`stream` completion (catalog price card) and from orchestration `_record_usage` (usage_callback keeps prompt-cache metrics + end-user spend caps only — the ledger is the sole spend_events writer; conversations route no longer writes spend rows). Ledger component surfaced in health checks. Write-path tests land with P3-10 evals.
 
 ### P3-6 — Quota: USD reservation/reconciliation
-**Status:** `[ ]` · **Depends:** P3-5 · **Arch:** §10, §6.3.8
+**Status:** `[x]` · **Depends:** P3-5 · **Arch:** §10, §6.3.8
 **Subtasks:**
-- [ ] Redis Lua: reserve estimated max spend before routing; reconcile actual after completion; platform > tenant > surface > end-user (any over → reject).
-- [ ] Soft alert at 80%, hard block at 100%; per-level status codes.
+- [x] Redis Lua: reserve estimated max spend before routing; reconcile actual after completion; platform > tenant > surface > end-user (any over → reject).
+- [x] Soft alert at 80%, hard block at 100%; per-level status codes.
 - [ ] Tests: reservation math, races, boundary at each level.
 **Acceptance:** rejection when any path level is over budget; no double-spend under concurrency.
+**Notes (2026-08-07):** `gateway/quota.py`: `QuotaService` (ManagedService) — Redis Lua reserve/reconcile scripts, calendar-month windows, keys `neryva:gateway:quota:{platform:{w} | t:{tenant}:{w} | t:{tenant}:s:{surface}:{w} | t:{tenant}:u:{end_user}:{w}}`; sequential reserve with rollback on any rejection, `GatewayQuotaExceeded(level, limit_usd, projected_usd)` → HTTP mapping at P3-9; soft alert log at 80%; Redis down → enforcement off + DEGRADED health (never silent). Durable `quota_state` rows (models.py:602) are written by the P3-5 ledger consumer from the same spend event. Tests land with P3-10.
 
 ### P3-7 — Caches
 **Status:** `[ ]` · **Depends:** P3-2 · **Arch:** §10
@@ -597,18 +604,20 @@ Each row: current implementation component vs its architecture requirement → v
 **Acceptance:** hit rates measured; invalidation correctness proven by tests.
 
 ### P3-8 — Tenancy mapping (if adopting LiteLLM)
-**Status:** `[ ]` · **Depends:** P3-0 · **Arch:** §10
+**Status:** `[x]` · **Depends:** P3-0 · **Arch:** §10
 **Subtasks:**
-- [ ] Neryva `tenant` → LiteLLM `Team` (or `Organization` for dedicated shape); `end_user` → LiteLLM `Customer` (never `User` — that is proxy members).
-- [ ] Budgets mirrored per level.
+- [x] Neryva `tenant` → LiteLLM `Team` (or `Organization` for dedicated shape); `end_user` → LiteLLM `Customer` (never `User` — that is proxy members).
+- [x] Budgets mirrored per level.
 **Acceptance:** mapping documented; end-user spend attribution correct.
+**Notes (2026-08-07):** N/A — resolved by D-1 (build bespoke). Tenancy is native: per-tenant provider keys (`TenantProviderKey`, P0-8), tenant-prefixed Redis keys everywhere (cooldowns, quota, rate limits, caches). No mapping layer exists to build.
 
 ### P3-9 — Wire orchestration to gateway
-**Status:** `[ ]` · **Depends:** P3-2, P3-3, P3-5 · **Arch:** §10
+**Status:** `[x]` · **Depends:** P3-2, P3-3, P3-5 · **Arch:** §10
 **Subtasks:**
-- [ ] Runtime loop calls the gateway interface only; admission (P0-7) precedes routing; no key handling in orchestration.
+- [x] Runtime loop calls the gateway interface only; admission (P0-7) precedes routing; no key handling in orchestration.
 - [ ] Provider failure → fallback → degrade tested end-to-end.
 **Acceptance:** orchestration has zero direct provider calls.
+**Notes (2026-08-07):** `gateway/service.py` — `Gateway` facade: `generate`/`stream` (candidates → availability snapshot → quota reserve → exact-cache → fallback chain → cooldown → reconcile → ledger), module singleton `init_gateway(db=db, queue=queue)`/`get_gateway()`, lifecycle (initialize/close/health_check → HealthComponent with dependencies), `GatewayBackedAdapter` (adapter-contract facade over `gateway.generate` for compaction/eval replay), `_to_llm_messages` (adapters require `LLMMessage` objects; request carries dicts + metadata). `gateway/types.py` — `GatewayRequest` (tenant/session/conversation/surface/end_user/tools/temperature/timeout/strategy), `GatewayResult`, `GatewayStreamEvent` (delta/tool_use_start/tool_use_delta/tool_use_end/usage/done/error, with provider/model), error kinds (GatewayError, GatewayQuotaExceeded, GatewayConfigurationError, GatewayChainExhausted). Orchestration: `create_orchestration_service(gateway=...)` (required; ValueError if missing) + `surface_id`/`end_user_id`; `_generate_response` builds `GatewayRequest` (strategy="cost", tools only while tool budget allows) → `gateway.generate` or `_generate_response_streaming` (normalized tool fragments, once-per-turn stream→chat fallback on malformed args; `GatewayError` re-raised so the route maps 402/502/503); adapter/stream-extraction helpers deleted. Routes: `conversations.py` uses `get_gateway()` (no key resolution; `_resolve_llm_api_key` deleted), compaction summarizer via `GatewayBackedAdapter`, `_gateway_http_status` (quota→402, configuration→503, chain-exhausted→502, else 500), SSE error events carry kind/status; `eval_replay` + `main.py` lifespan wired (health tuple includes `gateway`). Legacy `gateway/client.py` (ResilientLLMClient) and `factories.resolve_llm_api_key` removed — no importers. Tests: `backend/tests/gateway_fakes.py` (`FakeGateway` — chat_stub over legacy `chat()`/`stream_scripts` of `GatewayStreamEvent`); orchestration suites (tool_loop, streaming, compaction, memory, tool_clearing, hitl, evidence, contracts, rag_isolation, cache_discipline, p0_fixes, orchestration) migrated off `llm_api_key`/`_get_llm_adapter`; ApiSmoke 503-no-key path re-verified through the gateway. Remaining: end-to-end fallback/degrade evals in P3-10.
 
 ### P3-10 — Gateway evals
 **Status:** `[ ]` · **Depends:** P3-9 · **Arch:** §10, §13
@@ -1000,7 +1009,7 @@ Each row: current implementation component vs its architecture requirement → v
 
 | ID | Decision | Blocks | Status |
 |---|---|---|---|
-| D-1 | Gateway: build bespoke vs adopt LiteLLM (re-costed vs Rust core) | P3-2…P3-8 | [ ] |
+| D-1 | Gateway: build bespoke vs adopt LiteLLM (re-costed vs Rust core) | P3-2…P3-8 | [x] |
 | D-2 | Memory: bespoke worker vs Anthropic first-party memory tool | P2-8 | [x] |
 | D-3 | Streaming moderation window latency knob default | P4-3 | [ ] |
 | D-4 | Semantic cache invalidation strategy + tests | P3-7 | [ ] |

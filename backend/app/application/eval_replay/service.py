@@ -13,9 +13,9 @@ import structlog
 from backend.app.application.orchestration.factories import (
     get_retrieval_service,
     load_or_create_policy_set,
-    resolve_llm_api_key,
 )
 from backend.app.application.orchestration import create_orchestration_service
+from backend.app.gateway.service import get_gateway
 from backend.app.infrastructure.db.repositories import (
     AuditRepository,
     ConversationRepository,
@@ -71,7 +71,7 @@ class EvalReplayService:
         orchestration = create_orchestration_service(
             tenant_config=tenant_config,
             policy_set=policy_set,
-            llm_api_key=resolve_llm_api_key(tenant_config),
+            gateway=get_gateway(),
             retrieval_service=retrieval_service,
             escalation_service=escalation_service,
         )

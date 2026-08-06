@@ -45,6 +45,7 @@ from backend.app.domain.tenant import TenantConfig
 from backend.app.gateway.catalog import ModelCatalog, ModelSpec
 from backend.app.infrastructure.db import ConversationRepository, ThreadRepository, init_database
 from backend.app.infrastructure.db.models import Base
+from backend.tests.gateway_fakes import FakeGateway
 
 VALID_PAYLOAD = {
     "objective": "Resolve billing question",
@@ -553,7 +554,7 @@ async def test_orchestration_carries_layers_and_cache_markers():
     service = create_orchestration_service(
         tenant_config=_tenant(),
         policy_set=PolicySet(tenant_id=uuid4(), name="default"),
-        llm_api_key="test-key",
+        gateway=FakeGateway(),
         model_catalog=catalog,
         context_loader=SessionContextLoader(
             model_catalog=catalog, output_reserve_tokens=0
@@ -567,7 +568,7 @@ async def test_orchestration_carries_layers_and_cache_markers():
             content="ok", model="gpt-4", usage={}, finish_reason="stop"
         )
 
-    service._get_llm_adapter = lambda: _AdapterStub(chat=fake_chat, model="gpt-4")
+    service.gateway = FakeGateway(chat_stub=_AdapterStub(chat=fake_chat, model="gpt-4"))
 
     state = {
         "tenant_id": service.tenant_config.id,

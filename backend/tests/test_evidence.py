@@ -16,6 +16,7 @@ from backend.app.adapters.llm import LLMProviderType
 from backend.app.application.orchestration import create_orchestration_service
 from backend.app.domain.policy import PolicyAction, PolicyRule, PolicySet, PolicyType
 from backend.app.domain.tenant import TenantConfig
+from backend.tests.gateway_fakes import FakeGateway
 
 
 class _FakeAdapter:
@@ -42,11 +43,20 @@ def tenant():
 
 @pytest.fixture
 def policy_set(tenant):
+    # Deny-by-default (Arch 2.5): explicit allow rule so orchestration
+    # turns end in ALLOW; block tests append higher-priority rules.
     return PolicySet(
         id=uuid4(),
         tenant_id=tenant.id,
         name="default",
-        rules=[],
+        rules=[
+            PolicyRule(
+                name="allow-all",
+                action=PolicyAction.ALLOW,
+                conditions={},
+                priority=1,
+            )
+        ],
         version=1,
     )
 
@@ -56,19 +66,21 @@ def orchestration(tenant, policy_set):
     service = create_orchestration_service(
         tenant_config=tenant,
         policy_set=policy_set,
-        llm_api_key="fake-key",
+        gateway=FakeGateway(),
     )
-    service._get_llm_adapter = lambda: _FakeAdapter()
+    service.gateway = FakeGateway(chat_stub=_FakeAdapter())
     return service
 
 
 class TestPolicySetEvidence:
-    def test_no_matching_rules_returns_allow_with_no_details(self, policy_set):
-        action, details = policy_set.evaluate_with_results({})
-        assert action == PolicyAction.ALLOW
-        assert details == []
+    def test_no_matching_rules_denies_by_default(self):
+        empty = PolicySet(tenant_id=uuid4(), name="default", rules=[], version=1)
+        action, details = empty.evaluate_with_results({})
+        assert action == PolicyAction.BLOCK
+        assert details[0]["name"] == "deny-by-default"
 
-    def test_matching_rule_details_are_reported(self, policy_set):
+    def test_matching_rule_details_are_reported(self):
+        policy_set = PolicySet(tenant_id=uuid4(), name="default", version=1)
         rule = PolicyRule(
             name="block-low-confidence",
             policy_type=PolicyType.OUTPUT_VALIDATION,

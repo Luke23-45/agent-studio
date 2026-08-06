@@ -34,6 +34,7 @@ from backend.app.api.routes import (
     webhooks_router,
 )
 from backend.app.gateway.admission import get_admission_gate, init_admission
+from backend.app.gateway.service import get_gateway, init_gateway
 from backend.app.infrastructure.cache import get_cache_manager, init_cache
 from backend.app.infrastructure.db import (
     ApiKeyRepository,
@@ -43,6 +44,7 @@ from backend.app.infrastructure.db import (
 )
 from backend.app.infrastructure.queue import get_queue_manager, init_queue
 from backend.app.infrastructure.storage import get_storage_manager, init_storage
+from backend.app.infrastructure.stream import get_stream_buffer, init_stream_buffer
 from backend.app.modules.tenant_config import configure_tenant_config_service
 from backend.app.session.coordinator import get_thread_coordinator, init_thread_coordinator
 from backend.app.session.hot_tier import get_thread_tail_cache, init_thread_tail_cache
@@ -129,6 +131,10 @@ async def lifespan(app: FastAPI):
         tail_size=settings.SESSION_TAIL_SIZE,
     )
     init_session_token_service(db)
+    stream_buffer = init_stream_buffer(
+        settings.REDIS_URL,
+        ttl_seconds=settings.STREAM_BUFFER_TTL_SECONDS,
+    )
     end_user_limits = init_end_user_limits(
         settings.REDIS_URL,
         max_requests=settings.END_USER_RATE_MAX_REQUESTS,
@@ -137,6 +143,10 @@ async def lifespan(app: FastAPI):
         session_lease_seconds=settings.END_USER_SESSION_LEASE_SECONDS,
         spend_cap_tokens=settings.END_USER_SPEND_CAP_TOKENS,
     )
+    # P3-9: the LLM gateway (cooldowns, quota, cache, ledger) — the only
+    # path to providers. Redis-backed pieces degrade to in-memory fallbacks
+    # exactly like the other managers.
+    gateway = init_gateway(db=db, queue=queue)
     await asyncio.gather(
         cache.initialize(),
         queue.initialize(),
@@ -144,7 +154,9 @@ async def lifespan(app: FastAPI):
         admission.initialize(),
         coordinator.initialize(),
         tail_cache.initialize(),
+        stream_buffer.initialize(),
         end_user_limits.initialize(),
+        gateway.initialize(),
         initialize_rate_limiter(),
     )
 
@@ -165,7 +177,9 @@ async def lifespan(app: FastAPI):
         admission.close(),
         coordinator.close(),
         tail_cache.close(),
+        stream_buffer.close(),
         end_user_limits.close(),
+        gateway.close(),
     )
     logger.info("application_shutdown")
 
@@ -240,7 +254,9 @@ def create_application() -> FastAPI:
             ("rate_limiter", get_rate_limiter()),
             ("session_coordinator", get_thread_coordinator()),
             ("thread_tail_cache", get_thread_tail_cache()),
+            ("stream_buffer", get_stream_buffer()),
             ("end_user_limits", get_end_user_limits()),
+            ("gateway", get_gateway()),
         ):
             components[name] = (await manager.health_check()).to_dict()
 

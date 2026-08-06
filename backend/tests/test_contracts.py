@@ -22,6 +22,7 @@ from backend.app.application.orchestration import create_orchestration_service
 from backend.app.domain.policy import PolicyAction, PolicyRule, PolicySet, PolicyType
 from backend.app.domain.tenant import TenantConfig
 from backend.app.modules.webhooks import WebhookEnvelope
+from backend.tests.gateway_fakes import FakeGateway
 
 ROOT = Path(__file__).resolve().parents[2]
 OPENAPI_FILE = ROOT / "contracts" / "openapi" / "openapi.v1.json"
@@ -176,9 +177,9 @@ class TestSchemaContracts:
             ],
         )
         service = create_orchestration_service(
-            tenant_config=tenant, policy_set=policy_set, llm_api_key="fake-key"
+            tenant_config=tenant, policy_set=policy_set, gateway=FakeGateway()
         )
-        service._get_llm_adapter = lambda: _FakeAdapter()
+        service.gateway = FakeGateway(chat_stub=_FakeAdapter())
         records = []
         service.evidence_callback = records.append
         __import__("asyncio").run(

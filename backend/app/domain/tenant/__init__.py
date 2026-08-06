@@ -71,6 +71,12 @@ class TenantConfig:
         "pii": 0.5,
     })
 
+    # Phase 4 (P4-3, D-3): per-tenant latency/safety knob for the rolling
+    # moderation window. None = use the platform default (400 chars). A
+    # tenant with stricter PII/policy requirements can raise this to hold
+    # larger windows before release; latency-sensitive proxies lower it.
+    stream_moderation_window_chars: int | None = None
+
     def is_topic_allowed(self, topic: str) -> bool:
         if topic in self.blocked_topics:
             return False

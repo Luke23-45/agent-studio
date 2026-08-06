@@ -22,6 +22,7 @@ from backend.app.infrastructure.db import ConversationRepository, EscalationRepo
 from backend.app.infrastructure.db.manager import DatabaseConfig, DatabaseManager
 from backend.app.infrastructure.db.models import Base
 from backend.app.modules.escalation import create_escalation_service
+from backend.tests.gateway_fakes import FakeGateway
 
 
 class _FakeAdapter:
@@ -75,9 +76,9 @@ class TestLoopBudget:
         service = create_orchestration_service(
             tenant_config=tenant_config,
             policy_set=policy_set,
-            llm_api_key="fake-key",
+            gateway=FakeGateway(),
         )
-        service._get_llm_adapter = lambda: _FakeAdapter()
+        service.gateway = FakeGateway(chat_stub=_FakeAdapter())
         return service
 
     def test_default_budget_allows_two_iterations(self):

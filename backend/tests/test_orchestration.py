@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from backend.app.domain.policy import PolicyAction, PolicySet
 from backend.app.domain.tenant import TenantConfig
+from backend.tests.gateway_fakes import FakeGateway
 
 
 @pytest.fixture
@@ -45,7 +46,7 @@ class TestOrchestrationService:
         service = create_orchestration_service(
             tenant_config=sample_tenant_config,
             policy_set=sample_policy_set,
-            llm_api_key="test-key",
+            gateway=FakeGateway(),
         )
 
         result = await service.process_message(
@@ -65,7 +66,7 @@ class TestOrchestrationService:
         service = create_orchestration_service(
             tenant_config=sample_tenant_config,
             policy_set=sample_policy_set,
-            llm_api_key="test-key",
+            gateway=FakeGateway(),
         )
 
         # Test uncertainty detection

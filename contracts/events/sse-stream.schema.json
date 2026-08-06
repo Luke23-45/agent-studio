@@ -7,8 +7,25 @@
     {
       "title": "session",
       "type": "object",
-      "required": ["session_id"],
-      "properties": { "session_id": { "type": "string" } },
+      "required": ["session_id", "thread_id"],
+      "properties": {
+        "session_id": { "type": "string" },
+        "thread_id": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    {
+      "title": "heartbeat",
+      "description": "Keepalive ping; ``data`` is always an empty object ``{}``.",
+      "type": "object",
+      "additionalProperties": false
+    },
+    {
+      "title": "redaction",
+      "description": "Output moderation halted the stream before the tail reached the client (P4-3). Followed by the terminal ``error`` / ``result`` frame.",
+      "type": "object",
+      "required": ["violations"],
+      "properties": { "violations": { "type": "array" } },
       "additionalProperties": false
     },
     {

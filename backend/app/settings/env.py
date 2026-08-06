@@ -120,6 +120,18 @@ class Settings(BaseSettings):
     SESSION_TTL_SECONDS: int = 86400
     SESSION_TAIL_SIZE: int = 10
 
+    # Streaming durability and moderation (Arch 9.1, Phase 4):
+    # Server-side chunk buffer TTL — long enough for reconnect replay of a
+    # completed turn; short enough not to accumulate idle streams.
+    STREAM_BUFFER_TTL_SECONDS: int = 3600
+    # Rolling-window output moderation holds this many chars before release.
+    # Larger window = stricter context for the validator, more added latency.
+    STREAM_MODERATION_WINDOW_CHARS: int = 400
+    # SSE keepalive: the connection tier emits a heartbeat frame when no
+    # delta has been written for this many seconds (proxy/NAT idle timeouts,
+    # P4-1).
+    STREAM_HEARTBEAT_SECONDS: int = 15
+
     # End-user session tokens (Arch 6.4): Fernet bearer tokens, DB-revoked
     SESSION_TOKEN_TTL_SECONDS: int = 43200
     SESSION_TOKEN_ENCRYPTION_KEY: str | None = None

@@ -24,6 +24,7 @@ from backend.app.domain.policy import PolicySet
 from backend.app.domain.tenant import TenantConfig
 from backend.app.modules.grounding import FaithfulnessChecker
 from backend.app.modules.rag import RAGService
+from backend.tests.gateway_fakes import FakeGateway
 
 
 class _ConstantEmbedder:
@@ -204,7 +205,7 @@ class TestOrchestrationRetrieval:
         return tenant, create_orchestration_service(
             tenant_config=tenant,
             policy_set=PolicySet(id=uuid4(), tenant_id=tenant.id, name="default", version=1),
-            llm_api_key="fake-key",
+            gateway=FakeGateway(),
             retrieval_service=retrieval_service,
         )
 
@@ -342,10 +343,10 @@ class TestOrchestrationFaithfulnessWiring:
         service = create_orchestration_service(
             tenant_config=tenant,
             policy_set=policy_set,
-            llm_api_key="fake-key",
+            gateway=FakeGateway(),
             retrieval_service=retrieval_service,
         )
-        service._get_llm_adapter = lambda: adapter
+        service.gateway = FakeGateway(chat_stub=adapter)
         return asyncio.run(service.process_message("refund policy", "refund policy", session_id="s1"))
 
     def test_faithfulness_recorded_when_grounded(self):

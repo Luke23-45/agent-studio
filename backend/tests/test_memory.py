@@ -41,6 +41,7 @@ from backend.app.infrastructure.db import (
 )
 from backend.app.infrastructure.db.models import Base
 from backend.app.worker import handlers as worker_handlers
+from backend.tests.gateway_fakes import FakeGateway
 
 
 class _PiiStub:
@@ -367,7 +368,7 @@ def _orchestration(tenant_config, retriever=None):
     return create_orchestration_service(
         tenant_config=tenant_config,
         policy_set=PolicySet(tenant_id=uuid4(), name="default"),
-        llm_api_key="test-key",
+        gateway=FakeGateway(),
         model_catalog=catalog,
         context_loader=SessionContextLoader(
             model_catalog=catalog, output_reserve_tokens=0
@@ -409,7 +410,7 @@ async def test_orchestrator_renders_memory_block_when_feature_on():
         chat_calls.append(messages)
         return LLMResponse(content="ok", model="gpt-4", usage={}, finish_reason="stop")
 
-    service._get_llm_adapter = lambda: _AdapterStub(chat=fake_chat, model="gpt-4")
+    service.gateway = FakeGateway(chat_stub=_AdapterStub(chat=fake_chat, model="gpt-4"))
 
     result = await service._generate_response(_state(tenant_config))
     assert result["model_response"] == "ok"
@@ -434,7 +435,7 @@ async def test_orchestrator_skips_memory_when_feature_off():
         chat_calls.append(messages)
         return LLMResponse(content="ok", model="gpt-4", usage={}, finish_reason="stop")
 
-    service._get_llm_adapter = lambda: _AdapterStub(chat=fake_chat, model="gpt-4")
+    service.gateway = FakeGateway(chat_stub=_AdapterStub(chat=fake_chat, model="gpt-4"))
 
     result = await service._generate_response(_state(tenant_config))
     assert result["model_response"] == "ok"
@@ -456,7 +457,7 @@ async def test_orchestrator_survives_retriever_failure():
         chat_calls.append(messages)
         return LLMResponse(content="ok", model="gpt-4", usage={}, finish_reason="stop")
 
-    service._get_llm_adapter = lambda: _AdapterStub(chat=fake_chat, model="gpt-4")
+    service.gateway = FakeGateway(chat_stub=_AdapterStub(chat=fake_chat, model="gpt-4"))
 
     result = await service._generate_response(_state(tenant_config))
     assert result["model_response"] == "ok"

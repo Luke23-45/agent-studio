@@ -64,6 +64,7 @@ class TenantConfigService:
                 "features": config.features,
                 "guardrail_config": config.guardrail_config,
                 "guardrail_thresholds": config.guardrail_thresholds,
+                "stream_moderation_window_chars": config.stream_moderation_window_chars,
             }
 
             with open(config_file, "w") as f:
@@ -267,6 +268,7 @@ def tenant_config_from_data(data: dict[str, Any]) -> TenantConfig:
         budgets={**default_budgets, **data.get("budgets", {})},
         tool_clearing={**default_tool_clearing, **data.get("tool_clearing", {})},
         memory={**default_memory, **data.get("memory", {})},
+        stream_moderation_window_chars=data.get("stream_moderation_window_chars"),
     )
 
 
