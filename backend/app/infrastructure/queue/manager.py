@@ -1,15 +1,17 @@
 import asyncio
 import json
-import structlog
 import time as time_module
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 from uuid import uuid4
 
-from ..patterns import ManagedService, HealthComponent, HealthStatus
-from ..patterns.retry import AsyncRetry, RetryConfig, ExponentialBackoff
+import structlog
+
+from ..patterns import HealthComponent, HealthStatus, ManagedService
 from ..patterns.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
+from ..patterns.retry import AsyncRetry, ExponentialBackoff, RetryConfig
 
 logger = structlog.get_logger(__name__)
 
@@ -18,13 +20,13 @@ logger = structlog.get_logger(__name__)
 class Job:
     id: str = field(default_factory=lambda: str(uuid4()))
     type: str = ""
-    payload: Dict[str, Any] = field(default_factory=dict)
+    payload: dict[str, Any] = field(default_factory=dict)
     priority: int = 0
-    scheduled_at: Optional[datetime] = None
+    scheduled_at: datetime | None = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     retries: int = 0
     max_retries: int = 3
-    error: Optional[str] = None
+    error: str | None = None
     trace_id: str = ""
 
 
@@ -43,17 +45,17 @@ class QueueConfig:
 
 
 class QueueManager(ManagedService):
-    def __init__(self, config: Optional[QueueConfig] = None):
+    def __init__(self, config: QueueConfig | None = None):
         super().__init__("queue")
         self.config = config or QueueConfig()
         self._client: Any = None
-        self._handlers: Dict[str, Callable] = {}
+        self._handlers: dict[str, Callable] = {}
         self._running = False
         # In-memory idempotency tracking (Redis path caches seen keys lazily
         # at enqueue time; TTL applies on the Redis side)
         self._idem_seen: set[str] = set()
         self._idem_processed: set[str] = set()
-        self._dead_letters: List[str] = []
+        self._dead_letters: list[str] = []
         self._retry = AsyncRetry(RetryConfig(
             max_attempts=self.config.max_retries,
             backoff=ExponentialBackoff(min_delay=self.config.retry_min_delay),
@@ -79,7 +81,7 @@ class QueueManager(ManagedService):
                 error=str(e),
             )
             self._client = None
-            self._in_memory_queue: List[str] = []
+            self._in_memory_queue: list[str] = []
 
     async def _do_close(self) -> None:
         self._running = False
@@ -104,7 +106,7 @@ class QueueManager(ManagedService):
     def _dead_key(self, job_type: str) -> str:
         return f"{self.config.dead_letter_prefix}{job_type}"
 
-    async def enqueue(self, job: Job, idempotency_key: Optional[str] = None) -> bool:
+    async def enqueue(self, job: Job, idempotency_key: str | None = None) -> bool:
         """Enqueue a job.
 
         With ``idempotency_key`` the job is enqueued at most once per key
@@ -176,7 +178,7 @@ class QueueManager(ManagedService):
             error=d.get("error"), trace_id=d.get("trace_id", ""),
         )
 
-    async def dequeue(self, timeout: float = 1.0) -> Optional[Job]:
+    async def dequeue(self, timeout: float = 1.0) -> Job | None:
         if self._client:
             try:
                 return await self._circuit_breaker.call(self._redis_dequeue, timeout)
@@ -188,7 +190,7 @@ class QueueManager(ManagedService):
         await asyncio.sleep(timeout)
         return None
 
-    async def _redis_dequeue(self, timeout: float) -> Optional[Job]:
+    async def _redis_dequeue(self, timeout: float) -> Job | None:
         await self._move_scheduled_jobs()
 
         for queue_key in [f"{self.config.prefix}high", f"{self.config.prefix}default", f"{self.config.prefix}low"]:
@@ -263,20 +265,40 @@ class QueueManager(ManagedService):
         while self._running:
             if exit_event and exit_event.is_set():
                 break
+            await self._update_prometheus_gauges()
             job = await self.dequeue(timeout=self.config.poll_interval)
             if job:
                 await self.process_job(job)
 
+    async def _update_prometheus_gauges(self) -> None:
+        """Publish live queue depth + DLQ size gauges (P6-2)."""
+        try:
+            from backend.app.infrastructure.observability.metrics import get_metrics
+
+            metrics = get_metrics()
+            try:
+                depth = await self.get_queue_length()
+            except Exception:
+                depth = -1
+            try:
+                dlq = await self.get_dead_letter_count()
+            except Exception:
+                dlq = -1
+            metrics.queue_depth.labels(queue_name="default").set(depth)
+            metrics.dlq_size.labels(queue_name="default").set(dlq)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     def stop_processing(self) -> None:
         self._running = False
 
-    async def get_queue_length(self, priority: Optional[int] = None) -> int:
+    async def get_queue_length(self, priority: int | None = None) -> int:
         if not self._client:
             return len(self._in_memory_queue)
         key = self._queue_key(priority or 0)
         return await self._client.llen(key)
 
-    async def get_dead_letter_count(self, job_type: Optional[str] = None) -> int:
+    async def get_dead_letter_count(self, job_type: str | None = None) -> int:
         if not self._client:
             if job_type:
                 return sum(
@@ -296,15 +318,15 @@ class QueueManager(ManagedService):
                 break
         return total
 
-    async def drain_dead_letter(self, job_type: Optional[str] = None, limit: int = 100) -> List[Job]:
+    async def drain_dead_letter(self, job_type: str | None = None, limit: int = 100) -> list[Job]:
         """Remove and return failed jobs from the dead-letter queue.
 
         Used by the cleanup job to inspect and/or requeue dead letters.
         """
-        drained: List[Job] = []
+        drained: list[Job] = []
         if not self._client:
             if job_type:
-                remaining: List[str] = []
+                remaining: list[str] = []
                 for item in self._dead_letters:
                     job = self._deserialize_job(item)
                     if job.type == job_type and len(drained) < limit:
@@ -318,7 +340,7 @@ class QueueManager(ManagedService):
                 self._dead_letters = self._dead_letters[limit:]
             return drained
 
-        keys: List[str] = []
+        keys: list[str] = []
         if job_type:
             keys = [self._dead_key(job_type)]
         else:
@@ -358,7 +380,7 @@ class QueueManager(ManagedService):
         return HealthComponent(name=self.name, status=HealthStatus.DEGRADED, message="In-memory queue (single process)")
 
 
-_queue_manager: Optional[QueueManager] = None
+_queue_manager: QueueManager | None = None
 
 
 def get_queue_manager() -> QueueManager:

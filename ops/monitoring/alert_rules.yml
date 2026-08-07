@@ -1,0 +1,38 @@
+groups:
+  - name: neryva_slos
+    rules:
+      - alert: TTFTTooHigh
+        expr: histogram_quantile(0.95, sum(rate(neryva_ttft_seconds_bucket[5m])) by (le, tenant_id)) > 2.0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "TTFT p95 exceeded 2.0s for tenant {{ $labels.tenant_id }}"
+          description: "The 95th percentile Time-To-First-Token is currently {{ $value }}s."
+
+      - alert: ErrorBudgetExhausted
+        expr: sum(rate(neryva_errors_total[1h])) by (tenant_id) / sum(rate(neryva_requests_total[1h])) by (tenant_id) > 0.005
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Error budget exhausted for tenant {{ $labels.tenant_id }}"
+          description: "Error rate is {{ $value | humanizePercentage }} over the last hour."
+
+      - alert: HighGuardrailBlockRate
+        expr: sum(rate(neryva_guardrail_checks_total{decision="block"}[5m])) by (tenant_id) / sum(rate(neryva_requests_total[5m])) by (tenant_id) > 0.20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High guardrail block rate for tenant {{ $labels.tenant_id }}"
+          description: "Guardrails are blocking {{ $value | humanizePercentage }} of requests."
+
+      - alert: QueueDepthHigh
+        expr: neryva_queue_depth > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High background job queue depth"
+          description: "Queue {{ $labels.queue_name }} has {{ $value }} pending jobs."

@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - 'alert_rules.yml'
+
+scrape_configs:
+  - job_name: 'neryva_api'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['api:8000']
+
+  - job_name: 'neryva_worker'
+    # Worker metrics exposition usually requires a sidecar or a dedicated port.
+    # Assuming worker exposes Prometheus metrics on 8001 if instrumented.
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['worker:8001']

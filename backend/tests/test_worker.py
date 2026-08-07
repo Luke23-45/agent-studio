@@ -131,6 +131,12 @@ class TestHandlerRegistration:
             "cost_ledger.write",
             "tool_result.clear",
             "memory.extract",
+            "quality_monitor.run",
+            "canary.evaluate",
+            "eval_extract.run",
+            "retention.run",
+            "gdpr.erase",
+            "gdpr.export",
         }
         assert qm._handlers == handlers
 
@@ -149,10 +155,18 @@ class TestHandlerRegistration:
         names = [entry["name"] for entry in schedule]
         assert "retention-sweep-daily" in names
         assert "redteam-weekly" in names
+        assert "quality-monitor-hourly" in names
+        assert "canary-evaluate-5min" in names
+        assert "eval-extract-daily" in names
+        assert "retention-run-daily" in names
         for entry in schedule:
             assert entry["job_type"] in {
                 "cleanup.run",
                 "redteam.run",
+                "quality_monitor.run",
+                "canary.evaluate",
+                "eval_extract.run",
+                "retention.run",
                 "ingestion.process",
                 "notification.send",
                 "eval.replay",

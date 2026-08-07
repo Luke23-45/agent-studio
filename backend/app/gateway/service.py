@@ -26,10 +26,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-import structlog
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any
 from uuid import uuid4
+
+import structlog
 
 from backend.app.gateway.cache import CachedEntry, GatewayCache
 from backend.app.gateway.catalog import ModelCatalog, get_default_catalog
@@ -49,6 +51,17 @@ from backend.app.gateway.types import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+def _observe(*funcs: Callable[[], Any]) -> None:
+    """Best-effort metric emission: failures are logged, never raised
+    (metrics must not break the request path)."""
+    for fn in funcs:
+        try:
+            fn()
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning("metric_emission_failed", error=str(e))
+
 
 # Operational gateway config keys (the tenant-level dict the route passes):
 #   strategy                cost | latency | quality | pinned (default cost)
@@ -302,7 +315,9 @@ class Gateway:
             )
             if cached is not None:
                 await self.quota.release(reservation)
+                self._record_cache(str(tenant_config.id), "exact", "hit")
                 return self._from_cache(cached)
+            self._record_cache(str(tenant_config.id), "exact", "miss")
 
         api_key = await self._key_resolver(tenant_config)
         outcome = await self._execute_chain(
@@ -403,12 +418,19 @@ class Gateway:
                 ]
         except GatewayQuotaExceeded:
             await self.quota.release(reservation)
+            self._record_error(str(request.tenant_id), "rate_limit")
             raise
         except Exception:
             await self.quota.release(reservation)
             raise
         await self.quota.release(reservation)
         if last_error is not None:
+            self._record_error(
+                str(request.tenant_id),
+                last_error.failure_class,
+                provider=last_error.provider,
+                model=last_error.model,
+            )
             raise GatewayChainExhausted(
                 last_error.provider,
                 last_error.model,
@@ -441,6 +463,20 @@ class Gateway:
             response = await asyncio.wait_for(adapter.chat(messages), timeout=timeout)
             latency_ms = (time.perf_counter() - start) * 1000
             self.router.latency.update(provider, model, latency_ms)
+            self._record_llm(
+                str(tenant_config.id),
+                provider,
+                model,
+                response.usage or {},
+                self.catalog.estimate_cost(
+                    provider,
+                    model,
+                    (response.usage or {}).get("input_tokens", 0),
+                    (response.usage or {}).get("output_tokens", 0),
+                )
+                or 0.0,
+                ttft_ms=latency_ms,
+            )
             return _AttemptOutcome(
                 GatewayResult(
                     content=response.content,
@@ -536,6 +572,98 @@ class Gateway:
             cached=True,
         )
 
+    # -- observability helpers (P6-2; best-effort, never raised) -------------
+
+    def _record_cache(self, tenant_id: str, cache_type: str, result: str) -> None:
+        try:
+            from backend.app.infrastructure.observability.metrics import get_metrics
+
+            get_metrics().cache_operations_total.labels(
+                tenant_id=tenant_id, cache_type=cache_type, result=result
+            ).inc()
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    def _record_llm(
+        self,
+        tenant_id: str,
+        provider: str,
+        model: str,
+        usage: dict[str, int],
+        cost_usd: float,
+        ttft_ms: float | None = None,
+        inter_token_ms: float | None = None,
+    ) -> None:
+        try:
+            from backend.app.infrastructure.observability.metrics import get_metrics
+
+            metrics = get_metrics()
+            metrics.record_token_usage(
+                tenant_id=tenant_id,
+                provider=provider,
+                model=model,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                reasoning_tokens=usage.get("reasoning_tokens", 0),
+                cached_tokens=usage.get("cached_tokens", 0),
+            )
+            metrics.cost_per_conversation_usd.labels(
+                tenant_id=tenant_id, provider=provider, model=model
+            ).observe(cost_usd)
+            if ttft_ms is not None:
+                metrics.ttft_seconds.labels(
+                    tenant_id=tenant_id, provider=provider, model=model
+                ).observe(ttft_ms / 1000.0)
+                try:
+                    from backend.app.infrastructure.observability.slos import get_slo_tracker
+
+                    get_slo_tracker().record(
+                        "ttft_p95", success=(ttft_ms / 1000.0) <= 2.0
+                    )
+                except Exception:
+                    pass  # SLO tracker not initialized: app-level view is optional
+            if inter_token_ms is not None:
+                metrics.inter_token_latency_seconds.labels(
+                    tenant_id=tenant_id, provider=provider, model=model
+                ).observe(inter_token_ms / 1000.0)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    def _record_stream_completion(self, tenant_id: str, status: str) -> None:
+        try:
+            from backend.app.infrastructure.observability.metrics import get_metrics
+
+            get_metrics().stream_completion_total.labels(
+                tenant_id=tenant_id, status=status
+            ).inc()
+            try:
+                from backend.app.infrastructure.observability.slos import get_slo_tracker
+
+                get_slo_tracker().record("stream_completion_rate", success=(status == "completed"))
+            except Exception:
+                pass
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    def _record_error(
+        self, tenant_id: str, error_type: str, provider: str | None = None, model: str | None = None
+    ) -> None:
+        del provider, model  # unused: reserved for provider-level granularity
+        try:
+            from backend.app.infrastructure.observability.metrics import get_metrics
+
+            get_metrics().errors_total.labels(
+                tenant_id=tenant_id, error_type=error_type
+            ).inc()
+            try:
+                from backend.app.infrastructure.observability.slos import get_slo_tracker
+
+                get_slo_tracker().record("error_rate", success=False)
+            except Exception:
+                pass
+        except Exception:  # pragma: no cover - defensive
+            pass
+
     # -- streaming -------------------------------------------------------------
 
     async def _stream_impl(
@@ -576,6 +704,8 @@ class Gateway:
             targets: list[tuple[str, str]] = [(decision.provider, decision.model)]
             last_error: ProviderCallError | None = None
             emitted = False
+            first_token_time: float | None = None
+            last_token_time: float | None = None
 
             while targets:
                 provider, model = targets.pop(0)
@@ -603,10 +733,24 @@ class Gateway:
                         """Process one event; True when a delta/tool byte
                         was emitted (disables transparent failover)."""
                         nonlocal usage, finish_reason, parts, tool_acc, emitted
+                        nonlocal first_token_time, last_token_time
                         etype = ev.type
                         if etype == "delta" and ev.content:
                             emitted = True
                             parts.append(ev.content)
+                            now = time.perf_counter()
+                            if first_token_time is None:
+                                first_token_time = now
+                            if last_token_time is not None:
+                                self._record_llm(
+                                    str(tenant_config.id),
+                                    provider,
+                                    model,
+                                    {},
+                                    0.0,
+                                    inter_token_ms=(now - last_token_time) * 1000,
+                                )
+                            last_token_time = now
                             yield_event = GatewayStreamEvent(type="delta", content=ev.content)
                         elif etype == "tool_use_start":
                             emitted = True
@@ -693,6 +837,13 @@ class Gateway:
                     await self.cooldowns.record_failure(provider, model)
                     if emitted:
                         # Mid-stream failure: no transparent failover.
+                        self._record_error(
+                            str(tenant_config.id),
+                            last_error.failure_class,
+                            provider=provider,
+                            model=model,
+                        )
+                        self._record_stream_completion(str(tenant_config.id), "error")
                         yield GatewayStreamEvent(
                             type="error",
                             error=str(e),
@@ -713,6 +864,22 @@ class Gateway:
                 await self.cooldowns.record_success(provider, model)
                 latency_ms = (time.perf_counter() - start) * 1000
                 self.router.latency.update(provider, model, latency_ms)
+                cost_usd = self.catalog.estimate_cost(
+                    provider, model, usage.get("input_tokens", 0), usage.get("output_tokens", 0)
+                ) or 0.0
+                self._record_llm(
+                    str(tenant_config.id),
+                    provider,
+                    model,
+                    usage,
+                    cost_usd,
+                    ttft_ms=(
+                        (first_token_time - start) * 1000
+                        if first_token_time is not None
+                        else None
+                    ),
+                )
+                self._record_stream_completion(str(tenant_config.id), "completed")
                 result = GatewayResult(
                     content="".join(parts),
                     model=model,
@@ -810,7 +977,7 @@ class GatewayBackedAdapter:
 
     def __init__(
         self,
-        gateway: "Gateway",
+        gateway: Gateway,
         tenant_config: Any,
         provider: str,
         model: str,

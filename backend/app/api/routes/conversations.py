@@ -10,8 +10,10 @@ cache for the tenant config service and are never consulted on the hot path.
 """
 
 import asyncio
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+import time
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID, uuid4
 
 import structlog
@@ -618,6 +620,8 @@ async def process_conversation(
 
     logger.info("conversation_request", tenant_slug=request.tenant_slug)
     session_id = request.session_id or str(uuid4())
+    request_key = principal.end_user_id or session_id
+    request_started: float = time.monotonic()
 
     # Load tenant from the database (source of truth at request time)
     db = get_database_manager()
@@ -804,6 +808,12 @@ async def process_conversation(
             tenant_config,
             {"session_id": session_id, "violations": input_validation["violations"]},
             session_id,
+        )
+        _record_canary_outcome(
+            str(tenant_config.id),
+            request_key,
+            blocked=True,
+            latency_ms=(time.monotonic() - request_started) * 1000.0,
         )
         return blocked_response
 
@@ -1077,6 +1087,11 @@ async def process_conversation(
             },
             session_id,
         )
+        _record_canary_outcome(
+            str(tenant_config.id),
+            request_key,
+            latency_ms=(time.monotonic() - request_started) * 1000.0,
+        )
         return response
     except HTTPException:
         if trace:
@@ -1091,6 +1106,12 @@ async def process_conversation(
             tenant_config,
             {"session_id": session_id, "conversation_id": conversation["id"], "error": str(e)},
             session_id,
+        )
+        _record_canary_outcome(
+            str(tenant_config.id),
+            request_key,
+            error=True,
+            latency_ms=(time.monotonic() - request_started) * 1000.0,
         )
         if isinstance(e, GatewayQuotaExceeded):
             # P5-7: surface-level rejection carries a human-readable budget
@@ -1113,6 +1134,12 @@ async def process_conversation(
             tenant_config,
             {"session_id": session_id, "conversation_id": conversation["id"], "error": str(e)},
             session_id,
+        )
+        _record_canary_outcome(
+            str(tenant_config.id),
+            request_key,
+            error=True,
+            latency_ms=(time.monotonic() - request_started) * 1000.0,
         )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -1148,6 +1175,31 @@ def _gateway_http_status(exc: GatewayError) -> int:
     if isinstance(exc, GatewayChainExhausted):
         return status.HTTP_502_BAD_GATEWAY
     return status.HTTP_500_INTERNAL_SERVER_ERROR
+
+
+def _record_canary_outcome(
+    tenant_id: str,
+    request_key: str,
+    *,
+    error: bool = False,
+    blocked: bool = False,
+    latency_ms: float = 0.0,
+) -> None:
+    """Best-effort P6-5 attribution of a request outcome to the tenant's
+    active canary slice. No-op when no rollout is active; failures are
+    swallowed so canary bookkeeping can never break the request path."""
+    try:
+        from backend.app.worker.canary_monitor import record_outcome
+
+        record_outcome(
+            tenant_id,
+            request_key,
+            error=error,
+            blocked=blocked,
+            latency_ms=latency_ms,
+        )
+    except Exception:  # pragma: no cover - defensive
+        pass
 
 
 async def _store_idempotent_response(
@@ -1264,6 +1316,8 @@ async def stream_conversation(
 
     logger.info("conversation_stream_request", tenant_slug=request.tenant_slug)
     session_id = request.session_id or str(uuid4())
+    request_key = principal.end_user_id or session_id
+    request_started: float = time.monotonic()
     idempotency_key = request_ctx.headers.get("Idempotency-Key")
 
     db = get_database_manager()
@@ -1556,6 +1610,12 @@ async def stream_conversation(
                     "thread_id": thread["id"],
                 },
             )
+            _record_canary_outcome(
+                str(tenant_config.id),
+                request_key,
+                blocked=True,
+                latency_ms=(time.monotonic() - request_started) * 1000.0,
+            )
             return
 
         # Session coordinator (Arch 7.2): per-thread serialization; the
@@ -1686,6 +1746,12 @@ async def stream_conversation(
                                 },
                                 session_id,
                             )
+                            _record_canary_outcome(
+                                str(tenant_config.id),
+                                request_key,
+                                blocked=True,
+                                latency_ms=(time.monotonic() - request_started) * 1000.0,
+                            )
                             return
                         seq = await stream_buffer.append(
                             str(tenant_config.id), str(thread["id"]), stream_id, "delta",
@@ -1741,6 +1807,12 @@ async def stream_conversation(
                         "violations": violations,
                     },
                     session_id,
+                )
+                _record_canary_outcome(
+                    str(tenant_config.id),
+                    request_key,
+                    blocked=True,
+                    latency_ms=(time.monotonic() - request_started) * 1000.0,
                 )
                 return
             if tail is not None and tail.text:
@@ -1824,6 +1896,11 @@ async def stream_conversation(
                 str(tenant_config.id), str(thread["id"]), stream_id, "result", result_payload
             )
             yield _sse("result", result_payload)
+            _record_canary_outcome(
+                str(tenant_config.id),
+                request_key,
+                latency_ms=(time.monotonic() - request_started) * 1000.0,
+            )
         except HTTPException:
             raise
         except Exception as e:
@@ -1845,6 +1922,12 @@ async def stream_conversation(
                 str(tenant_config.id), str(thread["id"]), stream_id, "error", payload
             )
             yield _sse("error", payload)
+            _record_canary_outcome(
+                str(tenant_config.id),
+                request_key,
+                error=True,
+                latency_ms=(time.monotonic() - request_started) * 1000.0,
+            )
         finally:
             await admission_handle.release()
             await thread_lease.release()
@@ -2248,7 +2331,10 @@ async def set_tenant_provider_key(
     if provider not in SUPPORTED_PROVIDERS:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Unsupported provider '{provider}'. Must be one of: {', '.join(SUPPORTED_PROVIDERS)}",
+            detail=(
+                f"Unsupported provider '{provider}'. Must be one of: "
+                f"{', '.join(SUPPORTED_PROVIDERS)}"
+            ),
         )
     if request.key_source not in KEY_SOURCES:
         raise HTTPException(
@@ -2485,6 +2571,19 @@ async def publish_tenant_config_version(
             detail=f"Config version not found: {tenant_id} v{version}",
         )
 
+    # P6-5: a canary rollout (<100%) activates the runtime monitor so the
+    # request path can attribute outcomes to the canary vs the baseline.
+    if canary_percent is not None and canary_percent < 100:
+        from backend.app.worker.canary_monitor import start_canary
+
+        baseline = await repo.get_previous_published(str(tenant_id), version)
+        start_canary(
+            str(tenant_id),
+            canary_version=row["version"],
+            baseline_version=(baseline or {}).get("version", row["version"]),
+            canary_percent=canary_percent,
+        )
+
     get_tenant_config_service().invalidate_cache(tenant_id)
     await AuditRepository(db).add(
         action="config_version.published",
@@ -2550,7 +2649,7 @@ async def evaluate_tenant_config_version(
         eval_status,
         details={
             "suite": request.suite,
-            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            "evaluated_at": datetime.now(UTC).isoformat(),
             "metrics": request.details,
         },
     )
@@ -3088,7 +3187,7 @@ async def export_audit_events(
     if tenant_id is not None:
         assert_tenant_access(principal, tenant_id)
 
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     db = get_database_manager()
     events = await AuditRepository(db).list_events(
@@ -3099,7 +3198,7 @@ async def export_audit_events(
         content=_jsonable(
             {
                 "schema_version": "1.0",
-                "exported_at": datetime.now(timezone.utc).isoformat(),
+                "exported_at": datetime.now(UTC).isoformat(),
                 "immutable": True,
                 "events": events,
             }
@@ -3205,7 +3304,7 @@ async def resolve_escalation(
         escalation_id,
         "resolved",
         details=details,
-        resolved_at=datetime.now(timezone.utc),
+        resolved_at=datetime.now(UTC),
     )
     logger.info("escalation_resolved", escalation_id=escalation_id, actor=principal.role)
     return _escalation_response(updated)

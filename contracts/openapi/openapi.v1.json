@@ -2547,6 +2547,23 @@
         }
       }
     },
+    "/metrics": {
+      "get": {
+        "summary": "Metrics Endpoint",
+        "description": "Prometheus metrics exposition.",
+        "operationId": "metrics_endpoint_metrics_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "summary": "Health Check",

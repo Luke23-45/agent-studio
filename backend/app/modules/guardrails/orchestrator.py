@@ -1,31 +1,37 @@
 import asyncio
 import hashlib
 import inspect
-import structlog
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from collections.abc import Callable
+from typing import Any
 from uuid import UUID
 
-from ...domain.safety import SafetyCheckResult, SafetyViolation, ViolationSeverity, SafetyCategory
+import structlog
+
+from ...domain.safety import SafetyCategory, SafetyCheckResult, SafetyViolation, ViolationSeverity
 from ...domain.tenant import TenantConfig
 from ...infrastructure.patterns import (
-    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerOpenError,
-    RateLimiter, RateLimitConfig, RateLimitExceeded,
-    HealthCheckable, HealthComponent, HealthStatus, HealthReport,
+    CircuitBreaker,
+    CircuitBreakerConfig,
+    CircuitBreakerOpenError,
+    HealthComponent,
+    HealthStatus,
     ManagedService,
+    RateLimitConfig,
+    RateLimiter,
+    RateLimitExceeded,
 )
-from .types import GuardrailLayer, GuardrailDecision
-from .models import GuardrailConfig, GuardrailEvaluationResult
-from .config import GuardrailsModuleConfig, build_config_from_tenant
-from .errors import GuardrailError, GuardrailConfigurationError, GuardrailTimeoutError
-from .metrics import GuardrailMetrics
-from .interfaces import GuardrailEngine
-from .regex_fastpath import RegexFastpathEngine
 from .classifier import ClassifierLayer
-from .nemo_rails import NeMoGuardrailsEngine, NeMoRailConfig
-from .jailbreak import JailbreakDetector
+from .config import GuardrailsModuleConfig, build_config_from_tenant
 from .guardrails_ai import GuardrailsAIEngine
+from .interfaces import GuardrailEngine
+from .jailbreak import JailbreakDetector
+from .metrics import GuardrailMetrics
+from .models import GuardrailEvaluationResult
+from .nemo_rails import NeMoGuardrailsEngine, NeMoRailConfig
 from .pii_engine import PIIEnhancementEngine
+from .regex_fastpath import RegexFastpathEngine
 from .spotlighting import SpotlightingEngine
+from .types import GuardrailDecision, GuardrailLayer
 
 logger = structlog.get_logger(__name__)
 
@@ -35,22 +41,22 @@ class GuardrailsOrchestrator(ManagedService):
         super().__init__("guardrails_orchestrator")
         self.config = config
         self.config.validate()
-        self._engines: Dict[GuardrailLayer, GuardrailEngine] = {}
-        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
+        self._engines: dict[GuardrailLayer, GuardrailEngine] = {}
+        self._circuit_breakers: dict[str, CircuitBreaker] = {}
         self._rate_limiter = RateLimiter(RateLimitConfig(
             max_requests=config.rate_limit_max_requests,
             window_seconds=config.rate_limit_window_seconds,
         ))
         self._metrics = GuardrailMetrics()
         self._spotlight = SpotlightingEngine() if config.enable_spotlighting else None
-        self._layer_order: List[GuardrailLayer] = []
+        self._layer_order: list[GuardrailLayer] = []
         # Optional sink for audit evidence records (matrix item 4.14).
         # Wired per-request by callers; may be sync or async. Records are
         # plain dicts. Awaited so evidence is not lost on process exit.
-        self.evidence_callback: Optional[Callable[[Dict[str, Any]], Union[None, Any]]] = None
+        self.evidence_callback: Callable[[dict[str, Any]], None | Any] | None = None
 
     async def _do_initialize(self) -> None:
-        engines: List[Tuple[GuardrailLayer, Optional[GuardrailEngine]]] = [
+        engines: list[tuple[GuardrailLayer, GuardrailEngine | None]] = [
             (GuardrailLayer.REGEX_FASTPATH, RegexFastpathEngine() if self.config.enable_regex_fastpath else None),
             (GuardrailLayer.CLASSIFIER, ClassifierLayer(threshold=self.config.classifier_threshold) if self.config.enable_classifier else None),
             (GuardrailLayer.JAILBREAK_SCAN, JailbreakDetector(heuristic_threshold=self.config.jailbreak_threshold) if self.config.enable_jailbreak_scan else None),
@@ -99,9 +105,9 @@ class GuardrailsOrchestrator(ManagedService):
         self,
         user_input: str,
         tenant_config: TenantConfig,
-        conversation_history: Optional[List[Dict[str, str]]] = None,
-        conversation_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+        conversation_history: list[dict[str, str]] | None = None,
+        conversation_id: str | None = None,
+        session_id: str | None = None,
     ) -> GuardrailEvaluationResult:
         if not user_input:
             return GuardrailEvaluationResult(allowed=True, decision=GuardrailDecision.ALLOW)
@@ -132,8 +138,8 @@ class GuardrailsOrchestrator(ManagedService):
     async def _run_input_pipeline(self, user_input: str, tenant_config: TenantConfig) -> GuardrailEvaluationResult:
         start_time = asyncio.get_event_loop().time()
         result = GuardrailEvaluationResult(allowed=True, decision=GuardrailDecision.ALLOW)
-        violations: List[SafetyViolation] = []
-        layer_results: Dict[GuardrailLayer, SafetyCheckResult] = {}
+        violations: list[SafetyViolation] = []
+        layer_results: dict[GuardrailLayer, SafetyCheckResult] = {}
 
         if self.config.parallel_layer_execution:
             tasks = []
@@ -219,7 +225,7 @@ class GuardrailsOrchestrator(ManagedService):
                     layer_results={layer: check},
                     violations=check.violations,
                 )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             msg = f"Layer {layer.name} timed out"
             logger.error(msg, timeout=self.config.layer_timeout_seconds)
             if self.config.fail_open_on_error:
@@ -245,14 +251,14 @@ class GuardrailsOrchestrator(ManagedService):
     async def evaluate_output(
         self,
         model_output: str,
-        schema_name: Optional[str] = None,
-        tenant_config: Optional[TenantConfig] = None,
-        conversation_id: Optional[str] = None,
-        session_id: Optional[str] = None,
+        schema_name: str | None = None,
+        tenant_config: TenantConfig | None = None,
+        conversation_id: str | None = None,
+        session_id: str | None = None,
     ) -> GuardrailEvaluationResult:
         start_time = asyncio.get_event_loop().time()
-        violations: List[SafetyViolation] = []
-        layer_results: Dict[GuardrailLayer, SafetyCheckResult] = {}
+        violations: list[SafetyViolation] = []
+        layer_results: dict[GuardrailLayer, SafetyCheckResult] = {}
         decision = GuardrailDecision.ALLOW
 
         gaai = self._engines.get(GuardrailLayer.GUARDRAILS_AI)
@@ -284,17 +290,41 @@ class GuardrailsOrchestrator(ManagedService):
             processing_time_ms=elapsed_ms,
             metadata={"layers_evaluated": [l.name for l in layer_results.keys()], "total_violations": len(violations)},
         )
+        if tenant_config is not None:
+            self._record_guardrail_metric(
+                str(tenant_config.id), "output", result
+            )
         await self._emit_evidence("output", model_output, result, tenant_config, conversation_id, session_id)
         return result
+
+    def _record_guardrail_metric(
+        self, tenant_id: str, direction: str, result: GuardrailEvaluationResult
+    ) -> None:
+        """Emit P6-2 guardrail decision metrics (best-effort, never raised)."""
+        try:
+            from backend.app.infrastructure.observability.metrics import get_metrics
+
+            decision = result.decision.name.lower()
+            get_metrics().guardrail_checks_total.labels(
+                tenant_id=tenant_id,
+                rail_name=f"{direction}_gate",
+                decision=decision,
+            ).inc()
+            if not result.allowed and decision in ("block", "reask", "redirect"):
+                get_metrics().errors_total.labels(
+                    tenant_id=tenant_id, error_type="guardrail"
+                ).inc()
+        except Exception:  # pragma: no cover - defensive
+            pass
 
     async def _emit_evidence(
         self,
         direction: str,
         content: str,
         result: GuardrailEvaluationResult,
-        tenant_config: Optional[TenantConfig],
-        conversation_id: Optional[str],
-        session_id: Optional[str],
+        tenant_config: TenantConfig | None,
+        conversation_id: str | None,
+        session_id: str | None,
     ) -> None:
         """Persist an audit evidence packet via the configured callback (4.14)."""
         if self.evidence_callback is None:
@@ -324,7 +354,7 @@ class GuardrailsOrchestrator(ManagedService):
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("evidence_emit_failed", direction=direction, error=str(e))
 
-    def apply_spotlighting_to_context(self, retrieved_chunks: List[Tuple[str, Dict[str, Any]]], user_query: str) -> str:
+    def apply_spotlighting_to_context(self, retrieved_chunks: list[tuple[str, dict[str, Any]]], user_query: str) -> str:
         if not self._spotlight:
             return "\n\n".join(chunk for chunk, _ in retrieved_chunks) + f"\n\nQuery: {user_query}"
         return self._spotlight.create_spotlight_template(user_query, retrieved_chunks)
@@ -333,15 +363,19 @@ class GuardrailsOrchestrator(ManagedService):
         self,
         user_input: str,
         tenant_config: TenantConfig,
-        conversation_id: Optional[str] = None,
-        session_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        conversation_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
         result = await self.evaluate_input(
             user_input,
             tenant_config,
             conversation_id=conversation_id,
             session_id=session_id,
         )
+        if tenant_config is not None:
+            self._record_guardrail_metric(
+                str(tenant_config.id), "input", result
+            )
         return {
             "is_valid": result.allowed,
             "blocked": result.decision == GuardrailDecision.BLOCK,
@@ -385,14 +419,14 @@ class GuardrailsOrchestrator(ManagedService):
             metadata={"layers_loaded": len(self._engines), "active_requests": self._metrics._active_requests.value},
         )
 
-    def get_metrics_snapshot(self) -> Dict[str, Any]:
+    def get_metrics_snapshot(self) -> dict[str, Any]:
         return self._metrics.snapshot_all()
 
-    def get_circuit_breaker_states(self) -> Dict[str, str]:
+    def get_circuit_breaker_states(self) -> dict[str, str]:
         return {name: cb.state.name for name, cb in self._circuit_breakers.items()}
 
 
-def create_guardrails_orchestrator(tenant_config: TenantConfig, nemo_config_path: Optional[str] = None) -> GuardrailsOrchestrator:
+def create_guardrails_orchestrator(tenant_config: TenantConfig, nemo_config_path: str | None = None) -> GuardrailsOrchestrator:
     config = build_config_from_tenant(tenant_config, nemo_config_path)
     return GuardrailsOrchestrator(config)
 
@@ -404,13 +438,13 @@ def create_guardrails_service() -> GuardrailsOrchestrator:
 # Per-tenant registry with lazy async initialization.
 # Engines (classifier models, Presidio, etc.) are expensive to construct, so
 # they are created once per tenant and reused across requests.
-_guardrails_registry: Dict[str, GuardrailsOrchestrator] = {}
-_guardrails_locks: Dict[str, asyncio.Lock] = {}
+_guardrails_registry: dict[str, GuardrailsOrchestrator] = {}
+_guardrails_locks: dict[str, asyncio.Lock] = {}
 
 
 async def get_guardrails_service(
     tenant_config: TenantConfig,
-    nemo_config_path: Optional[str] = None,
+    nemo_config_path: str | None = None,
 ) -> GuardrailsOrchestrator:
     """Get (or lazily create and initialize) the guardrails orchestrator for a tenant."""
     key = str(tenant_config.id)

@@ -15,5 +15,39 @@
     "payload": {
       "tenant_id": null
     }
+  },
+  {
+    "name": "quality-monitor-hourly",
+    "job_type": "quality_monitor.run",
+    "interval_seconds": 3600,
+    "payload": {
+      "tenant_id": null,
+      "sample_size": 10
+    }
+  },
+  {
+    "name": "canary-evaluate-5min",
+    "job_type": "canary.evaluate",
+    "interval_seconds": 300,
+    "payload": {}
+  },
+  {
+    "name": "eval-extract-daily",
+    "job_type": "eval_extract.run",
+    "interval_seconds": 86400,
+    "payload": {
+      "tenant_id": null,
+      "sample_size": 20,
+      "output_prefix": "eval_corpora"
+    }
+  },
+  {
+    "name": "retention-run-daily",
+    "job_type": "retention.run",
+    "interval_seconds": 86400,
+    "payload": {
+      "tenant_id": null,
+      "dry_run": false
+    }
   }
 ]

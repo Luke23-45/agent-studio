@@ -1,0 +1,104 @@
+name: Continuous Red-Teaming (Evals)
+
+on:
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:     # Manual trigger
+  push:
+    paths:
+      - 'evals/**'       # Run when eval configs change
+      - 'backend/app/governance/**'  # Run on governance changes
+
+jobs:
+  run-garak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Neryva Eval Harness
+        run: |
+          pip install --upgrade pip
+          pip install -e ".[redteam]"
+
+      - name: Golden dataset validation gate (P6-6)
+        # Schema + redaction hygiene check that runs with no API keys, so the
+        # harness always executes in CI and malformed/leaky datasets block it.
+        shell: python
+        run: |
+          import json, re, sys
+          from pathlib import Path
+
+          failures = []
+          for path in sorted(Path("evals/datasets").rglob("*.jsonl")):
+              for lineno, line in enumerate(
+                  path.read_text(encoding="utf-8").splitlines(), start=1
+              ):
+                  try:
+                      case = json.loads(line)
+                  except json.JSONDecodeError:
+                      failures.append(f"{path}:{lineno} invalid JSON")
+                      continue
+                  for i, turn in enumerate(case.get("turns", [])):
+                      if "redacted_content" not in turn:
+                          failures.append(
+                              f"{path}:{lineno} turns[{i}] missing redacted_content"
+                          )
+                      body = turn.get("redacted_content", "")
+                      if re.search(r"\b\d{3}-\d{2}-\d{4}\b|\b\d{16}\b", body):
+                          failures.append(
+                              f"{path}:{lineno} turns[{i}] may leak SSN/card"
+                          )
+                  if not case.get("probes"):
+                      failures.append(f"{path}:{lineno} missing probes")
+          if failures:
+              print("\n".join(failures))
+              sys.exit(1)
+          print(f"dataset gate passed: {len(failures) == 0}")
+
+      - name: Run Garak Probe Suite
+        env:
+          OPENAI_API_KEY: ${{ secrets.EVAL_OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.EVAL_ANTHROPIC_API_KEY }}
+        run: |
+          python -m garak \
+            --model_type rest \
+            --model_name "neryva-studio" \
+            --rest.endpoint "http://localhost:8000/api/v1/threads/completions" \
+            --probes prompt_injection,jailbreak \
+            --report_prefix "garak-report"
+
+      - name: Red-team release gate (P6-6)
+        # Fail the run when any critical probe family shows a failing
+        # (attack-successful) result. Critical failures block deployment.
+        shell: python
+        run: |
+          import json, sys
+          from pathlib import Path
+
+          report = Path("garak-report.json")
+          if not report.exists():
+              print("no garak report produced; gating on missing report")
+              sys.exit(1)
+          data = json.loads(report.read_text(encoding="utf-8"))
+          results = data.get("results", {})
+          failures = [
+              plugin for plugin, res in results.items()
+              if isinstance(res, dict) and res.get("passed") is False
+          ]
+          critical = [p for p in failures if "prompt_injection" in p or "jailbreak" in p]
+          if critical:
+              print("CRITICAL red-team failures detected:", critical)
+              sys.exit(1)
+          print(f"red-team gate passed: {len(results)} probe plugins, "
+                f"{len(failures)} failing (non-critical)")
+
+      - name: Archive Eval Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: garak-results
+          path: garak-report.*

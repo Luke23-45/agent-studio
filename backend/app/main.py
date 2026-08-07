@@ -4,19 +4,18 @@ Neryva Agent Studio - Backend Application
 This is the main entry point for the FastAPI application.
 """
 
-import structlog
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import asyncio
-
-from fastapi import FastAPI
+import structlog
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.app.api.dependencies.auth import (
     generate_api_key,
-    hash_api_key,
     get_rate_limiter,
+    hash_api_key,
     initialize_rate_limiter,
 )
 from backend.app.api.middleware import (
@@ -42,6 +41,12 @@ from backend.app.infrastructure.db import (
     get_database_manager,
     init_database,
 )
+from backend.app.infrastructure.observability.metrics import (
+    init_metrics,
+    metrics_endpoint_content,
+)
+from backend.app.infrastructure.observability.slos import init_slo_tracker
+from backend.app.infrastructure.observability.tracing import init_tracing
 from backend.app.infrastructure.queue import get_queue_manager, init_queue
 from backend.app.infrastructure.storage import get_storage_manager, init_storage
 from backend.app.infrastructure.stream import get_stream_buffer, init_stream_buffer
@@ -49,7 +54,7 @@ from backend.app.modules.tenant_config import configure_tenant_config_service
 from backend.app.session.coordinator import get_thread_coordinator, init_thread_coordinator
 from backend.app.session.hot_tier import get_thread_tail_cache, init_thread_tail_cache
 from backend.app.session.limits import get_end_user_limits, init_end_user_limits
-from backend.app.session.tokens import get_session_token_service, init_session_token_service
+from backend.app.session.tokens import init_session_token_service
 from backend.app.settings.env import settings
 
 logger = structlog.get_logger(__name__)
@@ -107,6 +112,11 @@ async def lifespan(app: FastAPI):
     if settings.RUN_MIGRATIONS_ON_STARTUP:
         await db.run_migrations()
     await _bootstrap_api_key()
+
+    # Observability
+    metrics = init_metrics()
+    tracing = init_tracing(service_name=settings.APP_NAME)
+    slos = init_slo_tracker()
 
     # Cache / queue / storage managers (Redis/S3 unavailable degrades to
     # in-memory / local-fs fallbacks; startup never fails on external deps)
@@ -203,6 +213,13 @@ def create_application() -> FastAPI:
     app.add_middleware(LoggingMiddleware)
     app.add_middleware(CorrelationIdMiddleware)
 
+    # OpenTelemetry ASGI middleware (only active if provider is initialized)
+    try:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        FastAPIInstrumentor.instrument_app(app)
+    except ImportError:
+        pass
+
     # CORS for the admin console and widget origins.
     # "*" is the dev default; production deployments must set explicit
     # CORS_ORIGINS (credentials are only allowed with explicit origins).
@@ -229,12 +246,15 @@ def create_application() -> FastAPI:
         """Liveness: process + ASGI reachable, no external dependencies."""
         return {"status": "alive"}
 
+    @app.get("/metrics")
+    async def metrics_endpoint():
+        """Prometheus metrics exposition."""
+        content, content_type = metrics_endpoint_content()
+        return Response(content=content, media_type=content_type)
+
     @app.get("/health")
     async def health_check():
         from backend.app.adapters.tracing import get_langfuse_adapter
-        from backend.app.infrastructure.cache import get_cache_manager
-        from backend.app.infrastructure.queue import get_queue_manager
-        from backend.app.infrastructure.storage import get_storage_manager
         from backend.app.modules.guardrails.config import GuardrailsModuleConfig
         from backend.app.modules.guardrails.errors import GuardrailConfigurationError
         from backend.app.settings.feature_flags import feature_flags
@@ -307,6 +327,25 @@ def create_application() -> FastAPI:
 
         _severity = {"HEALTHY": 0, "DEGRADED": 1, "UNHEALTHY": 2}
         overall = max(_severity.get(c["status"], 2) for c in components.values())
+
+        # P6-3: SLO error budgets. An exhausted budget degrades readiness so
+        # orchestrators/load balancers stop steering fresh traffic at a
+        # platform that is exceeding its latency/availability objectives.
+        try:
+            from backend.app.infrastructure.observability.slos import get_slo_tracker
+
+            tracker = get_slo_tracker()
+            slo_status = tracker.get_status()
+            components["slos"] = {
+                "name": "slos",
+                "status": "DEGRADED" if tracker.any_exhausted() else "HEALTHY",
+                "metadata": {"budgets": {k: v["is_exhausted"] for k, v in slo_status.items()}},
+            }
+            if tracker.any_exhausted():
+                overall = max(overall, _severity["DEGRADED"])
+        except Exception:  # pragma: no cover - defensive
+            pass
+
         status = "healthy" if overall == 0 else "degraded" if overall == 1 else "unhealthy"
         return {
             "status": status,

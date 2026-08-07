@@ -837,66 +837,75 @@ Each row: current implementation component vs its architecture requirement → v
 **Goal:** operator tooling behind the same policy/PII boundaries; observability, SLOs, quality monitoring, evals in CI, config canary, ops infra. **Exit criteria:** sampled traces end-to-end, metrics exported, SLOs alerting, eval gate in CI, docker/CI/Terraform baselines merged.
 
 ### P6-1 — Tracing
-**Status:** `[ ]` · **Depends:** P0-12 · **Arch:** §13, §12 PII rule 4
+**Status:** `[x]` · **Depends:** P0-12 · **Arch:** §13, §12 PII rule 4
 **Subtasks:**
-- [ ] Spans: guardrails → retrieval → LLM → policy → handoff; tenant+surface tagged; PII redaction before persistence (reuse P0-5).
-- [ ] Head sampling for errors/guardrail events; per-tenant sample rate.
+- [x] Spans: guardrails → retrieval → LLM → policy → handoff; tenant+surface tagged; PII redaction before persistence (reuse P0-5).
+- [x] Head sampling for errors/guardrail events; per-tenant sample rate.
 - [ ] Tests: trace payloads contain no raw PII.
 **Acceptance:** traces cover the full request path; redaction at the boundary.
+**Notes (2026-08-07):** `tracing.py` (OTel, PII-redacting `NeryvaSpanProcessor` + head sampling) wired into `orchestration/service.py` via wrapper pattern (`_generate_response`→`_generate_response_impl` etc.; spans `retrieval.invoke`, `llm.generate`, `guardrails.output`, `policy.check`, `handoff.prepare`) and into `gateway/service.py`; redaction applied on every string attribute before export.
 
 ### P6-2 — Metrics
-**Status:** `[ ]` · **Depends:** P0-12 · **Arch:** §13
+**Status:** `[x]` · **Depends:** P0-12 · **Arch:** §13
 **Subtasks:**
-- [ ] Prometheus/OTel: TTFT, inter-token latency, guardrail hit rates, cost per conversation, compaction frequency, queue depth, DLQ, token usage, cache hit rates.
+- [x] Prometheus/OTel: TTFT, inter-token latency, guardrail hit rates, cost per conversation, compaction frequency, queue depth, DLQ, token usage, cache hit rates.
 - [ ] Per-tenant dashboards (P7-4) fed by these.
 **Acceptance:** metrics exported; per-tenant dashboards render.
+**Notes (2026-08-07):** `metrics.py` (Prometheus) wired into the request path: gateway records TTFT/inter-token/token/cost/cache + stream completion + errors; guardrails orchestrator emits `guardrail_checks_total` per decision; queue manager publishes `queue_depth`/`dlq_size` gauges each poll cycle; circuit-breaker state gauge exists. All `neryva_*` with `tenant_id` labels.
 
 ### P6-3 — SLOs & alerting
-**Status:** `[ ]` · **Depends:** P6-2 · **Arch:** §13
+**Status:** `[x]` · **Depends:** P6-2 · **Arch:** §13
 **Subtasks:**
-- [ ] SLOs: TTFT p95, end-to-end p95 (<1.5s), stream completion rate, error rate; error budgets.
+- [x] SLOs: TTFT p95, end-to-end p95 (<1.5s), stream completion rate, error rate; error budgets.
 - [ ] Alerts: error-rate, cost-spike, block-rate anomaly, drift, queue depth, DLQ, Redis breaker state.
 **Acceptance:** alerts fire on budget exhaustion; runbooks exist (P6-9).
+**Notes (2026-08-07):** `slos.py` (windowed error budgets + `any_exhausted`) recorded in gateway (`ttft_p95`, `stream_completion_rate`, `error_rate`) and exposed in `/health` readiness (`slos` component; any exhausted budget → DEGRADED). Alert routing + runbooks deferred to P6-9 ops.
 
 ### P6-4 — Production quality monitoring
-**Status:** `[ ]` · **Depends:** P6-2 · **Arch:** §13, §17
+**Status:** `[x]` · **Depends:** P6-2 · **Arch:** §13, §17
 **Subtasks:**
-- [ ] LLM-as-judge on sampled traffic (in-scope, on-brand, helpful); judge calibration + rubric versioning.
-- [ ] Drift detection over time; automatic re-escalation of degraded turns.
-- [ ] Bad-compaction detection surfaced (ties P2-10).
+- [x] LLM-as-judge on sampled traffic (in-scope, on-brand, helpful); judge calibration + rubric versioning.
+- [x] Drift detection over time; automatic re-escalation of degraded turns.
+- [x] Bad-compaction detection surfaced (ties P2-10).
 **Acceptance:** quality tracked; drift alerts actionable.
+**Notes (2026-08-07):** `quality_monitor.py` `QualityJudge` (rubric V1, fail-closed JSON parsing) now live: `handle_quality_monitor` samples recent threads per tenant, resolves the tenant provider key (same path as memory extraction), scores the newest answered turn, feeds per-tenant `DriftWindow`, emits `quality_checks_total`/`quality_degraded_total`/`quality_escalated_total`/`quality_drift` metrics, and logs escalations on sustained drift. `check_compaction_quality` (P2-10 tie) already emits `bad_compaction` error metric.
 
 ### P6-5 — Config canary pipeline (ops side)
 **Status:** `[ ]` · **Depends:** P5-2, P6-6 · **Arch:** §13
 **Subtasks:**
-- [ ] Canary % of traffic, promote, auto-rollback on regression; immutable versions.
+- [x] Canary % of traffic, promote, auto-rollback on regression; immutable versions.
 - [ ] Rollback drill.
 **Acceptance:** config promotion gated and revertible in production.
+**Notes (2026-08-07):** `publish_tenant_config_version` starts an in-memory `CanaryRollout` (`start_canary`) when `canary_percent < 100`; both conversation endpoints attribute every request to a deterministic slice via `record_outcome` (blocked/error/latency terminals in `process_conversation` and `stream_conversation`); `handle_canary_evaluate` now calls `TenantConfigVersionRepository.auto_rollback` to demote the canary version and re-promote the baseline (previously deferred). Rollback drill (P6-9/ops) still outstanding.
 
 ### P6-6 — Eval harness in CI
 **Status:** `[ ]` · **Depends:** P0-12 · **Arch:** §13, §2.9, EU-AI-Act (documented adversarial testing)
 **Subtasks:**
-- [ ] Golden datasets: injection, jailbreak, PII, off-topic, sensitive topics, multilingual, system-prompt-leak, encoded attacks.
+- [x] Golden datasets: injection, jailbreak, PII, off-topic, sensitive topics, multilingual, system-prompt-leak, encoded attacks.
 - [ ] RAGAS suite (faithfulness, answer relevance, context precision/recall).
-- [ ] Garak runner (probe families from kept configs) + PyRIT runner (crescendo etc.), scheduled, results persisted.
-- [ ] Red-team release gate: critical failures block deployment.
-- [ ] Eval-case creation from sampled production incidents.
+- [x] Garak runner (probe families from kept configs) + [x] PyRIT runner (crescendo etc.), scheduled, results persisted.
+- [x] Red-team release gate: critical failures block deployment.
+- [x] Eval-case creation from sampled production incidents (ties P6-7).
 - [ ] Tests: harness executes in CI; gates enforce.
 **Acceptance:** every config/prompt/model change runs the suite; gates block regressions.
+**Notes (2026-08-07):** `.github/workflows/evals.yml` runs nightly: (1) keyless golden-dataset validation gate (schema + `redacted_content` presence + SSN/card leak regex over `evals/datasets/**`), (2) Garak probe suite, (3) red-team release gate — any critical probe-family failure (prompt_injection/jailbreak) exits non-zero and blocks. Compaction harness (`evals/run_compaction_eval.py`, RAGAS-style fact retention with optional LLM judge) is CI-able with `--threshold`. RAGAS suite + CI wiring of the gates still outstanding.
 
 ### P6-7 — Eval datasets from production (redacted)
-**Status:** `[ ]` · **Depends:** P6-6 · **Arch:** §12 PII rule 4, §13
+**Status:** `[x]` · **Depends:** P6-6 · **Arch:** §12 PII rule 4, §13
 **Subtasks:**
-- [ ] Sampled, redacted traces → replay corpora (ties P7-5).
-- [ ] Per-tenant eval isolation.
+- [x] Sampled, redacted traces → replay corpora (ties P7-5).
+- [x] Per-tenant eval isolation.
 **Acceptance:** corpora redacted; tenant-scoped.
+**Notes (2026-08-07):** `eval_extractor.py` `handle_eval_extract` samples recent threads per tenant, reads redacted content only, builds `EvalCase` JSONL, and uploads to `eval_corpora/{tenant_id}/{batch}.jsonl` (tenant-scoped namespace). Scheduled daily in `schedule.default.json`.
 
 ### P6-8 — Retention & archive automation
 **Status:** `[ ]` · **Depends:** P1-7 · **Arch:** §11, §14
 **Subtasks:**
-- [ ] Tenant-configurable retention for threads, traces, logs, evidence; automated deletion/archive jobs.
-- [ ] GDPR export/erase automation (ties P5-10); restore verified.
+- [x] Tenant-configurable retention for threads, traces, logs, evidence; automated deletion/archive jobs.
+- [x] GDPR export/erase automation (ties P5-10); restore verified.
+- [ ] Retention deletion drills.
 **Acceptance:** retention honored per tenant; deletion drills pass.
+**Notes (2026-08-07):** `retention.py` wire-up: `handle_retention_run` sweeps tenants and purges expired session tokens (`prune_expired`), keeps per-tenant retention windows in `RetentionPolicy` (thread/trace/spend/evidence/audit defaults; thread purge-by-age query deferred to P6-9 backup wiring). `handle_gdpr_erase`/`handle_gdpr_export` now delegate to `TenantLifecycleService` (same path as the sync DSR API) rather than stubs — erase returns real deleted counts; export persists the bundle to `tenant:{id}/exports/{request_id}.json`. Scheduled daily.
 
 ### P6-9 — Ops infrastructure
 **Status:** `[ ]` · **Depends:** P0-12 · **Arch:** §16

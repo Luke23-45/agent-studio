@@ -11,11 +11,12 @@ number of times before escalating (Arch 9.2/9.3).
 
 import asyncio
 import json
-import structlog
 import uuid
-from typing import Any, AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from typing import Any
 from uuid import UUID
 
+import structlog
 from langgraph.graph import END, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import TypedDict
@@ -45,7 +46,6 @@ from backend.app.gateway.types import (
     GatewayError,
     GatewayRequest,
     GatewayResult,
-    GatewayStreamEvent,
 )
 
 logger = structlog.get_logger(__name__)
@@ -262,7 +262,18 @@ class OrchestrationService:
         return state
 
     async def _retrieve_context(self, state: AgentState) -> AgentState:
-        """Retrieve relevant context from knowledge base."""
+        """Retrieve relevant context from knowledge base (P6-1 traced)."""
+        from backend.app.infrastructure.observability import neryva_span
+
+        with neryva_span(
+            "retrieval.invoke",
+            tenant_id=str(state["tenant_id"]),
+            surface_id=self.surface_id,
+        ):
+            return await self._retrieve_context_impl(state)
+
+    async def _retrieve_context_impl(self, state: AgentState) -> AgentState:
+        """Retrieve relevant context from knowledge base (traced body)."""
         logger.info("retrieving_context", tenant_id=state["tenant_id"])
 
         if not self.retrieval_service:
@@ -308,6 +319,17 @@ class OrchestrationService:
         return state
 
     async def _generate_response(self, state: AgentState) -> AgentState:
+        """Generate response using the LLM (P6-1 traced)."""
+        from backend.app.infrastructure.observability import neryva_span
+
+        with neryva_span(
+            "llm.generate",
+            tenant_id=str(state["tenant_id"]),
+            surface_id=self.surface_id,
+        ):
+            return await self._generate_response_impl(state)
+
+    async def _generate_response_impl(self, state: AgentState) -> AgentState:
         """Generate response using the LLM.
 
         P2-3: when a compaction hook is wired, the node triggers compaction
@@ -922,6 +944,17 @@ class OrchestrationService:
         escalates to human handoff (Arch 9.3).
         """
         logger.info("validating_output", tenant_id=state["tenant_id"])
+        from backend.app.infrastructure.observability import neryva_span
+
+        with neryva_span(
+            "guardrails.output",
+            tenant_id=str(state["tenant_id"]),
+            surface_id=self.surface_id,
+        ):
+            return await self._validate_output_impl(state)
+
+    async def _validate_output_impl(self, state: AgentState) -> AgentState:
+        """Validate the generated output (P2-9/P4-9) - traced body."""
 
         response_text = state["model_response"] or ""
         if not response_text:
@@ -1020,7 +1053,15 @@ class OrchestrationService:
         """Check policy rules for the response."""
         logger.info("checking_policy", tenant_id=state["tenant_id"])
 
-        context = {
+        from backend.app.infrastructure.observability import neryva_span
+
+        with neryva_span(
+            "policy.check",
+            tenant_id=str(state["tenant_id"]),
+            surface_id=self.surface_id,
+            attributes={"policy.action": state.get("policy_action", "").name if state.get("policy_action") else ""},
+        ):
+            context = {
             "response": state["model_response"],
             "confidence": state["confidence"],
             "validation": state["validation_result"],
@@ -1050,6 +1091,19 @@ class OrchestrationService:
     async def _prepare_handoff(self, state: AgentState) -> AgentState:
         """Prepare data for human handoff."""
         logger.info("preparing_handoff", tenant_id=state["tenant_id"])
+
+        from backend.app.infrastructure.observability import neryva_span
+
+        with neryva_span(
+            "handoff.prepare",
+            tenant_id=str(state["tenant_id"]),
+            surface_id=self.surface_id,
+            attributes={"handoff.required": bool(state.get("handoff_required"))},
+        ):
+            return await self._prepare_handoff_impl(state)
+
+    async def _prepare_handoff_impl(self, state: AgentState) -> AgentState:
+        """Prepare data for human handoff (traced body)."""
         state["handoff_required"] = True
 
         if not self.escalation_service:
@@ -1322,7 +1376,7 @@ Guidelines:
         context_summary: str | None = None,
         context_summary_position: int | None = None,
         context_summary_layers: list[dict[str, Any]] | None = None,
-    ) -> AsyncGenerator[dict[str, Any], None]:
+    ) -> AsyncGenerator[dict[str, Any]]:
         """Process a message with token streaming.
 
         Yields events: ``{"type": "delta", "content": str}`` per token and a

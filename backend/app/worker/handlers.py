@@ -5,14 +5,26 @@ can retry with backoff and dead-letter permanently failed jobs; they
 never silently swallow errors.
 """
 
-import structlog
-from typing import Any, Callable, Dict
+from collections.abc import Callable
+from typing import Any
 
-from backend.app.infrastructure.queue.manager import Job, get_queue_manager
+import structlog
 
 from backend.app.application.clearing import JOB_TOOL_RESULT_CLEAR
 from backend.app.application.memory import JOB_MEMORY_EXTRACT
+from backend.app.infrastructure.queue.manager import Job, get_queue_manager
 from backend.app.modules.webhooks.relay import handle_outbox_relay
+from backend.app.worker.canary_monitor import JOB_CANARY_EVALUATE, handle_canary_evaluate
+from backend.app.worker.eval_extractor import JOB_EVAL_EXTRACT, handle_eval_extract
+from backend.app.worker.quality_monitor import JOB_QUALITY_MONITOR, handle_quality_monitor
+from backend.app.worker.retention import (
+    JOB_GDPR_ERASE,
+    JOB_GDPR_EXPORT,
+    JOB_RETENTION_RUN,
+    handle_gdpr_erase,
+    handle_gdpr_export,
+    handle_retention_run,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -221,8 +233,8 @@ async def handle_redteam_run(payload: dict[str, Any]) -> None:
 async def handle_webhook_deliver(payload: dict[str, Any]) -> None:
     """Deliver a stored webhook event to one subscription (signed, 1.7)."""
     from backend.app.infrastructure.db import get_database_manager
-    from backend.app.modules.webhooks import WebhookDeliverer, WebhookEnvelope
     from backend.app.infrastructure.db.repositories import WebhookRepository
+    from backend.app.modules.webhooks import WebhookDeliverer, WebhookEnvelope
 
     event_id = payload.get("event_id")
     subscription_id = payload.get("subscription_id")
@@ -416,8 +428,8 @@ async def handle_cost_ledger_write(payload: dict[str, Any]) -> None:
     record = UsageRecord(**payload)
 
     async def window_started_at() -> datetime.datetime:
-        now = datetime.datetime.now(datetime.timezone.utc)
-        return datetime.datetime(now.year, now.month, 1, tzinfo=datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
+        return datetime.datetime(now.year, now.month, 1, tzinfo=datetime.UTC)
 
     await SpendEventRepository(db).add(asdict_for_model(record))
 
@@ -561,9 +573,9 @@ async def handle_memory_extract(
         )
 
 
-def build_handlers() -> Dict[str, Callable]:
+def build_handlers() -> dict[str, Callable]:
     """Register every job handler with the shared queue manager."""
-    handlers: Dict[str, Callable] = {
+    handlers: dict[str, Callable] = {
         JOB_INGESTION_PROCESS: handle_ingestion_process,
         JOB_INGESTION_EMBED: handle_ingestion_embed,
         JOB_NOTIFICATION_SEND: handle_notification_send,
@@ -576,6 +588,12 @@ def build_handlers() -> Dict[str, Callable]:
         JOB_COST_LEDGER_WRITE: handle_cost_ledger_write,
         JOB_TOOL_RESULT_CLEAR: handle_tool_result_clear,
         JOB_MEMORY_EXTRACT: handle_memory_extract,
+        JOB_QUALITY_MONITOR: handle_quality_monitor,
+        JOB_CANARY_EVALUATE: handle_canary_evaluate,
+        JOB_EVAL_EXTRACT: handle_eval_extract,
+        JOB_RETENTION_RUN: handle_retention_run,
+        JOB_GDPR_ERASE: handle_gdpr_erase,
+        JOB_GDPR_EXPORT: handle_gdpr_export,
     }
     manager = get_queue_manager()
     for job_type, handler in handlers.items():
