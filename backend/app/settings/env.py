@@ -124,6 +124,11 @@ class Settings(BaseSettings):
     # Server-side chunk buffer TTL — long enough for reconnect replay of a
     # completed turn; short enough not to accumulate idle streams.
     STREAM_BUFFER_TTL_SECONDS: int = 3600
+    # Per-stream hot-tier cap (chunks) before the oldest chunks overflow to
+    # Postgres. 0 = unlimited in the hot tier (buffer never overflowed the
+    # runtime tier); when > 0 the durable overflow tier (P4-2) keeps the
+    # replay faithful past the cap without unbounded Redis/memory growth.
+    STREAM_BUFFER_OVERFLOW_CHUNKS: int = 0
     # Rolling-window output moderation holds this many chars before release.
     # Larger window = stricter context for the validator, more added latency.
     STREAM_MODERATION_WINDOW_CHARS: int = 400

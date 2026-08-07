@@ -12,6 +12,7 @@ from backend.app.infrastructure.queue.manager import Job, get_queue_manager
 
 from backend.app.application.clearing import JOB_TOOL_RESULT_CLEAR
 from backend.app.application.memory import JOB_MEMORY_EXTRACT
+from backend.app.modules.webhooks.relay import handle_outbox_relay
 
 logger = structlog.get_logger(__name__)
 
@@ -22,6 +23,7 @@ JOB_CLEANUP_RUN = "cleanup.run"
 JOB_EVAL_REPLAY = "eval.replay"
 JOB_REDTEAM_RUN = "redteam.run"
 JOB_WEBHOOK_DELIVER = "webhook.deliver"
+JOB_OUTBOX_RELAY = "outbox.relay"
 JOB_SUMMARY_REFRESH = "summary.refresh"
 JOB_COST_LEDGER_WRITE = "cost_ledger.write"
 
@@ -569,6 +571,7 @@ def build_handlers() -> Dict[str, Callable]:
         JOB_EVAL_REPLAY: handle_eval_replay,
         JOB_REDTEAM_RUN: handle_redteam_run,
         JOB_WEBHOOK_DELIVER: handle_webhook_deliver,
+        JOB_OUTBOX_RELAY: handle_outbox_relay,
         JOB_SUMMARY_REFRESH: handle_summary_refresh,
         JOB_COST_LEDGER_WRITE: handle_cost_ledger_write,
         JOB_TOOL_RESULT_CLEAR: handle_tool_result_clear,

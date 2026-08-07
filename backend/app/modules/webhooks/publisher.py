@@ -23,6 +23,9 @@ JOB_WEBHOOK_DELIVER = "webhook.deliver"
 # Conversation events wired in the request path (matrix 0.3).
 EVENT_CONVERSATION_COMPLETED = "conversation.completed"
 EVENT_GUARDRAIL_BLOCKED = "guardrail.blocked"
+EVENT_CONVERSATION_CREATED = "conversation.created"
+EVENT_ESCALATION_RAISED = "escalation.raised"
+EVENT_EVAL_FAILED = "eval.failed"
 
 
 class WebhookPublisher:
@@ -42,11 +45,14 @@ class WebhookPublisher:
         tenant_id: str,
         data: dict[str, Any],
         session_id: str | None = None,
+        event_id: str | None = None,
     ) -> str | None:
         """Persist the event and enqueue deliveries for matching subscriptions.
 
         Returns the event id, or ``None`` when no subscription matches
-        (event is still recorded for replay).
+        (event is still recorded for replay). An explicit ``event_id`` is
+        honored (transactional outbox reuse) so replaying the same outbox
+        row never double-publishes.
         """
         tenant_id = str(tenant_id)
         subscriptions = await self.repository.list_subscriptions(tenant_id)
@@ -54,7 +60,7 @@ class WebhookPublisher:
         if not matching:
             return None
 
-        event_id = str(uuid4())
+        event_id = event_id or str(uuid4())
         await self.repository.record_event(
             event_id=event_id,
             tenant_id=tenant_id,

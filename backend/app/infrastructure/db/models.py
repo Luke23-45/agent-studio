@@ -13,11 +13,11 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
-    Index,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -65,6 +65,13 @@ class TenantModel(Base, TimestampMixin):
     features: Mapped[dict] = mapped_column(json_column(), default=dict, nullable=False)
     guardrail_config: Mapped[dict] = mapped_column(json_column(), default=dict, nullable=False)
     guardrail_thresholds: Mapped[dict] = mapped_column(json_column(), default=dict, nullable=False)
+
+    # P5-12: region pinned at onboarding; archives/exports confined to it.
+    region: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # P5-9: per-tenant retention window (days) for data subject to compaction
+    # (P6-8). None = the default posture from `compliance.retention_days_for`.
+    retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
@@ -143,7 +150,14 @@ class GuardrailEvidenceModel(Base):
 
 
 class AuditEventModel(Base):
-    """Immutable admin audit trail."""
+    """Immutable admin audit trail.
+
+    Append-only by construction (no repo method updates or deletes rows) and
+    tamper-evident (P5-9): every row carries the SHA-256 hash of the
+    previous row, forming a chain; ``verify_chain`` recomputes it. First row
+    of the trail has a NULL ``prev_hash``. Rows created before the chain
+    schema existed carry NULL hashes and are skipped by verification.
+    """
 
     __tablename__ = "audit_events"
     __table_args__ = (Index("ix_audit_tenant_created", "tenant_id", "created_at"),)
@@ -156,6 +170,10 @@ class AuditEventModel(Base):
     resource_type: Mapped[str] = mapped_column(String(64), nullable=False)
     resource_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     details: Mapped[dict] = mapped_column(json_column(), default=dict, nullable=False)
+    # P5-9 hash chain: prev_hash links this row to its predecessor, event_hash
+    # covers prev_hash + this row's content (tamper-evidence).
+    prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    event_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
@@ -261,8 +279,34 @@ class WebhookEventModel(Base, TimestampMixin):
     delivered_to: Mapped[list] = mapped_column(json_column(), default=list, nullable=False)
 
 
+class EventOutboxModel(Base, TimestampMixin):
+    """Transactional outbox: events committed with their originating write.
+
+    The row is INSERTed in the same unit of work that persists the turn's
+    durable message (Arch 9.1, EU-AI-Act Art. 12), so a crash after commit
+    cannot lose the event. A worker relay drains pending rows to the
+    webhook bus; rows stay pending until the event is exactly published
+    (idempotency keys prevent double delivery), so failure to a webhook
+    retries rather than dropping the audit record.
+    """
+
+    __tablename__ = "event_outbox"
+    __table_args__ = (Index("ix_event_outbox_status", "status", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(json_column(), default=dict, nullable=False)
+    session_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), default="pending", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    event_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+
+
 class WebhookDeliveryModel(Base, TimestampMixin):
-    """One delivery attempt (or final outcome) per event/subscription."""
+    """One delivery attempt (or final outcome) per webhook event."""
 
     __tablename__ = "webhook_deliveries"
     __table_args__ = (Index("ix_webhook_deliveries_event", "event_id"),)
@@ -519,11 +563,31 @@ class TenantConfigVersionModel(Base):
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     config: Mapped[dict] = mapped_column(json_column(), nullable=False)
     status: Mapped[str] = mapped_column(String(16), default="draft", nullable=False)
+
+    # P5-2: validated-gated promotion ("invalid config cannot publish").
+    validation_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    validated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    approved_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     promoted_by: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
+
+    # P5-2 canary rollouts: 0-100; 100/None = full rollout. A canary keeps
+    # the previously published version live as the baseline so request traffic
+    # can be split deterministically at runtime.
+    canary_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # P5-2 eval-suite gate (P6-6 slot): "" (none) or pending/passed/failed.
+    # Kept as a versioned record so promotion can be blocked on a failing suite.
+    eval_status: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    eval_details: Mapped[dict | None] = mapped_column(json_column(), nullable=True)
 
 
 class ToolRegistryModel(Base, TimestampMixin):
@@ -629,6 +693,42 @@ class QuotaStateModel(Base, TimestampMixin):
     reserved_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     spent_usd: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     limit_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class StreamBufferChunkModel(Base):
+    """Durable overflow tier for the server-side stream buffer (P4-2).
+
+    One row per buffered chunk that overflowed out of the hot Redis/memory
+    list for a stream key. Surfacing the buffer has more info than Redis
+    (cap hit) — or Redis is down and we kept the in-process fallback —
+    the oldest chunks are persisted here so a reconnect (cross-process or
+    post-restart) still replays the identical ordered bytes. The row stores
+    the same ``(id, type, data)`` record the runtime tier holds, keyed by
+    the full stream scope; ``seq`` is the monotonic event id used for
+    ``Last-Event-ID`` resume.
+    """
+
+    __tablename__ = "stream_buffer_chunks"
+    __table_args__ = (
+        Index(
+            "ix_stream_buffer_chunks_stream",
+            "tenant_id",
+            "thread_id",
+            "stream_id",
+            "seq",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    stream_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    payload: Mapped[dict] = mapped_column(json_column(), default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
 
 
 class CacheInvalidationLogModel(Base):

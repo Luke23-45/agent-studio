@@ -140,7 +140,8 @@ class TestEventContracts:
 
     def test_sse_stream_events_match_schema(self):
         schema = ROOT / "contracts" / "events" / "sse-stream.schema.json"
-        _validate(schema, {"session_id": "s-1"})
+        _validate(schema, {"session_id": "s-1", "thread_id": "th-1"})
+        _validate(schema, {})
         _validate(schema, {"valid": True, "blocked": False, "violations": []})
         _validate(schema, {"content": "tok"})
         _validate(
@@ -154,6 +155,26 @@ class TestEventContracts:
             },
         )
         _validate(schema, {"error": "boom"})
+        _validate(schema, {"violations": []})
+        # P4-1: retraction is distinguishable from redaction because it
+        # requires retract_from_event_id (integer or null).
+        _validate(
+            schema,
+            {"violations": [], "retract_from_event_id": None},
+        )
+        _validate(
+            schema,
+            {"violations": [], "retract_from_event_id": 3},
+        )
+        with pytest.raises(ValidationError):
+            _validate(
+                schema,
+                {"violations": [], "retract_from_event_id": "three"},
+            )
+        # P4-1: compaction frame is emitted only when a checkpoint exists.
+        _validate(schema, {"position": 12, "layer_count": 2})
+        with pytest.raises(ValidationError):
+            _validate(schema, {"position": 12, "layer_count": "two"})
         with pytest.raises(ValidationError):
             _validate(schema, {"unknown": True})
 

@@ -9,14 +9,13 @@ for tenants and policies at request time. JSON files are only a write-side
 cache for the tenant config service and are never consulted on the hot path.
 """
 
+import asyncio
 from datetime import datetime, timezone
+from typing import Any, Awaitable, Callable
 from uuid import UUID, uuid4
 
-import asyncio
-from typing import Any, Awaitable, Callable
-
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -55,31 +54,47 @@ from backend.app.gateway.types import (
     GatewayError,
     GatewayQuotaExceeded,
 )
+from backend.app.governance.budgets import (
+    budget_rejection_message,
+    build_gateway_budget_cfg,
+)
+from backend.app.governance.compiled import ConfigValidationError, compile_surface_config
+from backend.app.governance.evidence import build_tool_gate_packet
+from backend.app.governance.isolation import (
+    resolve_tenant_context,
+    trace_tags,
+)
+from backend.app.governance.promotion import promotion_gate, validate_canary_percent
+from backend.app.governance.toolgate import build_authorizer
 from backend.app.infrastructure.db import (
     ApiKeyRepository,
     AuditRepository,
     ConversationRepository,
+    EndUserRepository,
     EscalationRepository,
     EvidenceRepository,
     PolicyRepository,
+    SurfaceRepository,
     TenantConfigVersionRepository,
     TenantRepository,
     ThreadRepository,
     get_database_manager,
 )
 from backend.app.infrastructure.stream import get_stream_buffer
-from backend.app.context import ContextTurn
 from backend.app.modules.escalation import create_escalation_service
 from backend.app.modules.guardrails import get_guardrails_service
 from backend.app.modules.rag import create_rag_service
-from backend.app.modules.webhooks import (
-    EVENT_CONVERSATION_COMPLETED,
-    EVENT_GUARDRAIL_BLOCKED,
-)
 from backend.app.modules.tenant_config import (
     get_tenant_config_service,
     policy_set_from_db,
     tenant_config_from_data,
+)
+from backend.app.modules.webhooks import (
+    EVENT_CONVERSATION_COMPLETED,
+    EVENT_CONVERSATION_CREATED,
+    EVENT_ESCALATION_RAISED,
+    EVENT_EVAL_FAILED,
+    EVENT_GUARDRAIL_BLOCKED,
 )
 from backend.app.session.coordinator import CoordinatorBusy, get_thread_coordinator
 from backend.app.session.hot_tier import get_thread_tail_cache
@@ -157,25 +172,37 @@ class ConfigVersionResponse(BaseModel):
     tenant_id: str
     version: int
     status: str
+    validation_status: str = ""
+    eval_status: str = ""
+    canary_percent: int | None = None
     published_at: datetime | None
     promoted_by: str | None
 
 
+class ConfigEvalRequest(BaseModel):
+    """Eval-suite result on a draft (P5-2 pipeline; P6-6 slot)."""
+
+    suite: str = Field(default="config", min_length=1, max_length=64)
+    passed: bool
+    details: dict[str, Any] | None = None
+
+
 async def _load_effective_tenant_config(
-    db: Any, tenant_row: dict[str, Any]
+    db: Any, tenant_row: dict[str, Any], request_key: str | None = None
 ) -> TenantConfig:
     """Runtime reads the published config version (Arch 12, P0-11).
 
     The tenant row is the base; a published config version (if any)
     overrides it, so publish/rollback change runtime behavior without
     touching the tenant row. No published version -> the row is
-    authoritative. Shared with the background worker (P2-5).
+    authoritative. Shared with the background worker (P2-5); ``request_key``
+    (end-user/session) resolves a canary rollout (P5-2).
     """
     from backend.app.application.compaction.refresh import (
         load_effective_tenant_config as _shared_load,
     )
 
-    return await _shared_load(db, tenant_row)
+    return await _shared_load(db, tenant_row, request_key)
 
 
 def _assert_conversation_tenant(
@@ -227,17 +254,75 @@ async def _resolve_request_surface(
     return surface
 
 
+async def _build_governance_wiring(
+    db: Any,
+    tenant_config: TenantConfig,
+    surface: dict[str, Any] | None,
+    session_id: str,
+    conversation_id: str,
+    evidence_repo: EvidenceRepository,
+) -> tuple[Callable[[dict[str, Any]], Any], dict[str, Any]]:
+    """P5-1/P5-3/P5-7: compile the surface config into the runtime hooks.
+
+    Returns ``(tool_authorizer, gateway_cfg)`` for the orchestration:
+    - the deterministic P5-3 tool gate (denials audited as evidence), and
+    - the P5-7 budget-hierarchy ``quota_*_usd`` cfg built from the compiled
+      surface budgets (P5-1), so the gateway's quota layer enforces
+      platform > tenant > surface > end-user without route/loop changes.
+    """
+    compiled = compile_surface_config(
+        tenant_config, surface=surface, version=getattr(tenant_config, "version", 1)
+    )
+    gateway_cfg = build_gateway_budget_cfg(compiled.budgets)
+
+    async def _audit_denial(record: dict[str, Any]) -> None:
+        packet = build_tool_gate_packet(
+            tenant_id=str(tenant_config.id),
+            session_id=session_id,
+            tool_name=record.get("tool") or "",
+            reason=record.get("reason"),
+            conversation_id=conversation_id,
+            surface_id=record.get("surface_id"),
+        )
+        try:
+            await evidence_repo.add(packet.to_dict())
+        except Exception as e:
+            logger.warning("tool_denial_evidence_failed", error=str(e))
+
+    gate = await build_authorizer(
+        tenant_config=tenant_config,
+        db=db,
+        surface=surface,
+        audit_service=_audit_denial,
+    )
+
+    async def _tool_authorizer(call: dict[str, Any]) -> Any:
+        decision = await gate.authorize_async(call)
+        return decision.allowed
+
+    return _tool_authorizer, gateway_cfg
+
+
 async def _refresh_hot_tail(
     db: Any,
     tenant_id: str,
     thread_id: str,
     summary: dict[str, Any] | None = None,
 ) -> None:
-    """Push the durable tail into the Redis hot tier; never fatal."""
+    """Push the durable tail into the Redis hot tier; never fatal.
+
+    P5-4: the hot tier is a model-context fast path, so rows are stored
+    redacted-only (raw ``content`` never leaves the access-controlled
+    durable store).
+    """
     try:
         rows = await ThreadRepository(db).read_tail(tenant_id, thread_id, limit=10)
+        redacted_rows = [
+            {**row, "content": row.get("redacted_content") or ""}
+            for row in rows
+        ]
         await get_thread_tail_cache().cache_tail(
-            tenant_id, thread_id, rows, summary=summary
+            tenant_id, thread_id, redacted_rows, summary=summary
         )
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("hot_tail_refresh_failed", thread_id=thread_id, error=str(e))
@@ -414,6 +499,10 @@ class TenantCreateRequest(BaseModel):
     allowed_topics: list[str] = Field(default_factory=list)
     blocked_topics: list[str] = Field(default_factory=list)
     escalation_threshold: float = Field(default=0.7, ge=0.0, le=1.0)
+    # P5-12: region pinned at onboarding (None = platform default).
+    region: str | None = None
+    # P5-9: per-tenant retention window (days); None = default posture.
+    retention_days: int | None = Field(default=None, ge=1)
 
 
 class TenantResponse(BaseModel):
@@ -425,6 +514,8 @@ class TenantResponse(BaseModel):
     allowed_topics: list[str]
     blocked_topics: list[str]
     escalation_threshold: float
+    region: str | None = None
+    retention_days: int | None = None
 
 
 class ApiKeyCreateRequest(BaseModel):
@@ -539,7 +630,9 @@ async def process_conversation(
             detail=f"Tenant not found: {request.tenant_slug}",
         )
 
-    tenant_config = await _load_effective_tenant_config(db, tenant_row)
+    tenant_config = await _load_effective_tenant_config(
+        db, tenant_row, request_key=principal.end_user_id or session_id
+    )
     _assert_conversation_tenant(principal, tenant_config)
 
     # Langfuse tracing for the request pipeline (flag + credentials gated)
@@ -548,6 +641,10 @@ async def process_conversation(
     if feature_flags.ENABLE_LANGFUSE_TRACING:
         adapter = get_langfuse_adapter()
         if adapter.is_enabled:
+            ctx = resolve_tenant_context(
+                tenant_id=str(tenant_config.id),
+                end_user_id=principal.end_user_id,
+            )
             trace = adapter.trace(
                 name="conversation.process",
                 session_id=session_id,
@@ -555,6 +652,7 @@ async def process_conversation(
                     "tenant_id": str(tenant_config.id),
                     "tenant_slug": request.tenant_slug,
                 },
+                tags=list(trace_tags(ctx).values()),
             )
 
     # Distributed rate limiting: per-tenant and per-model windows in
@@ -573,6 +671,13 @@ async def process_conversation(
 
     conversation_repo = ConversationRepository(db)
     conversation = await conversation_repo.get_or_create(str(tenant_config.id), session_id)
+    if conversation.get("created"):
+        await _publish_webhook_event(
+            EVENT_CONVERSATION_CREATED,
+            tenant_config,
+            {"session_id": session_id, "conversation_id": conversation["id"]},
+            session_id,
+        )
 
     if conversation["status"] == "paused":
         raise HTTPException(
@@ -735,6 +840,31 @@ async def process_conversation(
         await _load_thread_summary(threads, thread["id"], str(tenant_config.id))
     )
 
+    # P4-9: the non-streaming path runs full-output validation inside the
+    # orchestration's bounded verify loop (same gate the streaming path's
+    # rolling window uses), then returns; a rejected response re-asks
+    # ``max_verify_retries`` times and escalates (Arch 9.2).
+    if feature_flags.ENABLE_PRESIDIO:
+        async def _output_validator(text: str):
+            return await guardrails_service.evaluate_output(
+                text,
+                tenant_config=tenant_config,
+                conversation_id=conversation["id"],
+                session_id=session_id,
+            )
+
+    else:
+        async def _output_validator(text: str):
+            return None
+
+    tool_authorizer, gateway_cfg = await _build_governance_wiring(
+        db,
+        tenant_config,
+        surface,
+        session_id=session_id,
+        conversation_id=conversation["id"],
+        evidence_repo=evidence_repo,
+    )
     orchestration = create_orchestration_service(
         tenant_config=tenant_config,
         policy_set=policy_set,
@@ -747,6 +877,9 @@ async def process_conversation(
         ),
         surface_id=surface["id"] if surface else None,
         end_user_id=principal.end_user_id,
+        tool_authorizer=tool_authorizer,
+        gateway_cfg=gateway_cfg,
+        output_validator=_output_validator,
     )
     orchestration.compaction_callback = _build_compaction_callback(
         db,
@@ -783,9 +916,14 @@ async def process_conversation(
             trace,
             "orchestration",
             input={
-                "message": request.message,
+                "message": redacted_message,
                 "history_turns": len(history_turns),
             },
+            metadata=(
+                {"surface_id": surface["id"]}
+                if surface
+                else None
+            ),
         )
         if trace
         else None
@@ -845,20 +983,33 @@ async def process_conversation(
                 detail=result["error"],
             )
 
-        # Output validation: PII redaction on the model response
+        # P4-9: output validation already ran inside the orchestration's
+        # bounded verify loop. ``model_response`` is the released text
+        # (PII-redacted when the validator applied redaction); the raw
+        # model output is preserved in ``result["context"]["output_raw"]``
+        # for the durable log. A final rejection (retries exhausted)
+        # escalates and returns a withholding notice instead of the
+        # rejected bytes.
+        response_raw = (
+            (result.get("context") or {}).get("output_raw")
+            or result.get("model_response") or ""
+        )
         response_text = result.get("model_response") or ""
-        response_raw = response_text
-        if feature_flags.ENABLE_PRESIDIO and response_text:
-            output_validation = await guardrails_service.evaluate_output(
-                response_text,
-                tenant_config=tenant_config,
-                conversation_id=conversation["id"],
-                session_id=session_id,
-            )
-            if output_validation.redacted_text:
-                response_text = output_validation.redacted_text
-
         handoff_required = bool(result.get("handoff_required", False))
+        output_validation = (result.get("context") or {}).get("output_validation") or {}
+        output_blocked = bool(output_validation.get("checked")) and not bool(
+            output_validation.get("allowed", True)
+        )
+        if output_blocked and handoff_required:
+            # The response failed every bounded re-ask; never release the
+            # rejected content — escalate instead (Arch 9.3).
+            response_text = "[content withheld by compliance]"
+            response_raw = response_text
+            logger.warning(
+                "conversation_output_blocked_escalated",
+                tenant_slug=request.tenant_slug,
+                decision=output_validation.get("decision"),
+            )
         await conversation_repo.add_message(
             conversation["id"], "assistant", response_raw,
             redacted_content=response_text,
@@ -885,6 +1036,12 @@ async def process_conversation(
         await _enqueue_memory_extract(tenant_config, thread["id"])
         if handoff_required:
             await conversation_repo.mark_escalated(conversation["id"])
+            await _publish_webhook_event(
+                EVENT_ESCALATION_RAISED,
+                tenant_config,
+                {"session_id": session_id, "conversation_id": conversation["id"]},
+                session_id,
+            )
 
         if trace:
             adapter.update(
@@ -929,6 +1086,19 @@ async def process_conversation(
         if trace:
             adapter.update(trace, output={"error": str(e)})
             adapter.flush()
+        await _publish_webhook_event(
+            EVENT_EVAL_FAILED,
+            tenant_config,
+            {"session_id": session_id, "conversation_id": conversation["id"], "error": str(e)},
+            session_id,
+        )
+        if isinstance(e, GatewayQuotaExceeded):
+            # P5-7: surface-level rejection carries a human-readable budget
+            # line (level + limit + projection) the widget renders distinctly.
+            raise HTTPException(
+                status_code=_gateway_http_status(e),
+                detail=budget_rejection_message(e.level, e.limit_usd, e.projected_usd),
+            ) from e
         raise HTTPException(
             status_code=_gateway_http_status(e),
             detail=str(e),
@@ -938,6 +1108,12 @@ async def process_conversation(
         if trace:
             adapter.update(trace, output={"error": str(e)})
             adapter.flush()
+        await _publish_webhook_event(
+            EVENT_EVAL_FAILED,
+            tenant_config,
+            {"session_id": session_id, "conversation_id": conversation["id"], "error": str(e)},
+            session_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(e),
@@ -991,13 +1167,39 @@ async def _publish_webhook_event(
     data: dict,
     session_id: str,
 ) -> None:
-    """Publish a webhook event; failures must never break the request."""
-    try:
-        from backend.app.modules.webhooks import WebhookPublisher
+    """Publish a webhook event through the transactional outbox.
 
-        await WebhookPublisher().publish(
-            event_type, str(tenant_config.id), data, session_id=session_id
+    Records an outbox row (idempotent by event id) and attempts an
+    immediate drain; when the drain succeeds the webhook delivery jobs are
+    enqueued as before. Failures must never break the request — the row
+    stays pending and the worker retries it a later drain, so no event is
+    lost on crash (EU-AI-Act Art. 12).
+    """
+    try:
+        from uuid import uuid4 as _uuid4
+
+        from backend.app.infrastructure.db import get_database_manager
+        from backend.app.modules.webhooks.outbox import EventOutboxRepository
+        from backend.app.modules.webhooks.relay import OutboxRelay, enqueue_outbox_relay
+
+        db = get_database_manager()
+        outbox = EventOutboxRepository(db)
+        event_id = str(_uuid4())
+        await outbox.record(
+            event_id=event_id,
+            tenant_id=str(tenant_config.id),
+            event_type=event_type,
+            payload=data,
+            session_id=session_id,
         )
+        try:
+            await enqueue_outbox_relay()
+        except Exception as _e:  # queue not ready: inline drain still works
+            pass
+        try:
+            await OutboxRelay(db=db).drain(limit=50)
+        except Exception:  # pragma: no cover - defensive
+            pass
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("webhook_publish_failed", event_type=event_type, error=str(e))
 
@@ -1073,7 +1275,9 @@ async def stream_conversation(
             detail=f"Tenant not found: {request.tenant_slug}",
         )
 
-    tenant_config = await _load_effective_tenant_config(db, tenant_row)
+    tenant_config = await _load_effective_tenant_config(
+        db, tenant_row, request_key=principal.end_user_id or session_id
+    )
     _assert_conversation_tenant(principal, tenant_config)
 
     await get_rate_limiter().acquire_multi_or_raise(
@@ -1087,6 +1291,13 @@ async def stream_conversation(
 
     conversation_repo = ConversationRepository(db)
     conversation = await conversation_repo.get_or_create(str(tenant_config.id), session_id)
+    if conversation.get("created"):
+        await _publish_webhook_event(
+            EVENT_CONVERSATION_CREATED,
+            tenant_config,
+            {"session_id": session_id, "conversation_id": conversation["id"]},
+            session_id,
+        )
 
     if conversation["status"] == "paused":
         raise HTTPException(
@@ -1126,12 +1337,12 @@ async def stream_conversation(
     idempotency_hit = False
     if idempotency_key and not want_replay:
         idempotency_hit = await stream_buffer.get_terminal(
-            str(tenant_config.id), stream_id
+            str(tenant_config.id), str(thread["id"]), stream_id
         ) is not None
         want_replay = idempotency_hit
     if want_replay:
         records = await stream_buffer.replay(
-            str(tenant_config.id), stream_id, after_event_id=last_event_id
+            str(tenant_config.id), str(thread["id"]), stream_id, after_event_id=last_event_id
         )
 
         async def _replay_generator():
@@ -1209,6 +1420,14 @@ async def stream_conversation(
         else:
             model_override = pin.strip()
     gateway = get_gateway()
+    tool_authorizer, gateway_cfg = await _build_governance_wiring(
+        db,
+        tenant_config,
+        surface,
+        session_id=session_id,
+        conversation_id=conversation["id"],
+        evidence_repo=evidence_repo,
+    )
     orchestration = create_orchestration_service(
         tenant_config=tenant_config,
         policy_set=policy_set,
@@ -1221,6 +1440,8 @@ async def stream_conversation(
         ),
         surface_id=surface["id"] if surface else None,
         end_user_id=principal.end_user_id,
+        tool_authorizer=tool_authorizer,
+        gateway_cfg=gateway_cfg,
     )
     orchestration.compaction_callback = _build_compaction_callback(
         db,
@@ -1291,6 +1512,18 @@ async def stream_conversation(
                 "violations": input_validation["violations"],
             },
         )
+        if context_summary_position is not None:
+            # P4-1: the client should know history was compacted before this
+            # turn; the durable block replaces every turn <= position.
+            yield _sse(
+                "compaction",
+                {
+                    "position": context_summary_position,
+                    "layer_count": len(context_summary_layers)
+                    if context_summary_layers
+                    else 0,
+                },
+            )
 
         if not input_validation["is_valid"] and input_validation["blocked"]:
             logger.info(
@@ -1402,6 +1635,7 @@ async def stream_conversation(
 
             producer = asyncio.create_task(_produce())
             heartbeat_task = asyncio.create_task(_heartbeat_loop())
+            last_released_event_id: int | None = None
             try:
                 while True:
                     kind, payload = await stream_q.get()
@@ -1419,44 +1653,49 @@ async def stream_conversation(
                             continue  # held until a full window accumulates
                         if release.truncated:
                             # Output moderation flagged blocked content mid-
-                            # stream: emit a redaction event and truncate the
-                            # stream (never release the tail to the client).
+                            # stream: emit a redaction + retraction and
+                            # truncate the stream (never release the tail to
+                            # the client; the client drops deltas released
+                            # after last_released_event_id).
+                            violations = [
+                                getattr(v, "to_dict", lambda: v)()
+                                for v in release.violations
+                            ]
                             await stream_buffer.mark_terminal(
-                                str(tenant_config.id), stream_id, "error",
+                                str(tenant_config.id), str(thread["id"]), stream_id, "error",
                                 {
                                     "error": "output_moderation_redaction",
                                     "reason": "content_moderation",
-                                    "violations": [
-                                        getattr(v, "to_dict", lambda: v)()
-                                        for v in release.violations
-                                    ],
+                                    "violations": violations,
                                 },
                             )
+                            yield _sse("redaction", {"violations": violations})
                             yield _sse(
-                                "redaction",
-                                {"violations": [getattr(v, "to_dict", lambda: v)() for v in release.violations]},
+                                "retraction",
+                                {
+                                    "violations": violations,
+                                    "retract_from_event_id": last_released_event_id,
+                                },
                             )
                             await _publish_webhook_event(
                                 EVENT_GUARDRAIL_BLOCKED,
                                 tenant_config,
                                 {
                                     "reason": "content_moderation",
-                                    "violations": [
-                                        getattr(v, "to_dict", lambda: v)()
-                                        for v in release.violations
-                                    ],
+                                    "violations": violations,
                                 },
                                 session_id,
                             )
                             return
                         seq = await stream_buffer.append(
-                            str(tenant_config.id), stream_id, "delta",
+                            str(tenant_config.id), str(thread["id"]), stream_id, "delta",
                             {"content": release.text},
                         )
+                        last_released_event_id = seq
                         yield _sse("delta", {"content": release.text}, event_id=seq)
                     elif event["type"] == "error":
                         await stream_buffer.mark_terminal(
-                            str(tenant_config.id), stream_id, "error",
+                            str(tenant_config.id), str(thread["id"]), stream_id, "error",
                             {"error": event["error"]},
                         )
                         yield _sse("error", {"error": event["error"]})
@@ -1474,36 +1713,39 @@ async def stream_conversation(
             # Flush whatever the window still holds before the result frame.
             tail = await moderation.finish()
             if tail is not None and tail.truncated:
+                violations = [
+                    getattr(v, "to_dict", lambda: v)()
+                    for v in tail.violations
+                ]
                 await stream_buffer.mark_terminal(
-                    str(tenant_config.id), stream_id, "error",
+                    str(tenant_config.id), str(thread["id"]), stream_id, "error",
                     {
                         "error": "output_moderation_redaction",
                         "reason": "content_moderation_tail",
-                        "violations": [
-                            getattr(v, "to_dict", lambda: v)()
-                            for v in tail.violations
-                        ],
+                        "violations": violations,
                     },
                 )
+                yield _sse("redaction", {"violations": violations})
                 yield _sse(
-                    "redaction",
-                    {"violations": [getattr(v, "to_dict", lambda: v)() for v in tail.violations]},
+                    "retraction",
+                    {
+                        "violations": violations,
+                        "retract_from_event_id": last_released_event_id,
+                    },
                 )
                 await _publish_webhook_event(
                     EVENT_GUARDRAIL_BLOCKED,
                     tenant_config,
                     {
                         "reason": "content_moderation_tail",
-                        "violations": [
-                            getattr(v, "to_dict", lambda: v)() for v in tail.violations
-                        ],
+                        "violations": violations,
                     },
                     session_id,
                 )
                 return
             if tail is not None and tail.text:
                 seq = await stream_buffer.append(
-                    str(tenant_config.id), stream_id, "delta",
+                    str(tenant_config.id), str(thread["id"]), stream_id, "delta",
                     {"content": tail.text},
                 )
                 yield _sse("delta", {"content": tail.text}, event_id=seq)
@@ -1549,6 +1791,12 @@ async def stream_conversation(
             await _enqueue_memory_extract(tenant_config, thread["id"])
             if handoff_required:
                 await conversation_repo.mark_escalated(conversation["id"])
+                await _publish_webhook_event(
+                    EVENT_ESCALATION_RAISED,
+                    tenant_config,
+                    {"session_id": session_id, "conversation_id": conversation["id"]},
+                    session_id,
+                )
 
             result_payload: dict[str, Any] = {
                 "response": response_text,
@@ -1573,7 +1821,7 @@ async def stream_conversation(
                 session_id,
             )
             await stream_buffer.mark_terminal(
-                str(tenant_config.id), stream_id, "result", result_payload
+                str(tenant_config.id), str(thread["id"]), stream_id, "result", result_payload
             )
             yield _sse("result", result_payload)
         except HTTPException:
@@ -1584,8 +1832,17 @@ async def stream_conversation(
             if isinstance(e, GatewayError):
                 payload["kind"] = e.kind
                 payload["status"] = _gateway_http_status(e)
+            if isinstance(e, GatewayQuotaExceeded):
+                # P5-7: machine-readable budget fields for a surface-level
+                # rejection, plus a widget-ready message.
+                payload["error"] = budget_rejection_message(
+                    e.level, e.limit_usd, e.projected_usd
+                )
+                payload["level"] = e.level
+                payload["limit_usd"] = e.limit_usd
+                payload["projected_usd"] = e.projected_usd
             await stream_buffer.mark_terminal(
-                str(tenant_config.id), stream_id, "error", payload
+                str(tenant_config.id), str(thread["id"]), stream_id, "error", payload
             )
             yield _sse("error", payload)
         finally:
@@ -1823,6 +2080,17 @@ async def create_tenant(
     """Create a new tenant."""
     logger.info("tenant_create_request", slug=request.slug, actor=principal.key_id)
 
+    from backend.app.governance.residency import resolve_region
+
+    # P5-12: region is pinned at onboarding; unsupported regions are denied.
+    try:
+        region = resolve_region(request.region)
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid region: {e}",
+        )
+
     tenant_service = get_tenant_config_service()
 
     # Check if slug already exists (DB is source of truth, JSON file is a cache)
@@ -1858,6 +2126,8 @@ async def create_tenant(
         "features": config.features,
         "guardrail_config": config.guardrail_config,
         "guardrail_thresholds": config.guardrail_thresholds,
+        "region": region,
+        "retention_days": request.retention_days,
     })
     tenant_service.save_config(config)
 
@@ -1872,7 +2142,12 @@ async def create_tenant(
         tenant_id=str(config.id),
         actor_type="api_key",
         actor_id=principal.key_id,
-        details={"slug": config.slug, "name": config.name},
+        details={
+            "slug": config.slug,
+            "name": config.name,
+            "region": region,
+            "retention_days": request.retention_days,
+        },
     )
 
     return TenantResponse(
@@ -1882,6 +2157,8 @@ async def create_tenant(
         allowed_topics=config.allowed_topics,
         blocked_topics=config.blocked_topics,
         escalation_threshold=config.escalation_threshold,
+        region=region,
+        retention_days=request.retention_days,
     )
 
 
@@ -1907,6 +2184,8 @@ async def list_tenants(
             allowed_topics=r["allowed_topics"],
             blocked_topics=r["blocked_topics"],
             escalation_threshold=r["escalation_threshold"],
+            region=r.get("region"),
+            retention_days=r.get("retention_days"),
         )
         for r in rows
     ]
@@ -1938,6 +2217,8 @@ async def get_tenant(
         allowed_topics=row["allowed_topics"],
         blocked_topics=row["blocked_topics"],
         escalation_threshold=row["escalation_threshold"],
+        region=row.get("region"),
+        retention_days=row.get("retention_days"),
     )
 
 
@@ -2014,6 +2295,62 @@ async def set_tenant_provider_key(
     )
 
 
+class DeploymentShapeRequest(BaseModel):
+    """Opt a tenant into a dedicated deployment shape (P5-12).
+
+    Dedicated = own DB/vector/gateway behind the same shared control plane.
+    It is a configuration choice, never a code fork.
+    """
+
+    dedicated: bool
+
+
+@router.put("/tenants/{tenant_id}/deployment-shape")
+async def set_tenant_deployment_shape(
+    tenant_id: UUID,
+    request: DeploymentShapeRequest,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Set the tenant's deployment shape (shared | dedicated) and return the
+    resulting isolation config (P5-12)."""
+    assert_tenant_access(principal, tenant_id)
+
+    from backend.app.governance.residency import (
+        dedicated_deployment_config,
+        deployment_shape,
+    )
+
+    db = get_database_manager()
+    current = await TenantRepository(db).get_by_id(str(tenant_id))
+    if current is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+    features = dict(current.get("features") or {})
+    features["dedicated_deployment"] = request.dedicated
+    row = await TenantRepository(db).update(str(tenant_id), {"features": features})
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+    await AuditRepository(db).add(
+        action="tenant.deployment_shape_changed",
+        resource_type="tenant",
+        resource_id=str(tenant_id),
+        tenant_id=str(tenant_id),
+        actor_type="api_key",
+        actor_id=principal.key_id,
+        details={"dedicated": request.dedicated},
+    )
+    return {
+        "tenant_id": str(tenant_id),
+        "shape": deployment_shape(row),
+        "dedicated_deployment": dedicated_deployment_config(row),
+    }
+
+
 @router.post(
     "/tenants/{tenant_id}/config-versions",
     response_model=ConfigVersionResponse,
@@ -2051,8 +2388,28 @@ async def create_tenant_config_version(
             detail="Config id/slug must match the tenant",
         )
 
-    row = await TenantConfigVersionRepository(db).create_draft(
+    # P5-1/P5-2 eval gate: structural (schema) + compile validation before a
+    # draft may be created. A payload that fails cannot exist as a draft and
+    # therefore can never be promoted.
+    try:
+        compile_surface_config(candidate, surface=None)
+    except ConfigValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Config failed validation: {e}",
+        )
+
+    repo = TenantConfigVersionRepository(db)
+    row = await repo.create_draft(
         str(tenant_id), request.config, promoted_by=principal.key_id
+    )
+    # P5-2 pipeline: record the passing evaluation, then the privileged
+    # approval, so promoted versions have a full (validated, approved) trail.
+    validated = await repo.set_validation(
+        str(tenant_id), row["version"], "validated", by=principal.key_id
+    )
+    approved = await repo.approve(
+        str(tenant_id), row["version"], approved_by=principal.key_id
     )
     await AuditRepository(db).add(
         action="config_version.created",
@@ -2061,12 +2418,18 @@ async def create_tenant_config_version(
         tenant_id=str(tenant_id),
         actor_type="api_key",
         actor_id=principal.key_id,
-        details={"version": row["version"], "status": row["status"]},
+        details={
+            "version": row["version"],
+            "status": row["status"],
+            "validation_status": (validated or {}).get("validation_status"),
+            "approved_by": (approved or {}).get("approved_by"),
+        },
     )
     return ConfigVersionResponse(
         tenant_id=str(tenant_id),
         version=row["version"],
         status=row["status"],
+        validation_status=(validated or {}).get("validation_status", ""),
         published_at=row["published_at"],
         promoted_by=row["promoted_by"],
     )
@@ -2080,17 +2443,41 @@ async def publish_tenant_config_version(
     tenant_id: UUID,
     version: int,
     principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+    canary_percent: int | None = Query(default=None, ge=0, le=100),
 ):
     """Publish a draft (or re-promote any version); supersedes the old one.
 
-    Runtime behavior switches on the next request; in-memory caches are
-    invalidated and an audit event is recorded.
+    Gated on the P5-2 pipeline: a version that failed validation or its eval
+    suite cannot be promoted. ``canary_percent`` (0-100) turns the publish
+    into a canary rollout — the previous published version stays live as the
+    baseline and the runtime serves the canary to a deterministic slice of
+    request traffic. Runtime behavior switches on the next request; in-memory
+    caches are invalidated and an audit event is recorded.
     """
     assert_tenant_access(principal, tenant_id)
 
     db = get_database_manager()
-    row = await TenantConfigVersionRepository(db).promote(
-        str(tenant_id), version, promoted_by=principal.key_id
+    repo = TenantConfigVersionRepository(db)
+    draft = await repo.get(str(tenant_id), version)
+    allowed, reason = promotion_gate(
+        (draft or {}).get("validation_status"),
+        (draft or {}).get("eval_status"),
+    )
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Config version {version} cannot be promoted: {reason}",
+        )
+    if canary_percent is not None and not validate_canary_percent(canary_percent):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="canary_percent must be between 0 and 100",
+        )
+    row = await repo.promote(
+        str(tenant_id),
+        version,
+        promoted_by=principal.key_id,
+        canary_percent=canary_percent,
     )
     if row is None:
         raise HTTPException(
@@ -2106,17 +2493,150 @@ async def publish_tenant_config_version(
         tenant_id=str(tenant_id),
         actor_type="api_key",
         actor_id=principal.key_id,
-        details={"version": row["version"], "status": row["status"]},
+        details={
+            "version": row["version"],
+            "status": row["status"],
+            "canary_percent": row.get("canary_percent"),
+        },
     )
     logger.info(
         "tenant_config_version_published",
         tenant_id=str(tenant_id),
         version=row["version"],
+        canary_percent=row.get("canary_percent"),
     )
     return ConfigVersionResponse(
         tenant_id=str(tenant_id),
         version=row["version"],
         status=row["status"],
+        validation_status=(draft or {}).get("validation_status", ""),
+        eval_status=(draft or {}).get("eval_status") or "",
+        canary_percent=row.get("canary_percent"),
+        published_at=row["published_at"],
+        promoted_by=row["promoted_by"],
+    )
+
+
+@router.post(
+    "/tenants/{tenant_id}/config-versions/{version}/evaluate",
+    response_model=ConfigVersionResponse,
+)
+async def evaluate_tenant_config_version(
+    tenant_id: UUID,
+    version: int,
+    request: ConfigEvalRequest,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Record an eval-suite result on a draft (P5-2 pipeline, P6-6 slot).
+
+    A failing suite blocks promotion at the publish gate; the result and
+    per-metric details are retained on the immutable version record for the
+    audit trail.
+    """
+    assert_tenant_access(principal, tenant_id)
+
+    db = get_database_manager()
+    repo = TenantConfigVersionRepository(db)
+    draft = await repo.get(str(tenant_id), version)
+    if draft is None or draft.get("status") != repo.STATUS_DRAFT:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Config version not found: {tenant_id} v{version}",
+        )
+    eval_status = "passed" if request.passed else "failed"
+    row = await repo.set_eval_result(
+        str(tenant_id),
+        version,
+        eval_status,
+        details={
+            "suite": request.suite,
+            "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            "metrics": request.details,
+        },
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Config version not found: {tenant_id} v{version}",
+        )
+    await AuditRepository(db).add(
+        action="config_version.evaluated",
+        resource_type="tenant_config_version",
+        resource_id=row["id"],
+        tenant_id=str(tenant_id),
+        actor_type="api_key",
+        actor_id=principal.key_id,
+        details={
+            "version": row["version"],
+            "suite": request.suite,
+            "eval_status": eval_status,
+        },
+    )
+    return ConfigVersionResponse(
+        tenant_id=str(tenant_id),
+        version=row["version"],
+        status=row["status"],
+        validation_status=row.get("validation_status") or "",
+        eval_status=row.get("eval_status") or "",
+        canary_percent=row.get("canary_percent"),
+        published_at=row["published_at"],
+        promoted_by=row["promoted_by"],
+    )
+
+
+@router.post(
+    "/tenants/{tenant_id}/config-versions/{version}/auto-rollback",
+    response_model=ConfigVersionResponse,
+)
+async def auto_rollback_tenant_config_version(
+    tenant_id: UUID,
+    version: int,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+    reason: str = Query(default="eval regression"),
+):
+    """Auto-rollback on regression (P5-2): re-promote the prior version.
+
+    Marks the failing published version ``regressed`` (a failed eval gate —
+    it cannot be re-promoted until re-validated) and fully re-publishes the
+    previously live version. Mirrors a canary watchdog firing on error-rate
+    regression.
+    """
+    assert_tenant_access(principal, tenant_id)
+
+    db = get_database_manager()
+    repo = TenantConfigVersionRepository(db)
+    row = await repo.auto_rollback(
+        str(tenant_id), version, reason=reason, rolled_back_by=principal.key_id
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Config version {tenant_id} v{version} is not a published rollout",
+        )
+
+    get_tenant_config_service().invalidate_cache(tenant_id)
+    await AuditRepository(db).add(
+        action="config_version.auto_rolled_back",
+        resource_type="tenant_config_version",
+        resource_id=row["id"],
+        tenant_id=str(tenant_id),
+        actor_type="api_key",
+        actor_id=principal.key_id,
+        details={"version": row["version"], "reason": reason},
+    )
+    logger.info(
+        "tenant_config_version_auto_rolled_back",
+        tenant_id=str(tenant_id),
+        version=row["version"],
+        reason=reason,
+    )
+    return ConfigVersionResponse(
+        tenant_id=str(tenant_id),
+        version=row["version"],
+        status=row["status"],
+        validation_status=row.get("validation_status") or "",
+        eval_status=row.get("eval_status") or "",
+        canary_percent=row.get("canary_percent"),
         published_at=row["published_at"],
         promoted_by=row["promoted_by"],
     )
@@ -2193,6 +2713,210 @@ async def offboard_tenant(
     return {"tenant_id": str(tenant_id), "status": "offboarded"}
 
 
+@router.post("/tenants/{tenant_id}/onboard")
+async def onboard_tenant(
+    tenant_id: UUID,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Run the onboarding checklist (P5-10): default deny-by-default surface,
+    isolation namespaces/prefixes, budget defaults, tenant-bound operator key.
+
+    Idempotent: steps already provisioned are reported as such. The raw
+    operator key is returned exactly once, on first creation.
+    """
+    assert_tenant_access(principal, tenant_id)
+
+    from backend.app.application.tenant_lifecycle import TenantOnboardingService
+
+    try:
+        receipt = await TenantOnboardingService().run(str(tenant_id))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return receipt
+
+
+@router.get("/tenants/{tenant_id}/onboarding")
+async def get_onboarding_checklist(
+    tenant_id: UUID,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:read")),
+):
+    """Report the onboarding checklist state for a tenant (P5-10)."""
+    assert_tenant_access(principal, tenant_id)
+
+    from backend.app.application.tenant_lifecycle import TenantOnboardingService
+
+    try:
+        return await TenantOnboardingService().checklist(str(tenant_id))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@router.get("/tenants/{tenant_id}/metrics")
+async def get_tenant_metrics(
+    tenant_id: UUID,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:read")),
+):
+    """Tenant-scoped metrics (P5-10): conversations, messages, end users,
+    escalations, governance evidence, webhook deliveries."""
+    assert_tenant_access(principal, tenant_id)
+
+    db = get_database_manager()
+    tenant = await TenantRepository(db).get_by_id(str(tenant_id))
+    if tenant is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+
+    conversation_repo = ConversationRepository(db)
+    conversations = await conversation_repo.list_by_tenant(str(tenant_id), limit=10000)
+    messages = await conversation_repo.list_messages_all([c["id"] for c in conversations])
+
+    return {
+        "tenant_id": str(tenant_id),
+        "conversations": len(conversations),
+        "messages": len(messages),
+        "end_users": len(await EndUserRepository(db).list_by_tenant(str(tenant_id))),
+        "escalations": len(
+            await EscalationRepository(db).list_by_tenant(str(tenant_id), limit=10000)
+        ),
+        "guardrail_evidence": len(
+            await EvidenceRepository(db).list_by_tenant(str(tenant_id), limit=10000)
+        ),
+        "threads": len(
+            await ThreadRepository(db).list_threads(str(tenant_id), limit=10000)
+        ),
+    }
+
+
+@router.get("/tenants/{tenant_id}/end-users/{end_user_id}/export")
+async def export_end_user_data(
+    tenant_id: UUID,
+    end_user_id: UUID,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:read")),
+):
+    """DSR export: portable JSON bundle of one end user's data."""
+    assert_tenant_access(principal, tenant_id)
+
+    from backend.app.application.tenant_lifecycle import TenantLifecycleService
+
+    try:
+        bundle = await TenantLifecycleService().export_end_user_data(
+            str(tenant_id), str(end_user_id)
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    return JSONResponse(
+        content=_jsonable(bundle),
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="dsr-export-{end_user_id}.json"'
+            )
+        },
+    )
+
+
+@router.delete("/tenants/{tenant_id}/end-users/{end_user_id}/data", status_code=status.HTTP_200_OK)
+async def erase_end_user_data(
+    tenant_id: UUID,
+    end_user_id: str,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """DSR erasure: delete one end user's data and revoke their sessions."""
+    assert_tenant_access(principal, tenant_id)
+
+    from backend.app.application.tenant_lifecycle import TenantLifecycleService
+
+    try:
+        deleted = await TenantLifecycleService().erase_end_user_data(
+            str(tenant_id), str(end_user_id)
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+    return {"tenant_id": str(tenant_id), "end_user_id": str(end_user_id), "deleted": deleted}
+
+
+class ComplianceIncidentRequest(BaseModel):
+    """Art. 73 incident-reporting hook request (P5-11)."""
+
+    severity: str = Field(default="medium", pattern="^(low|medium|high|critical)$")
+    description: str = Field(..., min_length=1, max_length=4000)
+
+
+@router.get("/tenants/{tenant_id}/compliance")
+async def get_compliance_posture(
+    tenant_id: UUID,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:read")),
+):
+    """Compliance posture (P5-11): Art. 50 disclosure metadata + the
+    re-verification checklist as of the last verification date."""
+    assert_tenant_access(principal, tenant_id)
+
+    from backend.app.governance.compliance import ComplianceService, disclosure_payload
+
+    db = get_database_manager()
+    tenant = await TenantRepository(db).get_by_id(str(tenant_id))
+    if tenant is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+    surface = await SurfaceRepository(db).get_default(str(tenant_id))
+    service = ComplianceService()
+    return {
+        "tenant_id": str(tenant_id),
+        "disclosure": disclosure_payload(
+            tenant_id=str(tenant_id),
+            surface=surface,
+            surface_type=(surface or {}).get("surface_type") or "widget",
+        ),
+        "posture": service.checklist(),
+    }
+
+
+@router.post("/tenants/{tenant_id}/compliance/incidents")
+async def report_compliance_incident(
+    tenant_id: UUID,
+    request: ComplianceIncidentRequest,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Art. 73 incident reporting hook (P5-11): record the incident on the
+    immutable audit trail."""
+    assert_tenant_access(principal, tenant_id)
+
+    from backend.app.governance.compliance import ComplianceService
+
+    db = get_database_manager()
+    tenant = await TenantRepository(db).get_by_id(str(tenant_id))
+    if tenant is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+    record = ComplianceService().report_incident(
+        tenant_id=str(tenant_id),
+        severity=request.severity,
+        description=request.description,
+    )
+    await AuditRepository(db).add(
+        action="compliance.incident_reported",
+        resource_type="tenant",
+        resource_id=str(tenant_id),
+        tenant_id=str(tenant_id),
+        actor_type="api_key",
+        actor_id=principal.key_id,
+        details=record,
+    )
+    logger.info(
+        "compliance_incident_reported",
+        tenant_id=str(tenant_id),
+        severity=request.severity,
+    )
+    return record
+
+
 @router.post("/api-keys", response_model=ApiKeyResponse)
 async def create_api_key(
     request: ApiKeyCreateRequest,
@@ -2204,6 +2928,24 @@ async def create_api_key(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="role must be one of: super_admin, tenant_admin, operator, auditor",
         )
+    # P5-10 delegated admin: tenant-bound principals (tenant_admin) can only
+    # manage keys inside their own tenant and may never mint super_admin keys.
+    if principal.tenant_id is not None:
+        if request.tenant_id is not None and str(request.tenant_id) != str(
+            principal.tenant_id
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Delegated admin can only create keys for their own tenant",
+            )
+        if request.role == "super_admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Delegated admin cannot create super_admin keys",
+            )
+        effective_tenant_id = str(principal.tenant_id)
+    else:
+        effective_tenant_id = request.tenant_id
 
     raw_key, prefix, key_hash = generate_api_key()
     db = get_database_manager()
@@ -2213,7 +2955,7 @@ async def create_api_key(
         key_hash=key_hash,
         prefix=prefix,
         role=request.role,
-        tenant_id=request.tenant_id,
+        tenant_id=effective_tenant_id,
         expires_at=request.expires_at,
     )
 
@@ -2246,6 +2988,8 @@ async def list_api_keys(
     """List API keys (raw keys are never returned)."""
     db = get_database_manager()
     rows = await ApiKeyRepository(db).list_all()
+    if principal.tenant_id is not None:
+        rows = [r for r in rows if r["tenant_id"] == str(principal.tenant_id)]
     return [
         ApiKeyListItem(
             id=r["id"],
@@ -2271,6 +3015,21 @@ async def revoke_api_key(
     """Revoke an API key."""
     db = get_database_manager()
     repo = ApiKeyRepository(db)
+    rows = await repo.list_all()
+    target = next((r for r in rows if r["id"] == str(key_id)), None)
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"API key not found: {key_id}",
+        )
+    # P5-10 delegated admin: tenant-bound principals only revoke their own keys.
+    if principal.tenant_id is not None and target["tenant_id"] != str(
+        principal.tenant_id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Delegated admin can only revoke keys of their own tenant",
+        )
     revoked = await repo.revoke(str(key_id))
     if not revoked:
         raise HTTPException(

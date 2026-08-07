@@ -9,16 +9,16 @@ A per-key in-memory token bucket provides API-level rate limiting (item 1.4).
 import asyncio
 import hashlib
 import secrets
-import structlog
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Callable, Coroutine
 from uuid import UUID
 
+import structlog
 from fastapi import Depends, HTTPException, Request, status
 
-from backend.app.infrastructure.db import get_database_manager, ApiKeyRepository, AuditRepository
-from backend.app.infrastructure.patterns import RateLimiter, RateLimitConfig, RateLimitExceeded
+from backend.app.infrastructure.db import ApiKeyRepository, AuditRepository, get_database_manager
+from backend.app.infrastructure.patterns import RateLimitConfig, RateLimiter, RateLimitExceeded
 from backend.app.settings.env import settings
 
 logger = structlog.get_logger(__name__)
@@ -45,6 +45,9 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "escalations:read", "escalations:write",
         "webhooks:read", "webhooks:write",
         "knowledge:write", "evals:run",
+        # P5-10 delegated admin: tenant-bound keys may manage their own
+        # tenant's keys (enforced in the api-keys routes via assert_tenant_access).
+        "api_keys:manage",
     },
     ROLE_OPERATOR: {"conversations:read", "escalations:read", "escalations:write"},
     ROLE_AUDITOR: {"tenants:read", "audit:read"},

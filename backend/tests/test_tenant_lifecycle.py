@@ -13,6 +13,7 @@ from backend.app.infrastructure.db import (
     ApiKeyRepository,
     AuditRepository,
     ConversationRepository,
+    EndUserRepository,
     EscalationRepository,
     EvidenceRepository,
     TenantRepository,
@@ -180,6 +181,122 @@ class TestLifecycleService:
         audit_repo = AuditRepository(db)
         assert not hasattr(audit_repo, "update")
         assert not hasattr(audit_repo, "delete")
+
+
+class TestEndUserDsr:
+    def _seed_end_user(self, db, tenant_id):
+        from backend.app.infrastructure.db.threads import ThreadRepository
+
+        end_user = asyncio.run(
+            EndUserRepository(db).create_authenticated(
+                tenant_id, external_id="cust-42", display_name="DSR Person"
+            )
+        )
+        end_user_id = end_user["id"]
+
+        conversation = asyncio.run(
+            ConversationRepository(db).get_or_create(tenant_id, "session-dsr")
+        )
+        thread = asyncio.run(
+            ThreadRepository(db).create_thread(
+                tenant_id,
+                conversation_id=conversation["id"],
+                end_user_id=end_user_id,
+            )
+        )
+        asyncio.run(
+            ThreadRepository(db).append_message(
+                tenant_id,
+                thread["id"],
+                role="user",
+                content="hello dsr",
+                redacted_content="hello",
+                conversation_id=conversation["id"],
+                end_user_id=end_user_id,
+            )
+        )
+        asyncio.run(
+            ThreadRepository(db).append_message(
+                tenant_id,
+                thread["id"],
+                role="assistant",
+                content="welcome",
+                redacted_content="welcome",
+                conversation_id=conversation["id"],
+                end_user_id=end_user_id,
+            )
+        )
+        from backend.app.infrastructure.db.memory import MemoryRepository
+
+        asyncio.run(
+            MemoryRepository(db).add(
+                tenant_id=tenant_id,
+                end_user_id=end_user_id,
+                thread_id=thread["id"],
+                source_seq=2,
+                content="likes dsr",
+            )
+        )
+        return end_user
+
+    def _seed_end_user_data(self, db):
+        tenant = _seed_tenant_data(db)
+        end_user = self._seed_end_user(db, tenant["id"])
+        return tenant, end_user
+
+    def test_export_returns_end_user_bundle(self, db):
+        from backend.app.application.tenant_lifecycle import TenantLifecycleService
+
+        tenant, end_user = self._seed_end_user_data(db)
+        bundle = asyncio.run(
+            TenantLifecycleService(db=db).export_end_user_data(
+                tenant["id"], end_user["id"]
+            )
+        )
+        assert bundle["end_user"]["external_id"] == "cust-42"
+        assert bundle["threads"][0]["end_user_id"] == end_user["id"]
+        assert len(bundle["messages"]) == 2
+        assert len(bundle["memories"]) == 1
+
+    def test_export_missing_end_user_raises(self, db):
+        from backend.app.application.tenant_lifecycle import TenantLifecycleService
+
+        tenant = _seed_tenant_data(db)
+        with pytest.raises(ValueError):
+            asyncio.run(
+                TenantLifecycleService(db=db).export_end_user_data(
+                    tenant["id"], str(uuid4())
+                )
+            )
+
+    def test_erasure_in_end_user_marks_erased_and_revokes_sessions(self, db):
+        from backend.app.application.tenant_lifecycle import TenantLifecycleService
+        from backend.app.infrastructure.db.threads import ThreadRepository
+
+        tenant, end_user = self._seed_end_user_data(db)
+        service = TenantLifecycleService(db=db)
+
+        deleted = asyncio.run(
+            service.erase_end_user_data(tenant["id"], end_user["id"])
+        )
+        assert deleted["threads"] >= 1
+        assert deleted["messages"] >= 2
+
+        updated = asyncio.run(
+            EndUserRepository(db).get_by_id(tenant["id"], end_user["id"])
+        )
+        assert updated["status"] == "erased"
+
+        remaining_threads = asyncio.run(
+            ThreadRepository(db).list_threads(
+                tenant["id"], end_user_id=end_user["id"]
+            )
+        )
+        assert remaining_threads == []
+
+        audit = asyncio.run(AuditRepository(db).list_events(tenant_id=tenant["id"]))
+        actions = {e["action"] for e in audit}
+        assert "end_user.data_erased" in actions
 
 
 class TestApiLifecycleSmoke:

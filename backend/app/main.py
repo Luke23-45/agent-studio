@@ -134,6 +134,8 @@ async def lifespan(app: FastAPI):
     stream_buffer = init_stream_buffer(
         settings.REDIS_URL,
         ttl_seconds=settings.STREAM_BUFFER_TTL_SECONDS,
+        db=db,
+        overflow_max_chunks=settings.STREAM_BUFFER_OVERFLOW_CHUNKS,
     )
     end_user_limits = init_end_user_limits(
         settings.REDIS_URL,

@@ -299,6 +299,55 @@
         }
       }
     },
+    "/api/v1/tenants/{tenant_id}/deployment-shape": {
+      "put": {
+        "summary": "Set Tenant Deployment Shape",
+        "description": "Set the tenant's deployment shape (shared | dedicated) and return the\nresulting isolation config (P5-12).",
+        "operationId": "set_tenant_deployment_shape_api_v1_tenants__tenant_id__deployment_shape_put",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeploymentShapeRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/tenants/{tenant_id}/config-versions": {
       "post": {
         "summary": "Create Tenant Config Version",
@@ -353,7 +402,7 @@
     "/api/v1/tenants/{tenant_id}/config-versions/{version}/publish": {
       "post": {
         "summary": "Publish Tenant Config Version",
-        "description": "Publish a draft (or re-promote any version); supersedes the old one.\n\nRuntime behavior switches on the next request; in-memory caches are\ninvalidated and an audit event is recorded.",
+        "description": "Publish a draft (or re-promote any version); supersedes the old one.\n\nGated on the P5-2 pipeline: a version that failed validation or its eval\nsuite cannot be promoted. ``canary_percent`` (0-100) turns the publish\ninto a canary rollout \u2014 the previous published version stays live as the\nbaseline and the runtime serves the canary to a deterministic slice of\nrequest traffic. Runtime behavior switches on the next request; in-memory\ncaches are invalidated and an audit event is recorded.",
         "operationId": "publish_tenant_config_version_api_v1_tenants__tenant_id__config_versions__version__publish_post",
         "parameters": [
           {
@@ -373,6 +422,144 @@
             "schema": {
               "type": "integer",
               "title": "Version"
+            }
+          },
+          {
+            "name": "canary_percent",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 100,
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Canary Percent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigVersionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/config-versions/{version}/evaluate": {
+      "post": {
+        "summary": "Evaluate Tenant Config Version",
+        "description": "Record an eval-suite result on a draft (P5-2 pipeline, P6-6 slot).\n\nA failing suite blocks promotion at the publish gate; the result and\nper-metric details are retained on the immutable version record for the\naudit trail.",
+        "operationId": "evaluate_tenant_config_version_api_v1_tenants__tenant_id__config_versions__version__evaluate_post",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Version"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConfigEvalRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigVersionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/config-versions/{version}/auto-rollback": {
+      "post": {
+        "summary": "Auto Rollback Tenant Config Version",
+        "description": "Auto-rollback on regression (P5-2): re-promote the prior version.\n\nMarks the failing published version ``regressed`` (a failed eval gate \u2014\nit cannot be re-promoted until re-validated) and fully re-publishes the\npreviously live version. Mirrors a canary watchdog firing on error-rate\nregression.",
+        "operationId": "auto_rollback_tenant_config_version_api_v1_tenants__tenant_id__config_versions__version__auto_rollback_post",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Version"
+            }
+          },
+          {
+            "name": "reason",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "eval regression",
+              "title": "Reason"
             }
           }
         ],
@@ -506,6 +693,308 @@
             }
           }
         ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/onboard": {
+      "post": {
+        "summary": "Onboard Tenant",
+        "description": "Run the onboarding checklist (P5-10): default deny-by-default surface,\nisolation namespaces/prefixes, budget defaults, tenant-bound operator key.\n\nIdempotent: steps already provisioned are reported as such. The raw\noperator key is returned exactly once, on first creation.",
+        "operationId": "onboard_tenant_api_v1_tenants__tenant_id__onboard_post",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/onboarding": {
+      "get": {
+        "summary": "Get Onboarding Checklist",
+        "description": "Report the onboarding checklist state for a tenant (P5-10).",
+        "operationId": "get_onboarding_checklist_api_v1_tenants__tenant_id__onboarding_get",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/metrics": {
+      "get": {
+        "summary": "Get Tenant Metrics",
+        "description": "Tenant-scoped metrics (P5-10): conversations, messages, end users,\nescalations, governance evidence, webhook deliveries.",
+        "operationId": "get_tenant_metrics_api_v1_tenants__tenant_id__metrics_get",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/end-users/{end_user_id}/export": {
+      "get": {
+        "summary": "Export End User Data",
+        "description": "DSR export: portable JSON bundle of one end user's data.",
+        "operationId": "export_end_user_data_api_v1_tenants__tenant_id__end_users__end_user_id__export_get",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "name": "end_user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "End User Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/end-users/{end_user_id}/data": {
+      "delete": {
+        "summary": "Erase End User Data",
+        "description": "DSR erasure: delete one end user's data and revoke their sessions.",
+        "operationId": "erase_end_user_data_api_v1_tenants__tenant_id__end_users__end_user_id__data_delete",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "name": "end_user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "End User Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/compliance": {
+      "get": {
+        "summary": "Get Compliance Posture",
+        "description": "Compliance posture (P5-11): Art. 50 disclosure metadata + the\nre-verification checklist as of the last verification date.",
+        "operationId": "get_compliance_posture_api_v1_tenants__tenant_id__compliance_get",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/tenants/{tenant_id}/compliance/incidents": {
+      "post": {
+        "summary": "Report Compliance Incident",
+        "description": "Art. 73 incident reporting hook (P5-11): record the incident on the\nimmutable audit trail.",
+        "operationId": "report_compliance_incident_api_v1_tenants__tenant_id__compliance_incidents_post",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ComplianceIncidentRequest"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -2345,6 +2834,61 @@
         "title": "AuditEventResponse",
         "description": "Response model for audit events."
       },
+      "ComplianceIncidentRequest": {
+        "properties": {
+          "severity": {
+            "type": "string",
+            "pattern": "^(low|medium|high|critical)$",
+            "title": "Severity",
+            "default": "medium"
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Description"
+          }
+        },
+        "type": "object",
+        "required": [
+          "description"
+        ],
+        "title": "ComplianceIncidentRequest",
+        "description": "Art. 73 incident-reporting hook request (P5-11)."
+      },
+      "ConfigEvalRequest": {
+        "properties": {
+          "suite": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Suite",
+            "default": "config"
+          },
+          "passed": {
+            "type": "boolean",
+            "title": "Passed"
+          },
+          "details": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Details"
+          }
+        },
+        "type": "object",
+        "required": [
+          "passed"
+        ],
+        "title": "ConfigEvalRequest",
+        "description": "Eval-suite result on a draft (P5-2 pipeline; P6-6 slot)."
+      },
       "ConfigVersionRequest": {
         "properties": {
           "config": {
@@ -2373,6 +2917,27 @@
           "status": {
             "type": "string",
             "title": "Status"
+          },
+          "validation_status": {
+            "type": "string",
+            "title": "Validation Status",
+            "default": ""
+          },
+          "eval_status": {
+            "type": "string",
+            "title": "Eval Status",
+            "default": ""
+          },
+          "canary_percent": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Canary Percent"
           },
           "published_at": {
             "anyOf": [
@@ -2498,6 +3063,20 @@
         ],
         "title": "ConversationResponse",
         "description": "Response model for conversation endpoint."
+      },
+      "DeploymentShapeRequest": {
+        "properties": {
+          "dedicated": {
+            "type": "boolean",
+            "title": "Dedicated"
+          }
+        },
+        "type": "object",
+        "required": [
+          "dedicated"
+        ],
+        "title": "DeploymentShapeRequest",
+        "description": "Opt a tenant into a dedicated deployment shape (P5-12).\n\nDedicated = own DB/vector/gateway behind the same shared control plane.\nIt is a configuration choice, never a code fork."
       },
       "DocumentIngestRequest": {
         "properties": {
@@ -3421,6 +4000,29 @@
             "minimum": 0.0,
             "title": "Escalation Threshold",
             "default": 0.7
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "retention_days": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Days"
           }
         },
         "type": "object",
@@ -3462,6 +4064,28 @@
           "escalation_threshold": {
             "type": "number",
             "title": "Escalation Threshold"
+          },
+          "region": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Region"
+          },
+          "retention_days": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Retention Days"
           }
         },
         "type": "object",

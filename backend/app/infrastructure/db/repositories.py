@@ -6,12 +6,14 @@ work both inside a request and from fire-and-forget background tasks.
 All methods return plain dicts to avoid leaking ORM objects.
 """
 
-import structlog
+import hashlib
+import json
 from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import delete, func, select, update
+import structlog
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from .manager import DatabaseManager
@@ -31,15 +33,18 @@ from .models import (
     SessionTokenModel,
     SpendEventModel,
     SurfaceModel,
-    TenantModel,
     TenantConfigVersionModel,
+    TenantModel,
     TenantProviderKeyModel,
+    ToolRegistryModel,
     WebhookDeliveryModel,
     WebhookEventModel,
     WebhookSubscriptionModel,
 )
 
 logger = structlog.get_logger(__name__)
+
+from backend.app.governance.promotion import VALIDATION_REGRESSED, canary_bucket
 
 
 def _now() -> datetime:
@@ -115,13 +120,17 @@ class ConversationRepository:
             )
             row = result.scalar_one_or_none()
             if row:
-                return _row_to_dict(row)
+                data = _row_to_dict(row)
+                data["created"] = False
+                return data
             model = ConversationModel(
                 id=str(uuid4()), tenant_id=tenant_id, session_id=session_id
             )
             session.add(model)
             await session.flush()
-            return _row_to_dict(model)
+            data = _row_to_dict(model)
+            data["created"] = True
+            return data
 
     async def add_message(
         self,
@@ -236,6 +245,35 @@ class ConversationRepository:
             )
             return (message_result.rowcount or 0) + (conv_deleted.rowcount or 0)
 
+    async def list_messages_by_end_user(
+        self, tenant_id: str, end_user_id: str, limit: int = 10000
+    ) -> list[dict[str, Any]]:
+        """Return the messages authored by one end user (DSR export)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(MessageModel)
+                .where(
+                    MessageModel.tenant_id == tenant_id,
+                    MessageModel.end_user_id == end_user_id,
+                )
+                .order_by(MessageModel.created_at)
+                .limit(limit)
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def delete_messages_by_end_user(
+        self, tenant_id: str, end_user_id: str
+    ) -> int:
+        """Hard-delete messages authored by one end user (DSR erasure)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                delete(MessageModel).where(
+                    MessageModel.tenant_id == tenant_id,
+                    MessageModel.end_user_id == end_user_id,
+                )
+            )
+            return result.rowcount or 0
+
 
 class EvidenceRepository:
     def __init__(self, db: DatabaseManager):
@@ -267,8 +305,79 @@ class EvidenceRepository:
 
 
 class AuditRepository:
+    """Immutable, tamper-evident admin audit trail (P5-9).
+
+    Rows are append-only: there is no update/delete surface. Every row
+    stores ``event_hash`` (SHA-256 of the previous hash + this row's
+    canonical content); ``verify_chain`` recomputes the chain so tampering
+    is detected. Rows predating the chain schema carry NULL hashes and are
+    treated as unverifiable legacy entries (the chain starts at the first
+    hashed row).
+    """
+
     def __init__(self, db: DatabaseManager):
         self.db = db
+
+    @staticmethod
+    def _canonical_json(value: Any) -> str:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+    @staticmethod
+    def _utc_iso(value: datetime) -> str:
+        """Canonical instant: tz-normalized so an aware insert-time datetime
+        and its naive (SQLite) read-back produce the same digest."""
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+
+    def _compute_hash(
+        self,
+        *,
+        prev_hash: str | None,
+        event_id: str,
+        tenant_id: str | None,
+        actor_type: str,
+        actor_id: str | None,
+        action: str,
+        resource_type: str,
+        resource_id: str | None,
+        details: dict[str, Any],
+        created_at: datetime,
+    ) -> str:
+        parts = [
+            prev_hash or "",
+            event_id,
+            tenant_id or "",
+            actor_type,
+            actor_id or "",
+            action,
+            resource_type,
+            resource_id or "",
+            self._canonical_json(details),
+            self._utc_iso(created_at),
+        ]
+        return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
+
+    async def _previous_hash(self, event_id: str, created_at: datetime) -> str | None:
+        """Hash of the immediate predecessor in canonical (created_at, id)
+        order — the same order ``verify_chain`` walks, so timestamp ties can
+        never desynchronize the chain."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(AuditEventModel.event_hash)
+                .where(
+                    or_(
+                        AuditEventModel.created_at < created_at,
+                        and_(
+                            AuditEventModel.created_at == created_at,
+                            AuditEventModel.id < event_id,
+                        ),
+                    )
+                )
+                .order_by(AuditEventModel.created_at.desc(), AuditEventModel.id.desc())
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
 
     async def add(
         self,
@@ -280,9 +389,24 @@ class AuditRepository:
         actor_id: str | None = None,
         details: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        event_id = str(uuid4())
+        created_at = _now()
+        prev_hash = await self._previous_hash(event_id, created_at)
+        event_hash = self._compute_hash(
+            prev_hash=prev_hash,
+            event_id=event_id,
+            tenant_id=tenant_id,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            action=action,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            details=details or {},
+            created_at=created_at,
+        )
         async with self.db.get_session() as session:
             model = AuditEventModel(
-                id=str(uuid4()),
+                id=event_id,
                 tenant_id=tenant_id,
                 actor_type=actor_type,
                 actor_id=actor_id,
@@ -290,6 +414,9 @@ class AuditRepository:
                 resource_type=resource_type,
                 resource_id=resource_id,
                 details=details or {},
+                prev_hash=prev_hash,
+                event_hash=event_hash,
+                created_at=created_at,
             )
             session.add(model)
             await session.flush()
@@ -304,6 +431,47 @@ class AuditRepository:
                 stmt = stmt.where(AuditEventModel.tenant_id == tenant_id)
             result = await session.execute(stmt.order_by(AuditEventModel.created_at.desc()).limit(limit))
             return [_row_to_dict(r) for r in result.scalars()]
+
+    async def verify_chain(self, tenant_id: str | None = None) -> tuple[bool, str | None]:
+        """Recompute the hash chain over the trail.
+
+        Returns ``(ok, broken_at)``: ``ok`` is False when a hashed row does
+        not match its recomputed hash; ``broken_at`` is the id of the first
+        bad row (None when the chain is intact or has no hashed rows).
+        """
+        async with self.db.get_session() as session:
+            stmt = select(AuditEventModel)
+            if tenant_id:
+                stmt = stmt.where(AuditEventModel.tenant_id == tenant_id)
+            rows = (
+                await session.execute(
+                    stmt.order_by(AuditEventModel.created_at.asc(), AuditEventModel.id.asc())
+                )
+            ).scalars().all()
+
+        prev_hash: str | None = None
+        for row in rows:
+            if row.event_hash is None:
+                # legacy row: predates the chain schema; does not break it,
+                # but a chained row must never follow an unverified one.
+                prev_hash = None
+                continue
+            expected = self._compute_hash(
+                prev_hash=prev_hash,
+                event_id=row.id,
+                tenant_id=row.tenant_id,
+                actor_type=row.actor_type,
+                actor_id=row.actor_id,
+                action=row.action,
+                resource_type=row.resource_type,
+                resource_id=row.resource_id,
+                details=row.details,
+                created_at=row.created_at,
+            )
+            if row.event_hash != expected:
+                return False, row.id
+            prev_hash = row.event_hash
+        return True, None
 
 
 class ApiKeyRepository:
@@ -579,19 +747,33 @@ class TenantConfigVersionRepository:
             await session.flush()
             return _row_to_dict(model)
 
-    async def promote(
-        self, tenant_id: str, version: int, promoted_by: str | None = None
-    ) -> dict[str, Any] | None:
-        """Publish/rollback: promote a version, supersede the previous one."""
+    async def get(self, tenant_id: str, version: int) -> dict[str, Any] | None:
+        """Return one version by number (any status)."""
         async with self.db.get_session() as session:
-            await session.execute(
-                update(TenantConfigVersionModel)
-                .where(
+            result = await session.execute(
+                select(TenantConfigVersionModel).where(
                     TenantConfigVersionModel.tenant_id == tenant_id,
-                    TenantConfigVersionModel.status == self.STATUS_PUBLISHED,
+                    TenantConfigVersionModel.version == version,
                 )
-                .values(status=self.STATUS_SUPERSEDED)
             )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def set_validation(
+        self,
+        tenant_id: str,
+        version: int,
+        validation_status: str,
+        by: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Record the pipeline evaluation result (P5-2).
+
+        ``validation_status`` is one of "" (not yet), "validated" (schema +
+        compile passed) or "failed". Passing also stores the approver --
+        the ``by`` is the acting principal. The `approval` step is a second
+        explicit call (approval is separate from the eval gate).
+        """
+        async with self.db.get_session() as session:
             result = await session.execute(
                 select(TenantConfigVersionModel).where(
                     TenantConfigVersionModel.tenant_id == tenant_id,
@@ -601,11 +783,213 @@ class TenantConfigVersionRepository:
             row = result.scalar_one_or_none()
             if row is None:
                 return None
+            row.validation_status = validation_status
+            row.validated_at = _now()
+            _ = by  # caller records the audit event; column is promoted_by
+            await session.flush()
+            return _row_to_dict(row)
+
+    async def approve(
+        self, tenant_id: str, version: int, approved_by: str | None = None
+    ) -> dict[str, Any] | None:
+        """Record privileged-change approval (P5-2 approvals, audited)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(TenantConfigVersionModel).where(
+                    TenantConfigVersionModel.tenant_id == tenant_id,
+                    TenantConfigVersionModel.version == version,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            row.approved_by = approved_by
+            row.approved_at = _now()
+            await session.flush()
+            return _row_to_dict(row)
+
+    async def promote(
+        self,
+        tenant_id: str,
+        version: int,
+        promoted_by: str | None = None,
+        canary_percent: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Publish/rollback: promote a version, supersede the previous one.
+
+        A canary rollout (``0 < canary_percent < 100``) keeps the currently
+        published version live as the baseline so ``get_effective`` can split
+        request traffic deterministically; a full rollout (100/None) supersedes
+        the previous published version outright.
+        """
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(TenantConfigVersionModel).where(
+                    TenantConfigVersionModel.tenant_id == tenant_id,
+                    TenantConfigVersionModel.version == version,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            if canary_percent is None or canary_percent >= 100:
+                # Full rollout: the previous published version is superseded.
+                await session.execute(
+                    update(TenantConfigVersionModel)
+                    .where(
+                        TenantConfigVersionModel.tenant_id == tenant_id,
+                        TenantConfigVersionModel.status == self.STATUS_PUBLISHED,
+                    )
+                    .values(status=self.STATUS_SUPERSEDED)
+                )
+            # Canary rollout: baseline is left published; it is the version
+            # get_previous_published() picks up for the non-canary slice.
             row.status = self.STATUS_PUBLISHED
             row.published_at = _now()
             row.promoted_by = promoted_by
+            if canary_percent is not None and canary_percent < 100:
+                row.canary_percent = canary_percent
+            else:
+                row.canary_percent = None
             await session.flush()
             return _row_to_dict(row)
+
+    async def get_previous_published(
+        self, tenant_id: str, before_version: int
+    ) -> dict[str, Any] | None:
+        """The version that was live before ``before_version`` was promoted.
+
+        Baseline for canary rollouts: with a canary active, the previous
+        published row is kept (not superseded), so it is discoverable here.
+        After a full rollout it is superseded and also returned, enabling
+        auto-rollback after a full publish too.
+        """
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(TenantConfigVersionModel)
+                .where(
+                    TenantConfigVersionModel.tenant_id == tenant_id,
+                    TenantConfigVersionModel.status.in_(
+                        [self.STATUS_PUBLISHED, self.STATUS_SUPERSEDED]
+                    ),
+                    TenantConfigVersionModel.version != before_version,
+                )
+                .order_by(TenantConfigVersionModel.version.desc())
+                .limit(1)
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def get_effective(
+        self, tenant_id: str, request_key: str | None = None
+    ) -> dict[str, Any] | None:
+        """Runtime read: the published version to serve for ``request_key``.
+
+        A canary rollout (<100) serves the canary to the deterministic slice
+        (P5-2 ``canary_bucket``) and the previous published version to the
+        remainder. Without a key (background workers) or at full rollout the
+        latest published version is always returned.
+        """
+        latest = await self.get_latest_published(tenant_id)
+        if latest is None:
+            return None
+        percent = latest.get("canary_percent")
+        if percent is None or percent >= 100:
+            return latest
+        if request_key and not canary_bucket(request_key, percent):
+            baseline = await self.get_previous_published(tenant_id, latest["version"])
+            if baseline:
+                return baseline
+        return latest
+
+    async def set_eval_result(
+        self,
+        tenant_id: str,
+        version: int,
+        eval_status: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Record the eval-suite result (P6-6 slot) on a draft.
+
+        A failing suite blocks promotion at the publish gate; details carry
+        per-metric evidence for the audit trail.
+        """
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(TenantConfigVersionModel).where(
+                    TenantConfigVersionModel.tenant_id == tenant_id,
+                    TenantConfigVersionModel.version == version,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            row.eval_status = eval_status
+            row.eval_details = details
+            await session.flush()
+            return _row_to_dict(row)
+
+    async def auto_rollback(
+        self,
+        tenant_id: str,
+        failing_version: int,
+        reason: str,
+        rolled_back_by: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Regression-triggered rollback (P5-2): re-promote the prior version.
+
+        Marks the failing version ``validation_status="regressed"`` (a failed
+        eval gate — it can never be promoted again until re-validated) and
+        records the regression evidence, then does a full rollout of the
+        previously live version.
+        """
+        async with self.db.get_session() as session:
+            failing = (
+                await session.execute(
+                    select(TenantConfigVersionModel).where(
+                        TenantConfigVersionModel.tenant_id == tenant_id,
+                        TenantConfigVersionModel.version == failing_version,
+                    )
+                )
+            ).scalar_one_or_none()
+            if failing is None or failing.status != self.STATUS_PUBLISHED:
+                return None
+            previous_row = await session.execute(
+                select(TenantConfigVersionModel)
+                .where(
+                    TenantConfigVersionModel.tenant_id == tenant_id,
+                    TenantConfigVersionModel.status.in_(
+                        [self.STATUS_PUBLISHED, self.STATUS_SUPERSEDED]
+                    ),
+                    TenantConfigVersionModel.version != failing_version,
+                )
+                .order_by(TenantConfigVersionModel.version.desc())
+                .limit(1)
+            )
+            previous = previous_row.scalar_one_or_none()
+            if previous is None:
+                return None
+            failing.validation_status = VALIDATION_REGRESSED
+            failing.eval_details = {
+                **(failing.eval_details or {}),
+                "regression": reason,
+                "auto_rolled_back_at": _now().isoformat(),
+            }
+            await session.execute(
+                update(TenantConfigVersionModel)
+                .where(
+                    TenantConfigVersionModel.tenant_id == tenant_id,
+                    TenantConfigVersionModel.status == self.STATUS_PUBLISHED,
+                )
+                .values(status=self.STATUS_SUPERSEDED)
+            )
+            previous.status = self.STATUS_PUBLISHED
+            previous.published_at = _now()
+            previous.canary_percent = None
+            if rolled_back_by:
+                previous.promoted_by = rolled_back_by
+            await session.flush()
+            return _row_to_dict(previous)
 
 
 class TenantProviderKeyRepository:
@@ -834,6 +1218,31 @@ class EndUserRepository:
             await session.flush()
             return _row_to_dict(model)
 
+    async def list_by_tenant(self, tenant_id: str, limit: int = 1000) -> list[dict[str, Any]]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(EndUserModel)
+                .where(EndUserModel.tenant_id == tenant_id)
+                .order_by(EndUserModel.created_at.desc())
+                .limit(limit)
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def set_status(
+        self, tenant_id: str, end_user_id: str, status: str
+    ) -> bool:
+        """Mark an end user's durable status (e.g. ``erased``/``suspended``)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                update(EndUserModel)
+                .where(
+                    EndUserModel.tenant_id == tenant_id,
+                    EndUserModel.id == end_user_id,
+                )
+                .values(status=status)
+            )
+            return (result.rowcount or 0) > 0
+
 
 class SessionTokenRepository:
     """Durable session-token registry (Arch 6.4, P1-8)."""
@@ -891,6 +1300,20 @@ class SessionTokenRepository:
                     SessionTokenModel.expires_at < before,
                     SessionTokenModel.revoked_at.is_not(None),
                 )
+            )
+            return result.rowcount or 0
+
+    async def revoke_all_for_end_user(self, tenant_id: str, end_user_id: str) -> int:
+        """Revoke every live session token for one end user (DSR erasure)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                update(SessionTokenModel)
+                .where(
+                    SessionTokenModel.tenant_id == tenant_id,
+                    SessionTokenModel.end_user_id == end_user_id,
+                    SessionTokenModel.revoked_at.is_(None),
+                )
+                .values(revoked_at=_now())
             )
             return result.rowcount or 0
 
@@ -1000,6 +1423,84 @@ class SurfaceRepository:
                 )
             )
             return (result.rowcount or 0) > 0
+
+
+class ToolRegistryRepository:
+    """Per-tenant tool registry (Arch 14, P5-3).
+
+    Tools are disabled unless explicitly enabled and authorized for a
+    surface. ``enabled_map`` is the authoritative snapshot the tool gate
+    reads for a request.
+    """
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def list_by_tenant(self, tenant_id: str) -> list[dict[str, Any]]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(ToolRegistryModel)
+                .where(ToolRegistryModel.tenant_id == tenant_id)
+                .order_by(ToolRegistryModel.created_at.asc())
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def get(self, tenant_id: str, name: str) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(ToolRegistryModel).where(
+                    ToolRegistryModel.tenant_id == tenant_id,
+                    ToolRegistryModel.name == name,
+                )
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def enabled_map(self, tenant_id: str) -> dict[str, bool]:
+        """name -> enabled for every registered tool (authoritative gate)."""
+        tools = await self.list_by_tenant(tenant_id)
+        return {t["name"]: bool(t["enabled"]) for t in tools}
+
+    async def register(
+        self,
+        tenant_id: str,
+        name: str,
+        *,
+        description: str | None = None,
+        schema: dict[str, Any] | None = None,
+        enabled: bool = False,
+        auth_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        async with self.db.get_session() as session:
+            model = ToolRegistryModel(
+                id=str(uuid4()),
+                tenant_id=tenant_id,
+                name=name,
+                description=description,
+                schema=schema or {"type": "object"},
+                enabled=enabled,
+                auth_config=auth_config,
+            )
+            session.add(model)
+            await session.flush()
+            return _row_to_dict(model)
+
+    async def set_enabled(
+        self, tenant_id: str, name: str, enabled: bool
+    ) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(ToolRegistryModel).where(
+                    ToolRegistryModel.tenant_id == tenant_id,
+                    ToolRegistryModel.name == name,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            row.enabled = bool(enabled)
+            await session.flush()
+            return _row_to_dict(row)
 
 
 class PolicyRepository:
@@ -1134,6 +1635,9 @@ class WebhookRepository:
         self, event_id: str, tenant_id: str, event_type: str, payload: dict[str, Any]
     ) -> dict[str, Any]:
         async with self.db.get_session() as session:
+            existing = await session.get(WebhookEventModel, event_id)
+            if existing is not None:
+                return _row_to_dict(existing)
             model = WebhookEventModel(
                 id=event_id,
                 tenant_id=tenant_id,

@@ -15,6 +15,7 @@ from .repositories import (
     TenantConfigVersionRepository,
     TenantProviderKeyRepository,
     TenantRepository,
+    ToolRegistryRepository,
     WebhookRepository,
 )
 from .memory import MemoryRepository
@@ -40,6 +41,7 @@ __all__ = [
     "TenantConfigVersionRepository",
     "TenantProviderKeyRepository",
     "TenantRepository",
+    "ToolRegistryRepository",
     "WebhookRepository",
     "ThreadRepository",
     "MemoryRepository",

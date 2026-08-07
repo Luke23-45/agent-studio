@@ -13,7 +13,7 @@ import structlog
 from typing import Any, Sequence
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
 
 from backend.app.context import TOOL_RESULT_PLACEHOLDER
@@ -153,6 +153,17 @@ class ThreadRepository:
             stmt = stmt.order_by(ThreadModel.created_at.desc()).limit(limit)
             result = await session.execute(stmt)
             return [_row_to_dict(r) for r in result.scalars()]
+
+    async def delete_by_end_user(self, tenant_id: str, end_user_id: str) -> int:
+        """Hard-delete threads for one end user (DSR erasure)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                delete(ThreadModel).where(
+                    ThreadModel.tenant_id == tenant_id,
+                    ThreadModel.end_user_id == end_user_id,
+                )
+            )
+            return result.rowcount or 0
 
     # ---- append path ------------------------------------------------------
 

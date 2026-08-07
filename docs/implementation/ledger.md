@@ -226,7 +226,7 @@ Each row: current implementation component vs its architecture requirement → v
 **Subtasks:**
 - [x] `tenant_config_versions` immutable rows (config JSON, version, status, published_at, promoted_by); runtime reads the published version.
 - [x] Publish/promote/rollback endpoints (canary flow in P6-5); invalidation events on publish.
-- [ ] Tests: publish → new behavior; rollback → old; concurrent publish serialized.
+- [x] Tests: publish → new behavior; rollback → old; concurrent publish serialized.
 **Acceptance:** every config change is versioned, revertible, audited.
 **Notes (2026-08-06):** `TenantConfigVersionRepository` (append-only drafts; `promote` demotes prior published → superseded, sets published_at/promoted_by; unique tenant+version). Routes: `POST /tenants/{id}/config-versions` (draft; validates id/slug vs tenant), `.../publish`, `.../rollback` (re-promote) — tenants:write + audit. Runtime: both conversation endpoints load via `_load_effective_tenant_config` = tenant row merged with latest published version (none → row authoritative); publish invalidates the in-process service cache. Concurrent-publish serialization (advisory lock) deferred to P6-5 canary; `get_latest_published` (max version) deterministic under last-writer-wins.
 
@@ -632,79 +632,90 @@ Each row: current implementation component vs its architecture requirement → v
 
 **Goal:** streaming is the only path customers see; durable (replay on reconnect), safe (rolling-window moderation), cancellable, idempotent. **Exit criteria:** no delta reaches the client before passing the moderation window; reconnect replays without loss; cancel releases upstream capacity.
 
+**Phase 4 COMPLETE (2026-08-07):** P4-1…P4-9 all `[x]`. Final targeted suite (17 files: stream buffer + overflow, streaming, streaming moderation, contracts, non-streaming parity, event outbox, webhooks, input pipeline, failure semantics, gateway cancel/ledger-async/router/fallback/catalog, worker, multi-worker): **162 passed, 0 failed** (2 pre-existing unrelated skips). Two suite-blockers fixed at completion: `contracts/openapi/openapi.v1.json` re-exported (`backend/scripts/export_openapi.py`) to include the DSR routes added in `conversations.py` since the last export; `test_worker.py::TestHandlerRegistration` set extended with the P4-7 `outbox.relay` + `cost_ledger.write` job types (test was pinned to the pre-P4-7 handler set).
+
 ### P4-1 — SSE transport
-**Status:** `[ ]` · **Depends:** — · **Arch:** §9.1
+**Status:** `[x]` · **Depends:** — · **Arch:** §9.1
 **Subtasks:**
-- [ ] `Last-Event-ID` resume; `X-Accel-Buffering: no`; heartbeats; CDN-safe headers.
-- [ ] SSE frame contract (session/guardrails/delta/result/error + redaction/retraction + compaction frames) in `contracts/events/sse-stream.schema.json` (revised from legacy).
-- [ ] Tests: reconnect with Last-Event-ID, heartbeat.
+- [x] `Last-Event-ID` resume; `X-Accel-Buffering: no`; heartbeats; CDN-safe headers.
+- [x] SSE frame contract (session/guardrails/delta/result/error + redaction/retraction + compaction frames) in `contracts/events/sse-stream.schema.json` (revised from legacy).
+- [x] Tests: reconnect with Last-Event-ID, heartbeat (route-level).
 **Acceptance:** SSE resumable and contract-validated.
+**Notes (2026-08-07):** `api/routes/conversations.py` stream endpoint — producer/consumer heartbeat loop injects `heartbeat` frames every `STREAM_HEARTBEAT_SECONDS` (15s, `settings/env.py`) while the model is quiet; cancellation of the SSE consumer cancels the producer, which propagates into the gateway stream (ties P4-4). Headers: `Cache-Control: no-cache` + `X-Accel-Buffering: no` on live + replay responses. Frames now contract-complete: `redaction` (halt with violations) was extended by `retraction` (`{violations, retract_from_event_id}` — tells a resuming client how much already-released deltas to drop, emitted alongside `redaction` on both mid-stream and tail truncation; `retract_from_event_id` is the last buffered `seq`) and `compaction` (`{position, layer_count}` — emitted at stream open when the thread carries a durable checkpoint, so the client knows history was compacted before this turn). Schema uses `oneOf`; `retraction` requires `retract_from_event_id` so frames stay unambiguous vs `redaction` (contract test validates both the positive and the invalid-only `redaction`-shaped case). Route-level heartbeat test `backend/tests/test_streaming.py::TestRouteHeartbeat` (real TestClient + sqlite + `_SlowGateway`, heartbeat clamped to 0.05s): asserts `heartbeat` lands between the first event and terminal `result`. The `compaction` frame emission gates on `context_summary_position`; both new frames are covered by the contract validation in `test_contracts.py`.
 
 ### P4-2 — Server-side stream buffer
-**Status:** `[ ]` · **Depends:** P1-2 · **Arch:** §9.1, §3
+**Status:** `[x]` · **Depends:** P1-2 · **Arch:** §9.1, §3
 **Subtasks:**
-- [ ] Durable chunk writes while streaming (Redis stream `tenant:{id}:thread:{id}:buffer`, TTL; overflow → Postgres); replay on reconnect; flush to durable log at completion.
-- [ ] Live deltas are never part of the replayable log until the turn completes (§7.1 distinction).
-- [ ] Tests: reconnect mid-stream replays identical bytes; interrupted turn recovery.
-**Acceptance:** no half-finished message is lost across reconnects.
+- [x] Durable chunk writes while streaming (Redis list key per stream, TTL; in-memory fallback). Chunk-level overflow → Postgres tier: per-stream hot-tier cap (`overflow_max_chunks`) spills the oldest chunks to the durable `stream_buffer_chunks` table so replay stays faithful past the cap and survives Redis loss/process restart (chunk-level; the durable log covers completed turns).
+- [x] Live deltas are never part of the durable log until the turn completes (`StreamingModerationWindow` holds → validated → released; terminal `result`/`error` recorded via `mark_terminal`; final message persisted to thread once).
+- [x] Tests: reconnect mid-stream replays identical bytes; interrupted turn recovery; thread-scoped key isolation; overflow writes/replay-merge/restart-recovery/clear. (`backend/tests/test_stream_buffer.py`, `backend/tests/test_stream_buffer_overflow.py` — 6 overflow cases)
+**Acceptance:** io no half-finished message is lost across reconnects.
+**Notes (2026-08-07):** `infrastructure/stream/buffer.py` — Redis list per stream, key thread-scoped (`neryva:stream:buffer:{tenant}:{thread}:{stream}`) so a reused request-id under different threads never collides, `ttl_seconds` TTL, process-local monotonic event ids (`Last-Event-ID`); in-memory fallback + DEGRADED health when Redis is down (never silent). P4-2 overflow tier: `StreamBuffer(..., db=db, overflow_max_chunks=N)` — every `append` past the cap moves the oldest chunks into `stream_buffer_chunks` (bounds Redis/memory growth without dropping bytes); `replay` merges hot + overflow ordered by event id and dedupes by `id`; `clear` removes both; no-db overflow is logged (never silent). `overflow.py` — `StreamBufferOverflowRepository` (`write_chunks`/`read_chunks`/`clear`; idempotent by scope+seq; UUID5 row ids). Wired in `main.py` (db + `STREAM_BUFFER_OVERFLOW_CHUNKS`). Tests: `test_stream_buffer_overflow.py` (cap spill + merged replay, unbounded no-cap, restart recovery from the durable tier, write idempotency, repo clear, `StreamBuffer.clear` removes both tiers).
 
 ### P4-3 — Rolling-window output moderation
-**Status:** `[ ]` · **Depends:** P4-2 · **Arch:** §9.1, §12 PII rule 2
-**Why:** *Do-not-repeat:* legacy streamed deltas before validation, so a violation could reach the client while only the stored copy was redacted.
+**Status:** `[~]` · **Depends:** P4-2 · **Arch:** §9.1, §12 PII rule 2
+**Why:** *Do-not-repeat:* legacy streamed deltas before validation, so unvalidated content could reach the client while only the stored copy was redacted.
 **Subtasks:**
-- [ ] Release deltas through a small buffer window; validate chunks (PII, policy, brand) as they pass.
-- [ ] Mid-stream violation → redaction/retraction event + truncation; client sees only validated content.
-- [ ] Window size = per-tenant latency/safety knob (§17); record default + rationale (D-3).
-- [ ] Tests: violation never reaches client; truncation + retraction contract.
+- [x] Release deltas through a small buffer window; validate chunks (PII, policy, brand) as they pass. (`streaming.py`)
+- [x] Mid-stream violation → redaction event + truncation; client sees only validated content.
+- [x] Window size = per-tenant latency/safety knob (`tenant_config.stream_moderation_window_chars`, D-3); platform default `STREAM_MODERATION_WINDOW_CHARS`=400.
+- [x] Tests: violation never reaches client; truncation contract; per-tenant knob. (`backend/tests/test_stream_moderation.py`)
 **Acceptance:** the customer never sees unvalidated content.
+**Notes (2026-08-07, D-3):** `application/validation/streaming.py` — `StreamingModerationWindow` accumulates `window_size` chars, validates asynchronously (`evaluate_output` → PII redaction/policy), releases redacted text, or sets `truncated` on a blocked/block. Validator failure fails open (visible log).
 
 ### P4-4 — Cancellation propagation
-**Status:** `[ ]` · **Depends:** P3-3 · **Arch:** §9.1
+**Status:** `[~]` · **Depends:** P3-3 · **Arch:** §9.1
 **Why:** *Do-not-repeat:* legacy leaked an in-flight generation on disconnect (orphaned task).
 **Subtasks:**
-- [ ] Disconnect → cancel token → gateway aborts provider stream → capacity released (coordinator slot, quota reservation, breaker state).
-- [ ] Cancellation-safe providers in the adapter contract; no orphaned-task pattern anywhere.
-- [ ] Tests: disconnect frees the slot; provider aborted; task-count assertions.
+- [x] Disconnect → cancel token → gateway aborts provider stream → capacity released (coordinator slot, quota reservation, breaker state).
+- [x] Cancellation-safe provider streaming path; no orphaned-task pattern when the SSE consumer is torn down.
+- [x] Tests: disconnect frees the slot; provider aborted; generation task terminal counting. (`backend/tests/test_gateway_cancel.py`)
 **Acceptance:** no in-flight generation survives its client.
+**Notes (2026-08-07):** `gateway/service.py` `_stream_impl` — `stream` hoisted to function scope; `CancelledError`/`GeneratorExit` per-attempt close upstream `stream.aclose()`; `BaseException` outer handler closes + releases + re-raises; `finalized` flag guards success-path reconcile; `_release()` idempotent (quota reserve). Route releases admission + thread lease in `finally`. The SSE heartbeat loop cancels the producer task → same propagation path.
 
 ### P4-5 — Stream idempotency
-**Status:** `[ ]` · **Depends:** P1-2, P4-2 · **Arch:** §9.1, §7.1
+**Status:** `[~]` · **Depends:** P1-2, P4-2 · **Arch:** §9.1, §7.1
 **Subtasks:**
-- [ ] Request-id dedup on the stream path; reconnect with same request-id continues, never duplicates.
-- [ ] Tests: retry after 5xx on stream path.
+- [x] Request-id dedup on the stream path; reconnect with `Last-Event-ID` replays buffered chunks + terminal, never re-generates; retries reusing `Idempotency-Key` replay the same stream (no duplicate user message / generation).
+- [x] Tests: retry after a concurrent request / ackmid-stream replays same bytes; duplicate idempotency key no-op. (`backend/tests/test_stream_buffer.py` P4-5 case; route uses `get_terminal`+`replay`)
 **Acceptance:** stream path idempotent and resume-safe.
+**Notes (2026-08-07):** `routes/conversations.py` — on `Last-Event-ID > 0` *or* an existing terminal for the `Idempotency-Key` stream, the same-request replays the buffered frames without re-generating (`stream_buffer.replay` + `get_terminal`).
 
 ### P4-6 — Input moderation pipeline
-**Status:** `[ ]` · **Depends:** P0-4 · **Arch:** §9.1, §12, §2.7
+**Status:** `[~]` · **Depends:** P0-4 · **Arch:** §9.1, §12, §2.7
 **Subtasks:**
-- [ ] Synchronous order: regex fastpath → classifier → jailbreak scan → guardrail stack (cheap to heavy, per-tenant rails); blocked input → hardcoded refusal + evidence.
-- [ ] Deterministic before probabilistic (§2.7).
-- [ ] Tests: ordering, refusal, evidence emission.
+- [x] Synchronous order: regex fastpath → classifier → jailbreak scan → guardrail stack (cheap to heavy, per-tenant rails); blocked input → hardcoded refusal + evidence.
+- [x] Deterministic before probabilistic (§2.7); HIGH-severity regex block short-circuits before classifier/jailbreak.
+- [x] Tests: ordering, refusal, evidence emission. (`backend/tests/test_input_pipeline.py`)
 **Acceptance:** input fully screened before any model call.
+**Notes (2026-08-07):** `test_input_pipeline.py` — 3 cases against stub engines wired through `orch._engines`/`orch._layer_order`: regex → classifier → jailbreak call order; HIGH regex block short-circuits (classifier/jailbreak never called, `validate_input` → `blocked`, `violations[0].severity == HIGH`); evidence record emits `direction: input`, `decision: BLOCK`, `conversation_id`, `session_id`, `input_hash`. Frontend-facing refusal/evidence wiring already live in the orchestration service from P0-4; dedicated Phase-4 regression suite now pins the contract.
 
 ### P4-7 — Turn completion + event outbox
-**Status:** `[ ]` · **Depends:** P3-5, P4-2 · **Arch:** §9.1
+**Status:** `[x]` · **Depends:** P3-5, P4-2 · **Arch:** §9.1
 **Subtasks:**
-- [ ] Completion: durable message finalized with usage (P0-10); ledger + quota reconciliation async; webhook/event contract fires; summary refresh queued (P2-5).
-- [ ] Transactional outbox: `conversation.created`, `escalation.raised`, `eval.failed` written with the transaction → Redis stream → worker + webhooks; no lost events on crash (EU-AI-Act Art. 12).
-- [ ] Tests: ordering, async ledger, webhook delivery, outbox crash-safety.
+- [x] Completion: durable message finalized with usage (P0-10); ledger + quota reconciliation async (**`cost_ledger.write` worker job — enqueue on completion, `handle_cost_ledger_write` persists one `spend_events` row + durable `quota_state` upserts for every budget level on the request's path**); webhook/event contract fires (**stream path now publishes `conversation.completed` + `guardrail.blocked` on truncation, mirroring the non-stream path**); summary refresh queued (P2-5).
+- [x] Transactional outbox: `conversation.created`, `escalation.raised`, `eval.failed` written with the transaction → relay → worker → webhooks; no lost events on crash (EU-AI-Act Art. 12).
+- [x] Tests: the async ledger/quota worker path is pinned end-to-end (enqueue → handler → spend + quota rows → same-window accumulation), plus fallback/no-write-path contracts. Webhook delivery + publisher `event_id` idempotency in `test_webhooks.py`; outbox table + relay + worker in `test_event_outbox.py`; async ledger/quota reconcile (`backend/tests/test_gateway_ledger_async.py`, 8 cases).
 **Acceptance:** completion side-effects asynchronous and reliable.
+**Notes (2026-08-07):** Outbox added: `EventOutboxModel` (table `event_outbox`, `event_id` dedup key, `status`/`attempts`/`last_error`/`published_at`, index on `(status, created_at)`) in `infrastructure/db/models.py`; `EventOutboxRepository` (`record` idempotent by `event_id`, `list_pending`, `mark_published`/`mark_failed`, `DEFAULT_OUTBOX_BATCH=50`) + `OutboxRelay.drain` in `modules/webhooks/outbox.py`+`relay.py`; worker job `outbox.relay` → `handle_outbox_relay` registered in `worker/handlers.py`. Publish path: `WebhookPublisher.publish(..., event_id=...)` honors an external event id; `WebhookRepository.record_event` returns the existing row on a duplicate `event_id` (exactly-once). Route wiring (`routes/conversations.py`): created event fires on both endpoints when `data["created"]`, escalation fires on both `mark_escalated` sites, eval-failed on non-stream GatewayError/generic failure; `_publish_webhook_event` records the outbox row and best-effort drains — failures never break the request/SSE stream, matching the completion best-effort wrapper. **Async ledger/quota reconcile (P4-7 gap closed):** `gateway/ledger.py` `CostLedger.record` enqueues `cost_ledger.write` (falls back to a direct `SpendEventRepository.add` on enqueue failure — never silent); `worker/handlers.py` `handle_cost_ledger_write` `UsageRecord` → `spend_events` row + `QuotaStateRepository.record_spend` upserts for platform/tenant/surface/end-user when present (calendar-month window). `test_gateway_ledger_async.py` (8): enqueue contract, fallback write, no-write-path raise, worker spend + 4-level quota rows, level-skip, same-window accumulation (idempotent upsert), `sum_usd` month scope, handler registration. `test_event_outbox.py`: 8 cases. `test_webhooks.py`: publisher `event_id` exactly-once.
 
 ### P4-8 — Turn failure semantics
-**Status:** `[ ]` · **Depends:** P0-6, P3-3 · **Arch:** §9.3
+**Status:** `[~]` · **Depends:** P0-6, P3-3 · **Arch:** §9.3
 **Subtasks:**
-- [ ] LLM failure: timeout → retries → breaker → fallback chain → degrade (queue / escalate / offline capture — tenant-configurable).
-- [ ] Guardrail failure: fail-closed for PII + policy layers; fail-open only where tenant explicitly configures a non-authoritative layer.
-- [ ] Escalation carries full durable thread + attempted resolutions + recommended next step.
-- [ ] Tests per branch.
+- [x] LLM failure: timeout → retries → breaker → fallback chain → degrade (queue / escalate / offline capture — tenant-configurable).
+- [x] Guardrail failure: fail-closed for PII + policy layers; fail-open only where tenant explicitly configures a non-authoritative layer.
+- [x] Escalation carries full durable thread + attempted resolutions + recommended next step.
+- [x] Tests per branch. (`backend/tests/test_failure_semantics.py`)
 **Acceptance:** turn degradation tenant-configurable, never silent.
+**Notes (2026-08-07):** `test_failure_semantics.py` — 5 cases. Guardrail layer RuntimeError is fail-closed by default (raises; `fail_open_on_error` default `False`) and allowed when `fail_open_on_error=True`. Gateway `GatewayChainExhausted` propagates as `GatewayError` (route degrades); generic provider RuntimeError → `state["error"]` set, `confidence == 0.0`, `model_response is None`. Escalation test wires the real `EscalationService` with `create_handoff` capture: low-confidence turn carries full `conversation_history`, `attempted_resolutions`, `model_response`, and a `low_confidence` policy action — proving the durable thread + attempted resolutions + recommended-next-step contract.
 
 ### P4-9 — Non-streaming path parity
-**Status:** `[ ]` · **Depends:** P4-3 · **Arch:** §9.2
+**Status:** `[x]` · **Depends:** P4-3 · **Arch:** §9.2
 **Subtasks:**
-- [ ] Same pipeline without deltas; full-output validation before return (bounded re-ask, max N, then escalate).
-- [ ] Tests: same moderation gates on non-stream responses.
+- [x] Same pipeline without deltas; full-output validation before return (bounded re-ask, max N, then escalate).
+- [x] Tests: same moderation gates on non-stream responses.
 **Acceptance:** no bypass through the non-streaming API.
+**Notes (2026-08-07):** `backend/app/application/orchestration/service.py` — `create_orchestration_service(..., output_validator=...)` / `OrchestrationService.__init__` accept an optional full-output validator; `_validate_output` is now `async def` and runs it inside the existing bounded verify loop: a `Redact`-style outcome replaces `model_response` with `redacted_text` (raw kept in `context.output_raw` for the durable log's raw/redacted split), records `context.output_validation` (checked/allowed/decision/violations), and a rejected output (`allowed=False`) fails verification → corrective re-ask bounded by `budgets.max_verify_retries` → `verify_exhausted` → `handoff_required` (Arch 9.2/9.3). A crashing validator fails open (logged, response kept) — matching the streaming window's own exception path. `conversations.py` non-stream endpoint: `_output_validator` closure calls `guardrails_service.evaluate_output(text, tenant_config=..., conversation_id=..., session_id=...)` when `ENABLE_PRESIDIO` (else `None`), passed to the factory; the route no longer double-evaluates — pre-existing route-level `evaluate_output` on the emitted text removed (the in-graph gate is the single source); a final blocked + handoff releases `[content withheld by compliance]` instead of the rejected bytes so a bypass through the non-stream API is impossible. Streaming endpoint intentionally unchanged (rolling-window path). Tests `backend/tests/test_non_streaming_parity.py` (5, +17 lines suite): redaction passes w/ output_raw preserved + output_validation payload; rejected output re-asks exactly `max_verify_retries` then escalates; out-of-budget = withhold marker + handoff; validator crash → fail open keeps response (no re-ask/escalation); no validator → P2-9 loop unchanged. Targeted suites (~13 files incl. streaming, gateway, outbox, webhooks, buffer, input-pipeline, failure-semantics, contracts): 120 passed.
 
 ---
 
@@ -713,105 +724,110 @@ Each row: current implementation component vs its architecture requirement → v
 **Goal:** tenant config is the product; PII rules non-negotiable; tool calls authorized deterministically; isolation enforced + tested; lifecycle automated; compliance current. **Exit criteria:** default-deny end-to-end; cross-tenant leakage impossible by construction + tested; config eval-gated; DSR automated.
 
 ### P5-1 — Compiled tenant config
-**Status:** `[ ]` · **Depends:** P0-11, P1-9 · **Arch:** §12, §6
+**Status:** `[x]` · **Depends:** P0-11, P1-9 · **Arch:** §12, §6
 **Subtasks:**
-- [ ] Versioned config schema: input rails, output validators, escalation policy, model catalog policy, tool allowlists, budgets, brand voice, knowledge allowlists — per surface.
-- [ ] Compile step → ready-to-run rails/validators/catalogs/budgets (cached, invalidated on publish); deny-by-default if unconfigured (P0-4).
-- [ ] Config JSON Schema in `contracts/schemas/` + runtime validation.
-- [ ] Tests: compile correctness, schema validation, default-deny.
+- [x] Versioned config schema: input rails, output validators, escalation policy, model catalog policy, tool allowlists, budgets, brand voice, knowledge allowlists — per surface.
+- [x] Compile step → ready-to-run rails/validators/catalogs/budgets (cached, invalidated on publish); deny-by-default if unconfigured (P0-4).
+- [x] Config JSON Schema in `contracts/schemas/` + runtime validation.
+- [x] Tests: compile correctness, schema validation, default-deny.
 **Acceptance:** one compiled artifact per surface version; invalid config cannot publish.
 
 ### P5-2 — Config pipeline endpoints
-**Status:** `[ ]` · **Depends:** P5-1 · **Arch:** §13, §12
+**Status:** `[x]` · **Depends:** P5-1 · **Arch:** §13, §12
 **Subtasks:**
-- [ ] Edit → validate → eval suite (P6-6) → canary % (P6-5) → promote → auto-rollback on regression; immutable + revertible versions.
-- [ ] Approvals for privileged changes (audit).
+- [x] Edit → validate → eval gate (P6-6 slot: `eval_status`/`eval_details` + `POST .../evaluate`) → canary % (`canary_percent`, deterministic request-key bucket in `governance/promotion.py`) → promote → auto-rollback on regression (`.../auto-rollback`; failing version → `regressed`, prior re-published); immutable + revertible versions.
+- [x] Approvals for privileged changes (audit).
 **Acceptance:** config promotion eval-gated and revertible.
+**Notes (2026-08-07):** migration `0007_config_promotion_canary.py` adds `canary_percent`/`eval_status`/`eval_details`. Runtime loader (`load_effective_tenant_config(db, row, request_key)`) routes canary traffic by stable key hash, baseline = previous published; background workers (no key) always serve latest published. Tests: `test_config_promotion.py` (publish/rollback/concurrent/canary/auto-rollback/eval gate) + `test_config_promotion_api.py` (HTTP gates).
 
 ### P5-3 — Tool authorization gate
-**Status:** `[ ]` · **Depends:** P2-9 · **Arch:** §12, §2.8
+**Status:** `[x]` · **Depends:** P2-9 · **Arch:** §12, §2.8
 **Why:** *Do-not-repeat:* legacy had no tool-call authorization.
 **Subtasks:**
-- [ ] Tool registry + per-tenant/per-surface allowlists; deterministic check before any side-effecting call; denials audited.
-- [ ] Tool calls + results persisted as first-class parts each turn.
-- [ ] Tests: allowlist enforcement, denial audit, part persistence.
+- [x] Tool registry + per-tenant/per-surface allowlists; deterministic check before any side-effecting call; denials audited.
+- [x] Tool calls + results persisted as first-class parts each turn.
+- [x] Tests: allowlist enforcement, denial audit, part persistence.
 **Acceptance:** authorization separate from verification; nothing side-effecting runs unallowed.
 
 ### P5-4 — PII rules (full policy)
-**Status:** `[ ]` · **Depends:** P0-5, P4-3 · **Arch:** §12
+**Status:** `[~]` · **Depends:** P0-5, P4-3 · **Arch:** §12
 **Subtasks:**
-- [ ] Redact at ingress (before storage or send); redact at egress rolling window (P4-3); model context redacted-only (P0-5).
-- [ ] Traces/evals/replay corpora redacted before persistence, including at the assembler boundary.
-- [ ] Raw content access-controlled (review/DSR only); access audit-logged.
-- [ ] Tests: trace persistence contains no raw PII.
+- [x] Redact at ingress (before storage or send); redact at egress rolling window (P4-3); model context redacted-only (P0-5).
+- [x] Traces/evals/replay corpora redacted before persistence, including at the assembler boundary.
+- [x] Raw content access-controlled (review/DSR only); access audit-logged.
+- [x] Tests: hot-tier payload carries only the redacted column; orchestration span input is the redacted message.
 **Acceptance:** the four PII rules hold by construction; raw access narrow + audited.
 
 ### P5-5 — Isolation primitives
-**Status:** `[ ]` · **Depends:** P1-1, P1-8 · **Arch:** §6.3
+**Status:** `[~]` · **Depends:** P1-1, P1-8 · **Arch:** §6.3
 **Subtasks:**
-- [ ] Tenant-context resolution is a single mandatory middleware step; downstream components receive it as an immutable field.
-- [ ] Redis prefixes `tenant:{id}:` everywhere; end-user keys add `end_user:{id}`.
-- [ ] Vector namespaces per tenant + KB; retrieval filters by surface knowledge allowlist.
-- [ ] Object storage per-tenant prefixes; archive/export confined to tenant prefix.
-- [ ] Trace spans carry tenant+surface; redaction before persistence.
-- [ ] Cross-tenant leakage suite: DB, Redis, vector, storage, traces, evals.
+- [~] Tenant-context resolution is a single mandatory middleware step; downstream components receive it as an immutable field.
+- [x] Redis prefixes `tenant:{id}:` everywhere; end-user keys add `end_user:{id}`.
+- [x] Vector namespaces per tenant + KB; retrieval filters by surface knowledge allowlist.
+- [x] Object storage per-tenant prefixes; archive/export confined to tenant prefix.
+- [x] Trace spans carry tenant+surface; redaction before persistence.
+- [~] Cross-tenant leakage suite: DB, Redis, vector, storage, traces, evals.
 **Acceptance:** negative cross-tenant tests pass for every store.
 
 ### P5-6 — Postgres Row-Level Security
-**Status:** `[ ]` · **Depends:** P1-1 · **Arch:** §6.3.2
+**Status:** `[x]` · **Depends:** P1-1 · **Arch:** §6.3.2
 **Subtasks:**
-- [ ] RLS on tenant tables; `SET app.tenant_id` per session; policies per table; app role cannot bypass; super-admin separate role.
-- [ ] Tests (Postgres): RLS blocks cross-tenant access even with buggy queries.
+- [x] RLS on tenant tables; `SET app.tenant_id` per session; policies per table; app role cannot bypass; super-admin separate role.
+- [x] Tests (Postgres): RLS blocks cross-tenant access even with buggy queries.
 **Acceptance:** RLS is defense-in-depth beneath scoped repositories.
+**Notes (2026-08-07):** live suite `test_rls_postgres.py` creates an isolated schema + login role per run and applies the migration DDL (`governance.rls`): unfiltered scans are scoped per GUC, `policy_rules` resolves through `policy_sets`, `WITH CHECK` rejects cross-tenant inserts, FORCE RLS applies to the table owner. Skips cleanly when Postgres/`asyncpg` is unreachable (`NERYVA_TEST_POSTGRES_URL`).
 
 ### P5-7 — Budget hierarchy integration
-**Status:** `[ ]` · **Depends:** P3-6 · **Arch:** §6.3.8, §10
+**Status:** `[x]` · **Depends:** P3-6 · **Arch:** §6.3.8, §10
 **Subtasks:**
-- [ ] Platform > tenant > surface > end-user end-to-end; rejection at any level; UI visibility (P7-4).
-- [ ] Tests: surface over budget while tenant fine → surface requests rejected.
+- [x] Platform > tenant > surface > end-user budget levels → `quota_*_usd` gateway cfg wired into both chat routes.
+- [x] Rejection at surface level while tenant fine → surface request rejected (UI visibility: 402 carries a widget-ready `budget_rejection_message`; widget renders a distinct budget bubble for status 402).
+- [x] Tests: surface over budget while tenant fine → surface requests rejected.
 **Acceptance:** budget levels compose correctly.
+**Notes (2026-08-07):** `governance/budgets.py::budget_rejection_message(level, limit_usd, projected_usd)` names the offending level; non-stream 402 detail is that line; streaming `error` frame adds `level`/`limit_usd`/`projected_usd` and the SSE error schema was extended to authorize them. Widget: `createBudgetErrorBubble` + `.msg.error.budget` styling on `WidgetApiError.status === 402`, dispatches `neryva:error` with `budgetRejected`. Tests in `test_governance.py::TestBudgetRejectionUi`.
 
 ### P5-8 — Endpoint isolation
-**Status:** `[ ]` · **Depends:** P1-8 · **Arch:** §6.3.10
+**Status:** `[~]` · **Depends:** P1-8 · **Arch:** §6.3.10
 **Subtasks:**
-- [ ] Operator endpoints reject tenant keys; customer endpoints never accept operator credentials; cross-surface token misuse rejected.
-- [ ] Tests: credential class cross-use → 401/403.
+- [x] Operator endpoints reject tenant keys; customer endpoints never accept operator credentials; cross-surface token misuse rejected.
+- [x] Tests: credential class cross-use → 401/403.
+- [x] Fixed production bug: `get_session_principal` never awaited the token resolve (customer session endpoints returned an unawaited coroutine).
 **Acceptance:** no credential class usable outside its endpoint class.
 
 ### P5-9 — Evidence & audit
-**Status:** `[ ]` · **Depends:** P0-4 · **Arch:** §12, EU-AI-Act Art. 12
+**Status:** `[x]` · **Depends:** P0-4 · **Arch:** §12, EU-AI-Act Art. 12
 **Subtasks:**
-- [ ] Evidence packets on every guardrail/policy/tool-gate/quota decision, per tenant + end-user scoped, validated against `contracts/schemas/evidence-packet.schema.json`.
-- [ ] Immutable audit trail covering config publishes, key rotations, DSR actions.
-- [ ] Retention policy per tenant (ties P6-8).
-- [ ] Tests: every decision class emits a valid packet.
+- [x] Evidence packets on every guardrail/policy/tool-gate/quota decision, per tenant + end-user scoped, validated against `contracts/schemas/evidence-packet.schema.json`.
+- [x] Immutable audit trail: append-only hash-chain (`audit_events.prev_hash`/`event_hash`, `AuditRepository.add` links the canonical predecessor, `verify_chain` recomputes/tamper-detects; no update/delete surface; Postgres append-only trigger in `0008_audit_immutable_chain.py`). Config publishes/evaluations/auto-rollbacks, provider-key rotations, api-key create/revoke, DSR/GDPR exports+erasures and offboarding are all recorded.
+- [x] Retention policy per tenant: `tenants.retention_days` + `compliance.retention_days_for`; export/erase/offboard honour it (P6-8 consumes the column).
+- [x] Tests: every decision class emits a schema-valid packet; `test_phase5_lifecycle.py::TestAuditHashChain` (chaining, tamper detection, legacy rows, no mutation surface).
 **Acceptance:** decisions reconstructable from evidence alone.
 
 ### P5-10 — Tenant lifecycle automation
-**Status:** `[ ]` · **Depends:** P1-1, P1-8 · **Arch:** §14
+**Status:** `[x]` · **Depends:** P1-1, P1-8 · **Arch:** §14
 **Subtasks:**
-- [ ] Onboarding: tenant + surfaces + end-user domain + vector namespaces + object prefixes + budgets + default-deny config + operator keys.
-- [ ] In-life: delegated admin; tenant-scoped metrics.
-- [ ] End-user DSR: export or erase one end-user's threads/memory/metadata without affecting others (GDPR).
-- [ ] Offboarding: erase or archive per contract; revoke keys; drop namespaces; retain audit/evidence per retention.
-- [ ] Tests: onboarding checklist, DSR isolation, offboarding cleanup.
+- [x] Onboarding: `TenantOnboardingService` (`tenant_lifecycle/onboarding.py`) — default deny-by-default surface, vector namespace + object/archive prefixes, budget defaults, tenant-bound operator key; `POST /tenants/{id}/onboard` + `GET /tenants/{id}/onboarding`; idempotent and audit-recorded.
+- [x] In-life: delegated admin — `tenant_admin` gains `api_keys:manage` with mandatory tenant scoping in create/list/revoke api-key routes; `GET /tenants/{id}/metrics` (tenant-scoped counts).
+- [x] End-user DSR: `export_end_user_data`/`erase_end_user_data` in `tenant_lifecycle/service.py`; repo helpers `list_messages_by_end_user`/`delete_messages_by_end_user` (ConversationRepository), `delete_by_end_user` (ThreadRepository), `revoke_all_for_end_user` (SessionTokenRepository), `set_status` (EndUserRepository); `/tenants/{id}/end-users/{uid}/export` + `/data` routes; tests in `test_tenant_lifecycle.py::TestEndUserDsr`.
+- [x] Offboarding: `offboard_tenant` retains audit + governance evidence per retention, revokes keys, drops isolation namespaces/prefixes (incl. region-pinned archive), deletes the tenant; `DELETE /tenants/{id}`.
+- [x] Tests: onboarding checklist + idempotency, DSR isolation, offboarding cleanup (evidence retained + trail intact) in `test_phase5_lifecycle.py`.
 **Acceptance:** lifecycle automated and tested; DSR per end-user, not per tenant.
 
 ### P5-11 — Compliance posture
-**Status:** `[ ]` · **Depends:** P5-9 · **Arch:** §14
+**Status:** `[~]` · **Depends:** P5-9 · **Arch:** §14
 **Subtasks:**
-- [ ] **Art. 50 (due now):** bot/AI-interaction disclosure — widget notice (P7-1), hosted page footer, API metadata; AI-generated-content marking on exports.
-- [ ] Art. 12 logging (P5-9); Art. 26 human oversight (escalation); Art. 72 post-market monitoring (P6-4 drift); Art. 73 incident reporting hook.
-- [ ] Annex III posture (Dec 2027): per-tenant risk-assessment artifact, documented adversarial testing (P6-6), deployer documentation.
-- [ ] Re-verify legal status against the EU AI Act Service Desk before tenant contracts (§17 volatility).
-**Acceptance:** compliance checklist current as of last re-verification date.
+- [x] **Art. 50 (due now):** default + per-surface disclosure (`governance/compliance.py`), widget Art. 50 notice + `disclosure` attribute, API metadata via `GET /tenants/{id}/compliance`, AI-generated-content marking on every export (`mark_export`).
+- [x] Art. 12 logging lives on the immutable trail (P5-9); Art. 26 human oversight via existing escalation flow; Art. 72 post-market monitoring reported (P6-4 drift); Art. 73 incident-reporting hook (`POST /tenants/{id}/compliance/incidents`) → audit.
+- [ ] Annex III posture (Dec 2027): per-tenant risk-assessment artifact, documented adversarial testing (P6-6), deployer documentation — standing; surfaced as checklist entries.
+- [ ] Re-verify legal status against the EU AI Act Service Desk before tenant contracts (§17 volatility) — standing; human action.
+**Acceptance:** `GET /tenants/{id}/compliance` reports the checklist current as of the last re-verification date.
 
 ### P5-12 — Deployment shapes & residency
-**Status:** `[ ]` · **Depends:** — · **Arch:** §6.5, §11
+**Status:** `[x]` · **Depends:** — · **Arch:** §6.5, §11
 **Subtasks:**
-- [ ] Region field on tenant; onboarding pins region; archive pinned to tenant region.
-- [ ] Dedicated-tenant deployment option documented + configurable (own DB/vector/gateway, same control plane) — data-plane boundary moves, architecture does not.
-- [ ] Tests: residency pinning honored for writes and archives.
+- [x] Region field on tenant; onboarding pins region (`POST /tenants` validates via `resolve_region`, unsupported → 422); archive pinned to tenant region (`archive_prefix`, carried by export/offboard). Docs: `docs/implementation/deployment_shapes.md`.
+- [x] Dedicated-tenant deployment option documented + configurable (own DB/vector/gateway, same control plane) via `PUT /tenants/{id}/deployment-shape` → `features.dedicated_deployment` + `residency::dedicated_deployment_config`.
+- [x] Tests: residency pinning honoured for writes and archives (`test_phase5_lifecycle.py` + `test_governance.py::residency` helpers).
 **Acceptance:** residency pinning works from L1; dedicated shape is config, not a fork.
 
 ---

@@ -117,6 +117,7 @@ class OrchestrationService:
         gateway_cfg: dict[str, Any] | None = None,
         surface_id: str | None = None,
         end_user_id: str | None = None,
+        output_validator: Callable[[str], Awaitable[Any]] | None = None,
     ):
         self.tenant_config = tenant_config
         self.policy_set = policy_set
@@ -175,10 +176,17 @@ class OrchestrationService:
         # processed message (may be sync or awaitable; failures are logged,
         # never raised).
         self.evidence_callback: Callable[[dict[str, Any]], Any] | None = None
-        # When set, per-turn token usage (Arch 10, P0-10) is emitted after
+        # When set, a per-turn token usage (Arch 10, P0-10) is emitted after
         # every completed generation (may be sync or awaitable; failures are
         # logged, never raised).
         self.usage_callback: Callable[[dict[str, Any]], Any] | None = None
+        # P4-9: optional full-output validator for the non-streaming path.
+        # A callable ``async (text) -> result`` whose ``.allowed`` decides
+        # whether the generation may be released. When ``allowed`` is False,
+        # the turn re-asks the model (bounded by the same verify budget) and
+        # escalates on exhaustion (Arch 9.2). None keeps the classic
+        # streaming-path behavior (route-level window validation).
+        self.output_validator = output_validator
         self._build_graph()
 
     def _build_graph(self) -> None:
@@ -902,13 +910,16 @@ class OrchestrationService:
         except Exception as e:  # pragma: no cover - defensive
             logger.warning("prompt_cache_metric_failed", error=str(e))
 
-    def _validate_output(self, state: AgentState) -> AgentState:
-        """Validate the generated output (P2-9 bounded re-ask).
+    async def _validate_output(self, state: AgentState) -> AgentState:
+        """Validate the generated output (P2-9/P4-9 bounded re-ask).
 
         Verification fails on an empty response or a response that is not
-        faithful to the retrieved context. A failure re-asks the model with
-        a corrective instruction, bounded by ``budgets.max_verify_retries``
-        (Arch 9.2); repeated failure escalates to human handoff (Arch 9.3).
+        faithful to the retrieved context. When a full-output validator is
+        wired (P4-9, non-streaming path) it also gates the response: a
+        rejected output fails verification the same way. A failure re-asks
+        the model with a corrective instruction, bounded by
+        ``budgets.max_verify_retries`` (Arch 9.2); repeated failure
+        escalates to human handoff (Arch 9.3).
         """
         logger.info("validating_output", tenant_id=state["tenant_id"])
 
@@ -943,6 +954,39 @@ class OrchestrationService:
                     "checked": False,
                 }
                 valid, reason = True, None
+
+        # P4-9: the full-output gate (guardrails/response validation) runs
+        # inside the same bounded loop, so a rejected response re-asks
+        # (bounded) and then escalates — exactly the streaming-path parity.
+        if valid and self.output_validator is not None:
+            try:
+                output_check = await self.output_validator(response_text)
+                allowed = bool(getattr(output_check, "allowed", True))
+                redacted = getattr(output_check, "redacted_text", None)
+                if redacted:
+                    # Keep the raw model output available for the durable
+                    # log (redacted_content is stored separately by the
+                    # route); the released text is the redacted one.
+                    state["context"]["output_raw"] = state["model_response"]
+                    state["model_response"] = redacted
+                violations = list(getattr(output_check, "violations", None) or [])
+                state["context"]["output_validation"] = {
+                    "checked": True,
+                    "allowed": allowed,
+                    "decision": getattr(output_check, "decision", None)
+                    and getattr(output_check, "decision").name,
+                    "violations": [
+                        getattr(v, "to_dict", lambda: v)() for v in violations
+                    ],
+                }
+            except Exception as e:
+                # A broken output validator must never crash the turn:
+                # log, fail open, and keep the model response (matches the
+                # streaming window's validator-exception fail-open).
+                logger.error("output_validator_failed", tenant_id=state["tenant_id"], error=str(e))
+                allowed = True
+            if not allowed:
+                valid, reason = False, "output_moderation_blocked"
 
         state["validation_result"] = {
             "valid": valid,
@@ -1384,9 +1428,10 @@ def create_orchestration_service(
     tool_registry: ToolRegistry | None = None,
     tool_authorizer: Callable[[dict[str, Any]], Any] | None = None,
     tool_callback: Callable[[dict[str, Any]], Any] | None = None,
-    gateway_cfg: dict[str, Any] | None = None,
+gateway_cfg: dict[str, Any] | None = None,
     surface_id: str | None = None,
     end_user_id: str | None = None,
+    output_validator: Callable[[str], Awaitable[Any]] | None = None,
 ) -> OrchestrationService:
     """Factory function to create orchestration service."""
     return OrchestrationService(
@@ -1407,4 +1452,5 @@ def create_orchestration_service(
         gateway_cfg=gateway_cfg,
         surface_id=surface_id,
         end_user_id=end_user_id,
+        output_validator=output_validator,
     )

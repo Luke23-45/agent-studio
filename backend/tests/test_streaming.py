@@ -107,3 +107,139 @@ class TestSseFormatting:
 
         frame = _sse("delta", {"content": "x"})
         assert frame == 'event: delta\ndata: {"content": "x"}\n\n'
+
+
+class _SlowGateway:
+    """Gateway double whose stream yields chunks with ``sleep`` between each,
+    so the route's heartbeat timer (P4-1) has a chance to fire while the
+    model is still generating."""
+
+    def __init__(self, chunks, sleep):
+        self.chunks = chunks
+        self.sleep = sleep
+        self.generate_calls = 0
+
+    async def generate(self, request, tenant_config, gateway_cfg=None):
+        self.generate_calls += 1
+        return result("".join(self.chunks), model="gpt-4", provider="openai")
+
+    async def stream(self, request, tenant_config, gateway_cfg=None):
+        for i, c in enumerate(self.chunks):
+            yield delta(c)
+            if i < len(self.chunks) - 1:
+                await asyncio.sleep(self.sleep)
+        yield done()
+
+
+class TestRouteHeartbeat:
+    """P4-1: the streaming route injects heartbeat frames while the model is
+    quiet. Runs against the real endpoint (TestClient + sqlite) with a short
+    heartbeat interval and a slow gateway stream so a heartbeat lands mid-run."""
+
+    def _isolated_client(self, tmp_path):
+        import backend.app.api.routes.conversations as conversations_module
+        from backend.app.settings import feature_flags as flags_module
+        from backend.app.settings.env import settings
+
+        original = {
+            "auth": settings.AUTH_ENABLED,
+            "presidio": flags_module.feature_flags.ENABLE_PRESIDIO,
+            "db_url": settings.DATABASE_URL,
+            "cfg_path": settings.TENANT_CONFIG_PATH,
+            "hb": settings.STREAM_HEARTBEAT_SECONDS,
+            "keys": [
+                settings.OPENAI_API_KEY,
+                settings.ANTHROPIC_API_KEY,
+                settings.GOOGLE_API_KEY,
+                settings.AZURE_API_KEY,
+                settings.CUSTOM_LLM_API_KEY,
+            ],
+        }
+
+        def restore():
+            settings.AUTH_ENABLED = original["auth"]
+            settings.DATABASE_URL = original["db_url"]
+            settings.TENANT_CONFIG_PATH = original["cfg_path"]
+            settings.STREAM_HEARTBEAT_SECONDS = original["hb"]
+            settings.OPENAI_API_KEY, settings.ANTHROPIC_API_KEY, settings.GOOGLE_API_KEY = original["keys"][:3]
+            settings.AZURE_API_KEY, settings.CUSTOM_LLM_API_KEY = original["keys"][3:]
+            object.__setattr__(flags_module.feature_flags, "ENABLE_PRESIDIO", original["presidio"])
+            conversations_module._rag_services.clear()
+
+        settings.AUTH_ENABLED = False
+        object.__setattr__(flags_module.feature_flags, "ENABLE_PRESIDIO", False)
+        settings.DATABASE_URL = f"sqlite+aiosqlite:///{tmp_path.as_posix()}/hb.db"
+        settings.TENANT_CONFIG_PATH = str(tmp_path / "tenant_configs")
+        settings.STREAM_HEARTBEAT_SECONDS = 0.05
+        settings.OPENAI_API_KEY = None
+        settings.ANTHROPIC_API_KEY = None
+        settings.GOOGLE_API_KEY = None
+        settings.AZURE_API_KEY = None
+        settings.CUSTOM_LLM_API_KEY = None
+
+        from backend.app.infrastructure.db import init_database
+        from backend.app.infrastructure.db.models import Base
+
+        async def _setup_schema():
+            manager = init_database(settings.DATABASE_URL)
+            await manager.initialize()
+            async with manager._engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            await manager.close()
+
+        asyncio.run(_setup_schema())
+
+        from starlette.testclient import TestClient
+
+        from backend.app.main import app
+
+        return TestClient(app), restore
+
+    def test_heartbeat_frames_emitted_while_model_is_quiet(self, tmp_path, monkeypatch):
+        import backend.app.api.routes.conversations as conversations_module
+
+        client, restore = self._isolated_client(tmp_path)
+        try:
+            monkeypatch.setattr(
+                conversations_module, "get_gateway",
+                lambda: _SlowGateway(["one ", "two ", "three"], sleep=0.12),
+            )
+            with client:
+                resp = client.post(
+                    "/api/v1/tenants",
+                    json={
+                        "slug": "hbco",
+                        "name": "HB Co",
+                        # Empty allowlist: no topic classifier in the test
+                        # env, so the input passes validation and the turn
+                        # actually streams (the point under test is the
+                        # heartbeat while the model is quiet).
+                        "allowed_topics": [],
+                        "blocked_topics": [],
+                        "default_provider": "openai",
+                        "default_model": "gpt-4",
+                        "escalation_threshold": 0.5,
+                    },
+                )
+                assert resp.status_code == 200, resp.text
+
+                events = []
+                with client.stream(
+                    "POST",
+                    "/api/v1/conversations/stream",
+                    json={"tenant_slug": "hbco", "message": "tell me a story"},
+                ) as stream:
+                    for line in stream.iter_lines():
+                        if line.startswith("event: "):
+                            events.append(line[len("event: "):])
+
+                assert "session" in events
+                assert "delta" in events
+                assert "result" in events
+                # The slow stream keeps the generator alive past one
+                # STREAM_HEARTBEAT_SECONDS interval: a heartbeat lands
+                # between the first frame and the terminal result.
+                assert "heartbeat" in events
+                assert events.index("heartbeat") < events.index("result")
+        finally:
+            restore()

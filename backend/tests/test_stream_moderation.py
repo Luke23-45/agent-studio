@@ -101,3 +101,47 @@ async def test_finish_flushes_held_tail():
 async def test_constructor_rejects_bad_window():
     with pytest.raises(ValueError):
         StreamingModerationWindow(None, window_size=0)
+
+
+async def _collect(window: StreamingModerationWindow, chunks: list[str]):
+    out = []
+    for chunk in chunks:
+        release = await window.push(chunk)
+        if release is not None:
+            out.append(release.text)
+    tail = await window.finish()
+    if tail is not None:
+        out.append(tail.text)
+    return out
+
+
+@pytest.mark.asyncio
+async def test_tenants_with_bigger_window_batch_more_before_release():
+    """P4-3 (D-3): the per-tenant window knob is a latency/safety dial.
+
+    A stricter tenant (larger window) holds more text : the validator sees
+    a bigger context before the first release; a latency-sensitive tenant
+    (smaller window) releases smaller chunks.
+    """
+    absorb = []
+    async def validator(text):
+        absorb.append(text)
+        return await _allowed()
+
+    strict = StreamingModerationWindow(validator, window_size=64)
+    loose = StreamingModerationWindow(validator, window_size=8)
+
+    text = "the quick brown fox jumps over the lazy dog again"
+    strict_out = await _collect(strict, list(text))
+    loose_out = await _collect(loose, list(text))
+
+    # The strict tenant (64) holds the whole 44-char text in one window and
+    # releases it as a single chunk; the loose tenant (8) streams smaller
+    # validated windows as soon as they fill.
+    assert strict_out == [text]
+    assert "".join(loose_out) == text
+    assert loose_out and all(len(chunk) <= len(text) for chunk in loose_out)
+    assert any(len(chunk) < 64 for chunk in loose_out)
+    # Every character was validated by the (shared) validator exactly once
+    # per tenant stream.
+    assert "".join(absorb) == text * 2

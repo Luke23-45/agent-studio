@@ -126,7 +126,9 @@ class TestHandlerRegistration:
             "eval.replay",
             "redteam.run",
             "webhook.deliver",
+            "outbox.relay",
             "summary.refresh",
+            "cost_ledger.write",
             "tool_result.clear",
             "memory.extract",
         }

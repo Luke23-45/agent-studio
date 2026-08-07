@@ -54,7 +54,7 @@ async def get_session_principal(
     """Resolve the end-user session token (expiry + revocation checked)."""
     token = _bearer_token(request)
     try:
-        return get_session_token_service().resolve(token)
+        return await get_session_token_service().resolve(token)
     except ExpiredSessionToken:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,

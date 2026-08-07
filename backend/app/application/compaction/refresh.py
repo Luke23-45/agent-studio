@@ -31,18 +31,22 @@ class CompactionRefreshConfig:
     max_threads_per_run: int = DEFAULT_MAX_THREADS_PER_RUN
 
 
-async def load_effective_tenant_config(db: Any, tenant_row: dict[str, Any]):
-    """Runtime tenant config: row merged with the latest published version.
+async def load_effective_tenant_config(
+    db: Any, tenant_row: dict[str, Any], request_key: str | None = None
+):
+    """Runtime tenant config: row merged with the published config version.
 
     Mirrors the conversation route's runtime read (Arch 12, P0-11): no
-    published version -> the row is authoritative.
+    published version -> the row is authoritative. ``request_key`` (end-user
+    id or session id) selects between a canary rollout and its baseline
+    (P5-2); background workers pass None and always see the latest published.
     """
     from backend.app.infrastructure.db import TenantConfigVersionRepository
     from backend.app.modules.tenant_config import tenant_config_from_data
 
     config = tenant_config_from_data(tenant_row)
-    published = await TenantConfigVersionRepository(db).get_latest_published(
-        str(config.id)
+    published = await TenantConfigVersionRepository(db).get_effective(
+        str(config.id), request_key
     )
     if published:
         return tenant_config_from_data({**tenant_row, **published["config"]})

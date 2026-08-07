@@ -29,6 +29,28 @@
       "additionalProperties": false
     },
     {
+      "title": "retraction",
+      "description": "Output moderation truncated a stream that had already released deltas: the client must discard everything after ``retract_from_event_id`` (Last-Event-ID resume point) and render the terminal frame instead. Always preceded/followed by the matching ``redaction`` frame.",
+      "type": "object",
+      "required": ["violations", "retract_from_event_id"],
+      "properties": {
+        "violations": { "type": "array" },
+        "retract_from_event_id": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": false
+    },
+    {
+      "title": "compaction",
+      "description": "Emitted at stream open when the thread already carries a durable compaction checkpoint: ``position`` is the seq of the last summarized message (every earlier turn is replaced by the summary block) and ``layer_count`` is the number of byte-stable summary layers (P2-6). Client may render a compaction marker.",
+      "type": "object",
+      "required": ["position"],
+      "properties": {
+        "position": { "type": "integer", "minimum": 0 },
+        "layer_count": { "type": "integer", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    {
       "title": "guardrails",
       "type": "object",
       "required": ["valid", "blocked", "violations"],
@@ -80,9 +102,17 @@
     },
     {
       "title": "error",
+      "description": "Terminal failure. ``error`` is a human-readable reason; for a gateway rejection ``kind`` and ``status`` are added, and a budget rejection (P5-7) additionally carries ``level``/``limit_usd``/``projected_usd`` so the surface UI can render a distinct budget-blocked state.",
       "type": "object",
       "required": ["error"],
-      "properties": { "error": { "type": "string" } },
+      "properties": {
+        "error": { "type": "string" },
+        "kind": { "type": "string" },
+        "status": { "type": "integer" },
+        "level": { "type": "string", "enum": ["platform", "tenant", "surface", "end_user"] },
+        "limit_usd": { "type": "number" },
+        "projected_usd": { "type": "number" }
+      },
       "additionalProperties": false
     }
   ]
