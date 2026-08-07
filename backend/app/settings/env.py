@@ -159,6 +159,38 @@ class Settings(BaseSettings):
     # tenant has no key row. Production must set False (BYOK only).
     PLATFORM_MANAGED_KEYS_ENABLED: bool = True
 
+    # SSO (OIDC authorization-code flow, P7-4): operator sessions.
+    # Enabled only when OIDC_ENABLED is True and a discovery URL is set.
+    OIDC_ENABLED: bool = False
+    OIDC_DISCOVERY_URL: str | None = None
+    OIDC_CLIENT_ID: str | None = None
+    OIDC_CLIENT_SECRET: str | None = None
+    # Backend callback (this server's absolute URL), e.g.
+    # "https://console.neryva.example/api/v1/auth/oidc/callback"
+    OIDC_REDIRECT_URI: str | None = None
+    # Frontend URL the IdP callback redirects back to with ?code=...
+    OIDC_FRONTEND_REDIRECT: str = "http://localhost:5173/login"
+    OIDC_SCOPES: str = "openid profile email"
+    OIDC_HTTP_TIMEOUT_SECONDS: float = 10.0
+    # IdP claim carrying the role list (claim may be a list or comma string)
+    OIDC_ROLE_CLAIM: str = "roles"
+    # JSON map of IdP role -> Neryva role, e.g.
+    # '{"neryva:super_admin": "super_admin", "neryva:operator": "operator"}'
+    OIDC_ROLE_MAP: dict[str, str] = {}
+    # Preferred role when the claim maps to multiple Neryva roles (highest).
+    # Empty -> deny with 403 rather than guess.
+    OIDC_DEFAULT_ROLE: str | None = None
+    # Operator session lifetime (SSO sessions are long-lived until revoked).
+    OPERATOR_SESSION_TTL_SECONDS: int = 28800
+
+    # MFA (TOTP, P7-4): HMAC signing key for one-time "proof" tokens that
+    # unlock privileged actions (publish/reset/key-management) for keys that
+    # have MFA enabled. KMS-injected in production; dev key-file fallback.
+    MFA_SIGNING_KEY: str | None = None
+    MFA_SIGNING_KEY_FILE: str = "mfa_master.key"
+    MFA_PROOF_TTL_SECONDS: int = 60
+    MFA_ISSUER: str = "Neryva Agent Studio"
+
     @property
     def is_production(self) -> bool:
         return not self.DEBUG

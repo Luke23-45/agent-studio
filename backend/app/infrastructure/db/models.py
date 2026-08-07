@@ -196,6 +196,12 @@ class ApiKeyModel(Base, TimestampMixin):
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     usage_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
 
+    # P7-4 MFA (TOTP): while enrolling, `mfa_secret` holds the pending
+    # secret and `mfa_enabled` stays False; the confirm step flips the
+    # flag, making the secret active. Disabling clears both.
+    mfa_secret: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
 
 class EscalationModel(Base, TimestampMixin):
     """Persisted human-handoff / escalation record."""
@@ -538,6 +544,37 @@ class SessionTokenModel(Base):
     surface_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     device_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     scopes: Mapped[list] = mapped_column(json_column(), default=list, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class OperatorSessionModel(Base):
+    """Privileged operator session minted by SSO (OIDC) or MFA-verified login.
+
+    Only the SHA-256 hash of the bearer token is stored; the row is the
+    revocation source of truth — resolution checks ``revoked_at`` and
+    ``expires_at`` on every request (same contract as session tokens).
+    ``idp_sub`` keeps the IdP subject for audit; ``auth_method`` records
+    whether the session came from OIDC SSO or a direct key.
+    """
+
+    __tablename__ = "operator_sessions"
+    __table_args__ = (
+        Index("ix_operator_sessions_token_hash", "token_hash", unique=True),
+        Index("ix_operator_sessions_expires_at", "expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    scopes: Mapped[list] = mapped_column(json_column(), default=list, nullable=False)
+    idp_sub: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    auth_method: Mapped[str] = mapped_column(String(16), default="oidc", nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(

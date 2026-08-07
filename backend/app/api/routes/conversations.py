@@ -29,6 +29,7 @@ from backend.app.api.dependencies.auth import (
     generate_api_key,
     get_principal,
     get_rate_limiter,
+    require_mfa_proof,
     require_permission,
 )
 from backend.app.api.dependencies.session import (
@@ -2624,6 +2625,7 @@ async def publish_tenant_config_version(
     version: int,
     principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
     canary_percent: int | None = Query(default=None, ge=0, le=100),
+    _mfa: ApiKeyPrincipal = Depends(require_mfa_proof),
 ):
     """Publish a draft (or re-promote any version); supersedes the old one.
 
@@ -2786,6 +2788,7 @@ async def auto_rollback_tenant_config_version(
     version: int,
     principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
     reason: str = Query(default="eval regression"),
+    _mfa: ApiKeyPrincipal = Depends(require_mfa_proof),
 ):
     """Auto-rollback on regression (P5-2): re-promote the prior version.
 
@@ -2843,6 +2846,7 @@ async def rollback_tenant_config_version(
     tenant_id: UUID,
     version: int,
     principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+    _mfa: ApiKeyPrincipal = Depends(require_mfa_proof),
 ):
     """Rollback: re-promote a previously published (superseded) version."""
     return await publish_tenant_config_version(tenant_id, version, principal)
@@ -2891,6 +2895,7 @@ async def erase_tenant_data(
 async def offboard_tenant(
     tenant_id: UUID,
     principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+    _mfa: ApiKeyPrincipal = Depends(require_mfa_proof),
 ):
     """Offboard: erase tenant data, revoke its API keys, delete the tenant."""
     assert_tenant_access(principal, tenant_id)
@@ -3114,6 +3119,7 @@ async def report_compliance_incident(
 async def create_api_key(
     request: ApiKeyCreateRequest,
     principal: ApiKeyPrincipal = Depends(require_permission("api_keys:manage")),
+    _mfa: ApiKeyPrincipal = Depends(require_mfa_proof),
 ):
     """Create an API key. The raw key is returned exactly once."""
     if request.role not in ("super_admin", "tenant_admin", "operator", "auditor"):
@@ -3204,6 +3210,7 @@ async def list_api_keys(
 async def revoke_api_key(
     key_id: UUID,
     principal: ApiKeyPrincipal = Depends(require_permission("api_keys:manage")),
+    _mfa: ApiKeyPrincipal = Depends(require_mfa_proof),
 ):
     """Revoke an API key."""
     db = get_database_manager()

@@ -1,10 +1,11 @@
 import { Link, useLocation } from '@tanstack/react-router';
 import {
+  canManageBilling,
   canViewAudit,
   canViewEscalations,
+  isOperatorOrAbove,
   useAuthStore,
   ROLE_SUPER_ADMIN,
-  ROLE_OPERATOR,
 } from '../../lib/auth/session';
 
 interface NavItem {
@@ -21,7 +22,7 @@ export function Sidebar() {
   const principal = useAuthStore((s) => s.principal);
   const role      = principal?.role ?? '';
 
-  const isOperator    = role === ROLE_SUPER_ADMIN || role === ROLE_OPERATOR;
+  const isOperator    = isOperatorOrAbove(role);
   const isSuperAdmin  = role === ROLE_SUPER_ADMIN;
 
   const navigation: (NavItem | 'divider')[] = [
@@ -38,14 +39,16 @@ export function Sidebar() {
     'divider',
 
     // Observability
-    { name: 'Traces', href: '/traces', icon: '🔍', visible: isSuperAdmin || isOperator, section: 'Observability' },
+    { name: 'Traces', href: '/traces', icon: '🔍', visible: isOperator, section: 'Observability' },
     { name: 'Audit Log', href: '/audit', icon: '📋', visible: canViewAudit(role) },
-    { name: 'Evaluations', href: '/evaluations', icon: '📊', visible: isSuperAdmin || isOperator },
+    { name: 'Evaluations', href: '/evaluations', icon: '📊', visible: isOperator },
+    { name: 'Usage & Billing', href: '/usage', icon: '💳', visible: canManageBilling(role) },
 
     'divider',
 
     // Operations
     { name: 'Escalation Queue', href: '/handoffs', icon: '🚨', visible: canViewEscalations(role), section: 'Operations' },
+    { name: 'Security (MFA)', href: '/security', icon: '🔐', visible: isOperator },
 
     'divider',
 

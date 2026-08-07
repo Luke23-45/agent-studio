@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field
 from backend.app.api.dependencies.auth import (
     ApiKeyPrincipal,
     assert_tenant_access,
+    require_mfa_proof,
     require_permission,
 )
 from backend.app.infrastructure.db import (
@@ -279,6 +280,7 @@ async def publish_policy_set(
     tenant_id: UUID,
     policy_id: str,
     principal: ApiKeyPrincipal = Depends(require_permission("policies:write")),
+    _mfa: ApiKeyPrincipal = Depends(require_mfa_proof),
 ) -> PublishResponse:
     """Promote a draft to published; the runtime switches on the next request."""
     assert_tenant_access(principal, tenant_id)

@@ -31,11 +31,13 @@ from backend.app.api.routes import (
     model_catalog_router,
     openai_compat_router,
     operations_router,
+    operator_auth_router,
     policies_router,
     sessions_router,
     surfaces_router,
     threads_router,
     traces_router,
+    usage_router,
     webhooks_router,
 )
 from backend.app.gateway.admission import get_admission_gate, init_admission
@@ -252,6 +254,8 @@ def create_application() -> FastAPI:
     app.include_router(traces_router, prefix="/api/v1")
     app.include_router(evals_router, prefix="/api/v1")
     app.include_router(console_router, prefix="/api/v1")
+    app.include_router(operator_auth_router, prefix="/api/v1")
+    app.include_router(usage_router, prefix="/api/v1")
 
     @app.get("/health/live")
     async def liveness_check():

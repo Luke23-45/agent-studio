@@ -8,7 +8,8 @@ All methods return plain dicts to avoid leaking ORM objects.
 
 import hashlib
 import json
-from datetime import datetime, timezone
+import secrets
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -27,6 +28,7 @@ from .models import (
     GuardrailEvidenceModel,
     MessageModel,
     ModelCatalogModel,
+    OperatorSessionModel,
     PolicyRuleModel,
     PolicySetModel,
     QuotaStateModel,
@@ -45,6 +47,11 @@ from .models import (
 logger = structlog.get_logger(__name__)
 
 from backend.app.governance.promotion import VALIDATION_REGRESSED, canary_bucket
+from backend.app.settings.env import settings
+
+# Privileged operator sessions (P7-4): the bearer token prefix shared with
+# api/dependencies/auth.py — keep in sync with OPERATOR_TOKEN_PREFIX there.
+OPERATOR_TOKEN_PREFIX = "nry_ops_"
 
 
 def _now() -> datetime:
@@ -524,6 +531,24 @@ class ApiKeyRepository:
             row = result.scalar_one_or_none()
             return _row_to_dict(row) if row else None
 
+    async def get_by_id(self, key_id: str) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(ApiKeyModel).where(ApiKeyModel.id == key_id)
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def update_mfa(self, key_id: str, *, secret: str | None, enabled: bool) -> bool:
+        """Set/replace the TOTP secret and enrollment flag (P7-4)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                update(ApiKeyModel)
+                .where(ApiKeyModel.id == key_id)
+                .values(mfa_secret=secret, mfa_enabled=enabled)
+            )
+            return result.rowcount > 0
+
     async def list_all(self) -> list[dict[str, Any]]:
         async with self.db.get_session() as session:
             result = await session.execute(
@@ -568,6 +593,80 @@ class ApiKeyRepository:
                 .where(ApiKeyModel.revoked.is_(False))
             )
             return int(result.scalar_one())
+
+
+class OperatorSessionRepository:
+    """Privileged operator sessions (P7-4): SSO / MFA-verified logins.
+
+    Only the SHA-256 hash of the bearer token is stored; the row is the
+    revocation source of truth — resolution checks ``revoked_at`` and
+    ``expires_at`` on every request.
+    """
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def create(
+        self,
+        *,
+        name: str,
+        role: str,
+        tenant_id: str | None = None,
+        scopes: list[str] | None = None,
+        idp_sub: str | None = None,
+        auth_method: str = "oidc",
+        ttl_seconds: int | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """Mint a session; returns (raw_bearer_token, row_dict)."""
+        raw = OPERATOR_TOKEN_PREFIX + secrets.token_hex(24)
+        ttl = ttl_seconds or settings.OPERATOR_SESSION_TTL_SECONDS
+        now = _now()
+        async with self.db.get_session() as session:
+            model = OperatorSessionModel(
+                id=str(uuid4()),
+                token_hash=hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                name=name,
+                role=role,
+                tenant_id=tenant_id,
+                scopes=scopes or ["*"],
+                idp_sub=idp_sub,
+                auth_method=auth_method,
+                expires_at=now + timedelta(seconds=ttl),
+                created_at=now,
+            )
+            session.add(model)
+            await session.flush()
+            return raw, _row_to_dict(model)
+
+    async def get_by_hash(self, token_hash: str) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(OperatorSessionModel).where(
+                    OperatorSessionModel.token_hash == token_hash
+                )
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def revoke(self, session_id: str) -> bool:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                update(OperatorSessionModel)
+                .where(OperatorSessionModel.id == session_id)
+                .values(revoked_at=_now())
+            )
+            return result.rowcount > 0
+
+    async def list_active(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Newest-first unrevoked sessions (status view / revocation UI)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(OperatorSessionModel)
+                .where(OperatorSessionModel.revoked_at.is_(None))
+                .order_by(OperatorSessionModel.created_at.desc())
+                .limit(limit)
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
 
 
 class SpendEventRepository:
@@ -615,6 +714,61 @@ class SpendEventRepository:
                 stmt = stmt.where(SpendEventModel.tenant_id == tenant_id)
             row = (await session.execute(stmt)).scalar_one_or_none()
             return _row_to_dict(row) if row else None
+
+    async def aggregate(
+        self,
+        *,
+        tenant_id: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        group_by: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Grouped totals over spend events (P7-4 usage/billing).
+
+        ``group_by`` is one of None (single totals row), "tenant", "model",
+        "surface" or "day" (calendar date of the event). Rows carry
+        ``calls``, ``usd``, ``input_tokens``, ``output_tokens``,
+        ``cached_tokens``; grouped rows add ``key``.
+        """
+        totals = (
+            func.count().label("calls"),
+            func.coalesce(func.sum(SpendEventModel.usd), 0.0).label("usd"),
+            func.coalesce(func.sum(SpendEventModel.input_tokens), 0).label("input_tokens"),
+            func.coalesce(func.sum(SpendEventModel.output_tokens), 0).label("output_tokens"),
+            func.coalesce(func.sum(SpendEventModel.cached_tokens), 0).label("cached_tokens"),
+        )
+        key_exprs = {
+            "tenant": SpendEventModel.tenant_id,
+            "model": SpendEventModel.model,
+            "surface": SpendEventModel.surface_id,
+            "day": func.date(SpendEventModel.created_at),
+        }
+
+        filters = []
+        if tenant_id:
+            filters.append(SpendEventModel.tenant_id == tenant_id)
+        if since:
+            filters.append(SpendEventModel.created_at >= since)
+        if until:
+            filters.append(SpendEventModel.created_at < until)
+
+        async with self.db.get_session() as session:
+            if group_by is None:
+                result = await session.execute(select(*totals).where(*filters))
+                return [dict(result.one()._mapping)]
+            if group_by not in key_exprs:
+                raise ValueError(f"unsupported group_by: {group_by!r}")
+            key = key_exprs[group_by]
+            stmt = (
+                select(key.label("key"), *totals)
+                .where(*filters)
+                .group_by(key)
+                .order_by(func.count().desc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return [dict(row._mapping) for row in result.all()]
 
 
 class QuotaStateRepository:
@@ -691,6 +845,25 @@ class QuotaStateRepository:
             )
             row = result.scalar_one_or_none()
             return _row_to_dict(row) if row else None
+
+    async def list_windows(
+        self,
+        *,
+        tenant_id: str | None = None,
+        scope_type: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Newest-first quota windows (P7-4 usage/billing quota view)."""
+        async with self.db.get_session() as session:
+            stmt = select(QuotaStateModel)
+            if tenant_id:
+                stmt = stmt.where(QuotaStateModel.tenant_id == tenant_id)
+            if scope_type:
+                stmt = stmt.where(QuotaStateModel.scope_type == scope_type)
+            result = await session.execute(
+                stmt.order_by(QuotaStateModel.window_started_at.desc()).limit(limit)
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
 
 
 class CacheInvalidationRepository:

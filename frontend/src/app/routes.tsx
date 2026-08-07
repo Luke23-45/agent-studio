@@ -10,6 +10,8 @@ import { EvalsExplorer } from '../features/evaluations/EvalsExplorer';
 import { EscalationQueue } from '../features/handoffs/EscalationQueue';
 import { ModelCatalogUI } from '../features/tenants/ModelCatalogUI';
 import { HarnessWorkbench } from '../features/harness/HarnessWorkbench';
+import { SecurityPage } from '../features/security/SecurityPage';
+import { UsageBilling } from '../features/usage/UsageBilling';
 import { useAuthStore } from '../lib/auth/session';
 
 // Root route
@@ -94,6 +96,20 @@ const harnessRoute = createRoute({
   component: HarnessWorkbench,
 });
 
+// Usage & Billing (billing:read)
+const usageRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/usage',
+  component: UsageBilling,
+});
+
+// Security / MFA (operator+)
+const securityRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/security',
+  component: SecurityPage,
+});
+
 export const routeTree = rootRoute.addChildren([
   dashboardRoute,
   tenantsRoute,
@@ -104,4 +120,6 @@ export const routeTree = rootRoute.addChildren([
   handoffsRoute,
   modelsRoute,
   harnessRoute,
+  usageRoute,
+  securityRoute,
 ]);

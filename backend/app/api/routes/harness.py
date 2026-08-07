@@ -93,6 +93,27 @@ class HarnessCompareRequest(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
 
 
+class HarnessCorpusCase(BaseModel):
+    """A single redacted eval case (P6-7 corpus line)."""
+
+    user_message: str = Field(..., min_length=1)
+    id: str = ""
+    thread_id: str = ""
+
+
+class HarnessCorpusReplayRequest(BaseModel):
+    provider: str = Field(..., min_length=1)
+    model: str = Field(..., min_length=1)
+    storage_key: str | None = Field(
+        default=None,
+        description="Object-storage key of a redacted corpus (JSONL under 'eval_corpora/')",
+    )
+    cases: list[HarnessCorpusCase] | None = Field(
+        default=None, description="Inline redacted cases (alternative to storage_key)"
+    )
+    limit: int = Field(default=50, ge=1, le=200)
+
+
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
@@ -503,6 +524,213 @@ async def replay_harness_session(
     )
 
     return _session_to_response(replay_session)
+
+
+# ---------------------------------------------------------------------------
+# Corpus replay (P6-7 redacted corpora)
+# ---------------------------------------------------------------------------
+
+
+async def _load_corpus_cases(
+    request: HarnessCorpusReplayRequest,
+) -> list[HarnessCorpusCase]:
+    """Load redacted cases from object storage or the inline payload."""
+    if request.storage_key and request.cases:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide either storage_key or cases, not both",
+        )
+    if not request.storage_key and not request.cases:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide storage_key or cases",
+        )
+    if request.cases:
+        return request.cases[: request.limit]
+
+    import json
+
+    if not request.storage_key.startswith("eval_corpora/"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="storage_key must live under the 'eval_corpora/' namespace (P6-7)",
+        )
+    from backend.app.infrastructure.storage import get_storage_manager
+
+    try:
+        body, _ = await get_storage_manager().download_file(request.storage_key)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Corpus not found: {request.storage_key}",
+        ) from e
+    cases: list[HarnessCorpusCase] = []
+    for raw in body.decode("utf-8", errors="replace").splitlines():
+        if not raw.strip():
+            continue
+        try:
+            line = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        user_message = str(line.get("user_message") or "").strip()
+        if not user_message:
+            continue
+        cases.append(
+            HarnessCorpusCase(
+                user_message=user_message,
+                id=str(line.get("id") or ""),
+                thread_id=str(line.get("thread_id") or ""),
+            )
+        )
+        if len(cases) >= request.limit:
+            break
+    if not cases:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Corpus {request.storage_key} contains no usable cases",
+        )
+    return cases
+
+
+@router.post(
+    "/replay-corpus",
+    summary="Replay a redacted eval corpus through a pinned deployment (operator only)",
+)
+async def replay_harness_corpus(
+    request: HarnessCorpusReplayRequest,
+    principal: ApiKeyPrincipal = Depends(get_principal),
+) -> dict[str, Any]:
+    """Replay P6-7 redacted eval cases through one pinned provider/model.
+
+    Each case runs independently (corpora are sampled pairs, not threads),
+    through the same production gateway the customer runtime uses, on the
+    internal harness slot — no customer tenant state is read or written.
+    Results (latency, tokens, cost, error) are returned per case and the
+    run is preserved as a fork_replay session in the in-memory workbench.
+    """
+    _require_operator(principal)
+
+    cases = await _load_corpus_cases(request)
+    provider = request.provider
+    model = request.model
+
+    now = datetime.now(UTC).isoformat()
+    session_id = str(uuid4())
+    replay_session: dict[str, Any] = {
+        "id": session_id,
+        "name": f"corpus replay @ {model} ({len(cases)} cases)",
+        "kind": "fork_replay",
+        "status": "active",
+        "provider": provider,
+        "model": model,
+        "config": {"corpus": request.storage_key or "inline"},
+        "messages": [],
+        "created_at": now,
+        "updated_at": now,
+        "_internal": True,
+        "_operator_key_id": principal.key_id,
+    }
+    _SESSIONS[session_id] = replay_session
+
+    gateway = get_gateway()
+    results: list[dict[str, Any]] = []
+    succeeded = failed = 0
+    latencies: list[int] = []
+    total_cost = 0.0
+
+    for case in cases:
+        t0 = time.monotonic()
+        try:
+            result = await _harness_generate(
+                gateway,
+                provider=provider,
+                model=model,
+                message=case.user_message,
+                history=[],
+            )
+        except GatewayError as exc:
+            failed += 1
+            latency_ms = int((time.monotonic() - t0) * 1000)
+            results.append(
+                {
+                    "caseId": case.id,
+                    "threadId": case.thread_id,
+                    "userMessage": case.user_message,
+                    "response": "",
+                    "latencyMs": latency_ms,
+                    "tokensUsed": 0,
+                    "cost": 0.0,
+                    "error": str(exc),
+                }
+            )
+            replay_session["messages"].append(
+                _make_message("user", case.user_message, provider=provider, model=model)
+            )
+            replay_session["messages"].append(
+                _make_message(
+                    "assistant", f"[Error during corpus replay: {exc}]", error=True
+                )
+            )
+            continue
+
+        succeeded += 1
+        latency_ms = int((time.monotonic() - t0) * 1000)
+        latencies.append(latency_ms)
+        usage = result.usage
+        cost = float(usage.get("cost", 0.0))
+        total_cost += cost
+        results.append(
+            {
+                "caseId": case.id,
+                "threadId": case.thread_id,
+                "userMessage": case.user_message,
+                "response": result.content,
+                "latencyMs": latency_ms,
+                "tokensUsed": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                "cost": cost,
+                "error": None,
+            }
+        )
+        replay_session["messages"].append(
+            _make_message("user", case.user_message, provider=provider, model=model)
+        )
+        replay_session["messages"].append(
+            _make_message(
+                "assistant",
+                result.content,
+                provider=provider,
+                model=model,
+                latency_ms=latency_ms,
+                tokens_used=usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                cost=cost,
+                metadata={"usage": usage, "replayed": True, "case_id": case.id},
+            )
+        )
+
+    replay_session["updated_at"] = datetime.now(UTC).isoformat()
+
+    logger.info(
+        "harness_corpus_replayed",
+        session_id=session_id,
+        provider=provider,
+        model=model,
+        cases=len(cases),
+        succeeded=succeeded,
+        failed=failed,
+        operator=principal.key_id,
+    )
+
+    return {
+        "session": _session_to_response(replay_session),
+        "summary": {
+            "replayed": len(cases),
+            "succeeded": succeeded,
+            "failed": failed,
+            "avg_latency_ms": int(sum(latencies) / len(latencies)) if latencies else 0,
+            "total_cost": round(total_cost, 6),
+        },
+        "results": results,
+    }
 
 
 # ---------------------------------------------------------------------------

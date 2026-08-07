@@ -15,6 +15,7 @@ import {
   listCircuitBreakers,
   resetCircuitBreaker,
 } from '../../lib/api/endpoints';
+import { MfaCancelled, useMfaProof } from '../security/mfa';
 import type { ModelCatalogEntry } from '../../lib/api/types';
 
 const STATUS_STYLES: Record<string, string> = {
@@ -40,6 +41,7 @@ const PROVIDER_LOGOS: Record<string, string> = {
 
 export function ModelCatalogUI() {
   const queryClient = useQueryClient();
+  const { getProof } = useMfaProof();
   const [activeTab, setActiveTab] = useState<'models' | 'circuit-breakers'>('models');
   const [providerFilter, setProviderFilter] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
@@ -55,8 +57,16 @@ export function ModelCatalogUI() {
   });
 
   const updateMut = useMutation({
-    mutationFn: ({ id, input }: { id: string; input: Partial<ModelCatalogEntry> }) =>
-      updateModel(id, input),
+    mutationFn: async ({ id, input }: { id: string; input: Partial<ModelCatalogEntry> }) => {
+      let proof: string | null;
+      try {
+        proof = await getProof();
+      } catch (err) {
+        if (err instanceof MfaCancelled) return null;
+        throw err;
+      }
+      return updateModel(id, input, { proof });
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['models'] });
       setSuccessMsg('Model updated.');
@@ -66,8 +76,16 @@ export function ModelCatalogUI() {
   });
 
   const resetCbMut = useMutation({
-    mutationFn: ({ provider, model }: { provider: string; model: string }) =>
-      resetCircuitBreaker(provider, model),
+    mutationFn: async ({ provider, model }: { provider: string; model: string }) => {
+      let proof: string | null;
+      try {
+        proof = await getProof();
+      } catch (err) {
+        if (err instanceof MfaCancelled) return null;
+        throw err;
+      }
+      return resetCircuitBreaker(provider, model, { proof });
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['circuit-breakers'] });
       setSuccessMsg('Circuit breaker reset.');

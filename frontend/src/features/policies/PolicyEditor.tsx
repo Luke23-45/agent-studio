@@ -16,6 +16,7 @@ import {
   updatePolicy,
   publishPolicy,
 } from '../../lib/api/endpoints';
+import { MfaCancelled, useMfaProof } from '../security/mfa';
 import type { PolicyRule } from '../../lib/api/types';
 
 interface Props {
@@ -42,6 +43,7 @@ const STATUS_COLORS: Record<string, string> = {
 
 export function PolicyEditor({ tenantId }: Props) {
   const queryClient = useQueryClient();
+  const { getProof } = useMfaProof();
   const [selectedPolicyId, setSelectedPolicyId] = useState<string | null>(null);
   const [showNewRuleForm, setShowNewRuleForm] = useState(false);
   const [editingRules, setEditingRules] = useState<PolicyRule[] | null>(null);
@@ -98,9 +100,16 @@ export function PolicyEditor({ tenantId }: Props) {
   });
 
   const publishMut = useMutation({
-    mutationFn: () => {
-      if (!selectedPolicyId) return Promise.resolve(null as any);
-      return publishPolicy(tenantId, selectedPolicyId);
+    mutationFn: async () => {
+      if (!selectedPolicyId) return null;
+      let proof: string | null;
+      try {
+        proof = await getProof();
+      } catch (err) {
+        if (err instanceof MfaCancelled) return null;
+        throw err;
+      }
+      return publishPolicy(tenantId, selectedPolicyId, { proof });
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['policies', tenantId] });

@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from backend.app.api.dependencies.auth import (
     ApiKeyPrincipal,
+    require_mfa_proof,
     require_permission,
 )
 from backend.app.gateway.catalog import get_default_catalog
@@ -84,6 +85,7 @@ async def update_model(
     model_id: str,
     request: ModelStatusUpdate,
     principal: ApiKeyPrincipal = Depends(require_permission("models:write")),
+    _mfa: ApiKeyPrincipal = Depends(require_mfa_proof),
 ) -> dict[str, Any]:
     """Set a deployment's enablement status (process-scoped)."""
     if ":" not in model_id:
@@ -187,6 +189,7 @@ class CircuitBreakerResetRequest(BaseModel):
 async def reset_circuit_breakers(
     request: CircuitBreakerResetRequest,
     principal: ApiKeyPrincipal = Depends(require_permission("models:write")),
+    _mfa: ApiKeyPrincipal = Depends(require_mfa_proof),
 ) -> dict[str, Any]:
     """Clear cooldown state: one deployment (provider+model), one provider,
     or all deployments when neither is given."""

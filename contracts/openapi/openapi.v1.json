@@ -2853,6 +2853,50 @@
         }
       }
     },
+    "/api/v1/harness/replay-corpus": {
+      "post": {
+        "tags": [
+          "Harness (Internal Only)"
+        ],
+        "summary": "Replay a redacted eval corpus through a pinned deployment (operator only)",
+        "description": "Replay P6-7 redacted eval cases through one pinned provider/model.\n\nEach case runs independently (corpora are sampled pairs, not threads),\nthrough the same production gateway the customer runtime uses, on the\ninternal harness slot \u2014 no customer tenant state is read or written.\nResults (latency, tokens, cost, error) are returned per case and the\nrun is preserved as a fork_replay session in the in-memory workbench.",
+        "operationId": "replay_harness_corpus_api_v1_harness_replay_corpus_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HarnessCorpusReplayRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Replay Harness Corpus Api V1 Harness Replay Corpus Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/harness/compare": {
       "post": {
         "tags": [
@@ -3770,6 +3814,643 @@
                   "additionalProperties": true,
                   "type": "object",
                   "title": "Response Reset Circuit Breakers Api V1 Gateway Circuit Breakers Reset Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/oidc/status": {
+      "get": {
+        "tags": [
+          "Operator Auth (SSO/MFA)"
+        ],
+        "summary": "Oidc Status",
+        "description": "Whether SSO is enabled on this deployment (drives the login page).",
+        "operationId": "oidc_status_api_v1_auth_oidc_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "type": "object",
+                  "title": "Response Oidc Status Api V1 Auth Oidc Status Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/oidc/authorize": {
+      "get": {
+        "tags": [
+          "Operator Auth (SSO/MFA)"
+        ],
+        "summary": "Oidc Authorize",
+        "description": "Start the authorization-code flow; redirects to the IdP.",
+        "operationId": "oidc_authorize_api_v1_auth_oidc_authorize_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/oidc/callback": {
+      "get": {
+        "tags": [
+          "Operator Auth (SSO/MFA)"
+        ],
+        "summary": "Oidc Callback",
+        "description": "IdP callback: exchange the code, verify the id_token, hand the\nfrontend a one-time exchange code (never the bearer token).",
+        "operationId": "oidc_callback_api_v1_auth_oidc_callback_get",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Code"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Error"
+            }
+          },
+          {
+            "name": "error_description",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Error Description"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/oidc/exchange": {
+      "post": {
+        "tags": [
+          "Operator Auth (SSO/MFA)"
+        ],
+        "summary": "Oidc Exchange",
+        "description": "Exchange a one-time code for an operator session bearer token.",
+        "operationId": "oidc_exchange_api_v1_auth_oidc_exchange_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OidcExchangeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Oidc Exchange Api V1 Auth Oidc Exchange Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/mfa/status": {
+      "get": {
+        "tags": [
+          "Operator Auth (SSO/MFA)"
+        ],
+        "summary": "Mfa Status",
+        "operationId": "mfa_status_api_v1_auth_mfa_status_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "type": "object",
+                  "title": "Response Mfa Status Api V1 Auth Mfa Status Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/mfa/setup": {
+      "post": {
+        "tags": [
+          "Operator Auth (SSO/MFA)"
+        ],
+        "summary": "Mfa Setup",
+        "description": "Generate a pending TOTP secret (encrypted at rest). Confirm to activate.",
+        "operationId": "mfa_setup_api_v1_auth_mfa_setup_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MfaSetupResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/mfa/confirm": {
+      "post": {
+        "tags": [
+          "Operator Auth (SSO/MFA)"
+        ],
+        "summary": "Mfa Confirm",
+        "description": "Verify a live code against the pending secret and activate MFA.",
+        "operationId": "mfa_confirm_api_v1_auth_mfa_confirm_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "type": "object",
+                  "title": "Response Mfa Confirm Api V1 Auth Mfa Confirm Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/mfa/proof": {
+      "post": {
+        "tags": [
+          "Operator Auth (SSO/MFA)"
+        ],
+        "summary": "Mfa Proof",
+        "description": "Verify a live code and mint a short-lived proof for privileged ops.",
+        "operationId": "mfa_proof_api_v1_auth_mfa_proof_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MfaProofRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Mfa Proof Api V1 Auth Mfa Proof Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/mfa": {
+      "delete": {
+        "tags": [
+          "Operator Auth (SSO/MFA)"
+        ],
+        "summary": "Mfa Disable",
+        "description": "Disable MFA (requires a valid proof when already enabled).",
+        "operationId": "mfa_disable_api_v1_auth_mfa_delete",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "type": "object",
+                  "title": "Response Mfa Disable Api V1 Auth Mfa Delete"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/usage/summary": {
+      "get": {
+        "tags": [
+          "Usage & Billing"
+        ],
+        "summary": "Usage Summary",
+        "description": "Platform usage totals, broken down per tenant (or own tenant only\nfor tenant-bound principals).",
+        "operationId": "usage_summary_api_v1_usage_summary_get",
+        "parameters": [
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO-8601 start",
+              "title": "Since"
+            },
+            "description": "ISO-8601 start"
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "ISO-8601 end",
+              "title": "Until"
+            },
+            "description": "ISO-8601 end"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Usage Summary Api V1 Usage Summary Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/usage/tenants/{tenant_id}": {
+      "get": {
+        "tags": [
+          "Usage & Billing"
+        ],
+        "summary": "Usage Tenant Detail",
+        "description": "Per-tenant usage: totals plus per-model, per-surface and per-day\nbreakdowns (last 90 days by default).",
+        "operationId": "usage_tenant_detail_api_v1_usage_tenants__tenant_id__get",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "name": "until",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Usage Tenant Detail Api V1 Usage Tenants  Tenant Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/usage/quota": {
+      "get": {
+        "tags": [
+          "Usage & Billing"
+        ],
+        "summary": "Usage Quota",
+        "description": "Durable USD quota windows (limit vs spent per window).",
+        "operationId": "usage_quota_api_v1_usage_quota_get",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "name": "scope_type",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Scope Type"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Usage Quota Api V1 Usage Quota Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/usage/events": {
+      "get": {
+        "tags": [
+          "Usage & Billing"
+        ],
+        "summary": "Usage Events",
+        "description": "Newest spend events (drill-down feed).",
+        "operationId": "usage_events_api_v1_usage_events_get",
+        "parameters": [
+          {
+            "name": "tenant_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Tenant Id"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Usage Events Api V1 Usage Events Get"
                 }
               }
             }
@@ -5040,6 +5721,85 @@
         ],
         "title": "HarnessCompareRequest"
       },
+      "HarnessCorpusCase": {
+        "properties": {
+          "user_message": {
+            "type": "string",
+            "minLength": 1,
+            "title": "User Message"
+          },
+          "id": {
+            "type": "string",
+            "title": "Id",
+            "default": ""
+          },
+          "thread_id": {
+            "type": "string",
+            "title": "Thread Id",
+            "default": ""
+          }
+        },
+        "type": "object",
+        "required": [
+          "user_message"
+        ],
+        "title": "HarnessCorpusCase",
+        "description": "A single redacted eval case (P6-7 corpus line)."
+      },
+      "HarnessCorpusReplayRequest": {
+        "properties": {
+          "provider": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Provider"
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "title": "Model"
+          },
+          "storage_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Storage Key",
+            "description": "Object-storage key of a redacted corpus (JSONL under 'eval_corpora/')"
+          },
+          "cases": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/HarnessCorpusCase"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cases",
+            "description": "Inline redacted cases (alternative to storage_key)"
+          },
+          "limit": {
+            "type": "integer",
+            "maximum": 200.0,
+            "minimum": 1.0,
+            "title": "Limit",
+            "default": 50
+          }
+        },
+        "type": "object",
+        "required": [
+          "provider",
+          "model"
+        ],
+        "title": "HarnessCorpusReplayRequest"
+      },
       "HarnessForkRequest": {
         "properties": {
           "at_message_id": {
@@ -5158,6 +5918,59 @@
           "model"
         ],
         "title": "HarnessSessionCreate"
+      },
+      "MfaConfirmRequest": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "maxLength": 8,
+            "minLength": 6,
+            "title": "Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "title": "MfaConfirmRequest"
+      },
+      "MfaProofRequest": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "maxLength": 8,
+            "minLength": 6,
+            "title": "Code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "title": "MfaProofRequest"
+      },
+      "MfaSetupResponse": {
+        "properties": {
+          "secret": {
+            "type": "string",
+            "title": "Secret"
+          },
+          "otpauthUri": {
+            "type": "string",
+            "title": "Otpauthuri"
+          },
+          "pending": {
+            "type": "boolean",
+            "title": "Pending",
+            "default": true
+          }
+        },
+        "type": "object",
+        "required": [
+          "secret",
+          "otpauthUri"
+        ],
+        "title": "MfaSetupResponse"
       },
       "MintSessionTokenRequest": {
         "properties": {
@@ -5305,6 +6118,21 @@
           "status"
         ],
         "title": "ModelStatusUpdate"
+      },
+      "OidcExchangeRequest": {
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 16,
+            "title": "Code",
+            "description": "One-time exchange code"
+          }
+        },
+        "type": "object",
+        "required": [
+          "code"
+        ],
+        "title": "OidcExchangeRequest"
       },
       "PolicyRuleInput": {
         "properties": {

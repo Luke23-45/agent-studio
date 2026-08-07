@@ -1,13 +1,13 @@
 import { Link } from '@tanstack/react-router';
 import { useAuthStore } from '../../lib/auth/session';
-import { clearStoredApiKey } from '../../lib/auth/storage';
+import { clearStoredSession } from '../../lib/auth/storage';
 
 export function Header() {
   const principal = useAuthStore((s) => s.principal);
   const clear = useAuthStore((s) => s.clear);
 
   function handleLogout() {
-    clearStoredApiKey();
+    clearStoredSession();
     clear();
   }
 

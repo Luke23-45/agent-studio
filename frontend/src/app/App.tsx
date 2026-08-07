@@ -3,10 +3,11 @@ import { Outlet } from '@tanstack/react-router';
 import { Header } from '../components/layout/Header';
 import { Sidebar } from '../components/layout/Sidebar';
 import { Login } from '../features/auth/Login';
+import { MfaModalHost } from '../features/security/mfa';
 import { apiErrorMessage } from '../lib/api/client';
 import { fetchPrincipal } from '../lib/api/endpoints';
 import { useAuthStore } from '../lib/auth/session';
-import { clearStoredApiKey } from '../lib/auth/storage';
+import { clearStoredSession, getStoredApiKey, getStoredOperatorToken } from '../lib/auth/storage';
 
 export function App() {
   const apiKey = useAuthStore((s) => s.apiKey);
@@ -15,9 +16,12 @@ export function App() {
   const setApiKey = useAuthStore((s) => s.setApiKey);
   const clear = useAuthStore((s) => s.clear);
 
-  // Resolve the principal once when a key exists but no principal is known yet.
+  const hasStoredCredential = !!getStoredApiKey() || !!getStoredOperatorToken();
+
+  // Resolve the principal once when a credential exists but no principal is
+  // known yet (API key or OIDC operator session).
   useEffect(() => {
-    if (!apiKey || principal) return;
+    if (!hasStoredCredential || principal) return;
     let cancelled = false;
     fetchPrincipal()
       .then((p) => {
@@ -33,7 +37,7 @@ export function App() {
       })
       .catch((err) => {
         if (cancelled) return;
-        clearStoredApiKey();
+        clearStoredSession();
         setApiKey(null);
         setPrincipal(null);
         console.error('principal resolution failed:', apiErrorMessage(err));
@@ -41,7 +45,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [apiKey, principal, setApiKey, setPrincipal]);
+  }, [hasStoredCredential, principal, setApiKey, setPrincipal]);
 
   // Any 401/403 from the API layer drops the session.
   useEffect(() => {
@@ -50,12 +54,13 @@ export function App() {
     return () => window.removeEventListener('neryva:auth-error', onAuthError);
   }, [clear]);
 
-  if (!apiKey) {
+  if (!apiKey && !hasStoredCredential) {
     return <Login />;
   }
 
   return (
     <div className="min-h-screen bg-gray-50">
+      <MfaModalHost />
       <Header />
       <div className="flex">
         <Sidebar />

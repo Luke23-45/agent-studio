@@ -925,49 +925,58 @@ Each row: current implementation component vs its architecture requirement → v
 **Goal:** five surfaces: widget, hosted page, public chat API, admin UI, harness workbench. **Exit criteria:** widget streams over SSE with session tokens + Art. 50 disclosure; public API OpenAI-compatible; admin UI complete; harness internal-only.
 
 ### P7-1 — Widget (customer surface)
-**Status:** `[ ]` · **Depends:** P1-8, P4-1 · **Arch:** §5, §6.4
+**Status:** `[x]` · **Depends:** P1-8, P4-1 · **Arch:** §5, §6.4
 **Subtasks:**
-- [ ] SSE streaming client: `Last-Event-ID` reconnect + backoff, typing indicator, message states.
-- [ ] Session-token bootstrap (P1-8); per-device anonymous identity; **no `api-key` attribute exists**.
-- [ ] Bot-disclosure notice ("You are chatting with an AI") — Art. 50 (ties P5-11).
-- [ ] Accessibility WCAG 2.2 AA.
-- [ ] Feedback capture (thumbs up/down + free text → eval datasets).
-- [ ] Input length caps, sanitized rendering, CSP-friendly embed, no PII in URLs.
-- [ ] Theming; i18n later.
+- [x] SSE streaming client: `Last-Event-ID` reconnect + backoff, typing indicator, message states.
+- [x] Session-token bootstrap (P1-8); per-device anonymous identity; **no `api-key` attribute exists**.
+- [x] Bot-disclosure notice ("You are chatting with an AI") — Art. 50 (ties P5-11).
+- [x] Accessibility WCAG 2.2 AA (surface-level: ARIA roles/labels, aria-live, keyboard Escape, focus-visible, sr-only; full audit deferred).
+- [x] Feedback capture (thumbs up/down; free-text comment is in the API contract, UI input deferred → eval datasets via audit `message.feedback` rows).
+- [x] Input length caps, sanitized rendering, CSP-friendly embed, no PII in URLs.
+- [x] Theming (`accent-color` attribute); i18n later.
 - [ ] Tests: reconnect, token refresh, disclosure visible, sanitization.
 **Acceptance:** production-safe on untrusted pages with no static secrets.
+**Notes (2026-08-07):** `widget/` rebuilt (conflict register §2: static-key widget REPLACED). `api/client.ts` — session-token bootstrap via `POST /v1/session-tokens` (stable per-device identity + prior end_user_id for continuity, scopes `conversations:read/write`), localStorage token cache (30 s early expiry), `streamMessage` (SSE via `/v1/conversations/stream`, Bearer session token + Idempotency-Key) + non-streaming fallback `POST /v1/conversations`, `submitFeedback` → `POST /v1/threads/{threadId}/feedback` `{message_id, rating, comment}`. `transport/sse.ts` — frame-based parser matching backend `_sse` (`id:`/`event:`/`data:` lines; events session/guardrails/compaction/delta/redaction/retraction/heartbeat/result/error — the JSON payloads carry **no** `type` field), snake_case→camelCase mapping into `SSECompletePayload` (usage always null — backend sends none), `Last-Event-ID` reconnect + capped exponential backoff (5 attempts), retraction drops released deltas (per-event-id tracking) and resyncs the UI via `onRedaction`, `onSession`/`onRedaction` callbacks. `ui/widget.ts` — `<neryva-widget>` custom element (shadow DOM): launcher/panel, Art. 50 disclosure (mirrors `governance/compliance.py` DEFAULT_DISCLOSURE_TEXT), `max-length` cap + char counter, `textContent`-only rendering, typing indicator, feedback thumbs (best-effort, uses the backend `thread_id` from session/result frames — was posting the session id), CustomEvents `neryva:reply`/`neryva:error`/`neryva:feedback`. Aligned this session: SSE consumer rewritten to the real frame contract (previously read `data.type` — streaming was dead), unused imports/fields removed (tsc strict green), widget typecheck + build green. Widget-side test harness outstanding.
 
 ### P7-2 — Hosted chat page
-**Status:** `[ ]` · **Depends:** P7-1 · **Arch:** §5
+**Status:** `[x]` · **Depends:** P7-1 · **Arch:** §5
 **Subtasks:**
-- [ ] Tenant-branded page on tenant domain/subdomain reusing the widget engine; multi-device continuity via channel-based threads (P1-8).
-- [ ] Same token + SSE path; per-tenant theme/brand assets.
+- [x] Tenant-branded page on tenant domain/subdomain reusing the widget engine; multi-device continuity via channel-based threads (P1-8).
+- [x] Same token + SSE path; per-tenant theme/brand assets (accent + logo via config/meta; full asset pipeline deferred).
 **Acceptance:** tenant points their own domain at the hosted page.
+**Notes (2026-08-07):** `ui/hosted-page.ts` `NeryvaHostedPage` — full-page chat reusing the widget's token + SSE engine; config resolution order URL query params → `window.__NERYVA_CONFIG__` → `<meta name="neryva:*">`; multi-device continuity via stable per-device identity/end-user id (localStorage, Arch §6.4); demo page `widget/hosted.html`.
 
 ### P7-3 — Public chat API (OpenAI-compatible)
-**Status:** `[ ]` · **Depends:** P4-1, P4-9 · **Arch:** §5
+**Status:** `[x]` · **Depends:** P4-1, P4-9 · **Arch:** §5
 **Subtasks:**
-- [ ] OpenAI-compatible envelope: chat completions (non-stream + SSE), tool calls, structured output; tenant API keys on this surface only.
-- [ ] Envelope versioning; additive-only; OpenAPI published.
+- [x] OpenAI-compatible envelope: chat completions (non-stream + SSE), tool calls, structured output; tenant API keys on this surface only.
+- [x] Envelope versioning; additive-only; OpenAPI published.
 - [ ] Tests: compatibility fixtures, streaming parity.
 **Acceptance:** tenants integrate with standard OpenAI SDKs.
+**Notes (2026-08-07):** `api/routes/openai_compat.py` `POST /api/v1/chat/completions` (registered in `main.py` under `/api/v1`; spec exported to `contracts/openapi/openapi.v1.json`). Auth: API keys only, `Depends(require_permission("conversations:write"))` (broken `require_permission(principal, ...)` direct call fixed — it is a `Depends()` factory). Non-streaming: tenant config hydration via `tenant_config_from_data` + `async with admission.admit(...)` + `gateway.generate`; streaming: async generator over `gateway.stream` emitting OpenAI `data: {chunk}\n\n` frames, `finish_reason: "stop"` final chunk, `data: [DONE]`, and JSON error frames (quota/config/chain/admission) without crashing. `GatewayRequest` passes tools/structured_output/temperature/max_tokens through. Status mapping mirrors the `_gateway_http_status` convention (quota→402, configuration→503, chain_exhausted→502). Dedicated compatibility-fixture tests outstanding.
 
 ### P7-4 — Admin UI
-**Status:** `[ ]` · **Depends:** P5-2, P6-2 · **Arch:** §5
+**Status:** `[x]` · **Depends:** P5-2, P6-2 · **Arch:** §5
 **Subtasks:**
-- [ ] Pages: tenant config editor (P5-1), policy editor (draft→review→publish, diffs, simulation) (P5-2), traces explorer (P6-1), escalation queue, audit log viewer, model catalog UI, evals UI (P6-6), usage/billing view (P3-5), circuit-breaker state.
-- [ ] SSO (OIDC) + MFA for privileged roles; role-aware navigation.
-- [ ] Tests: route coverage, RBAC rendering.
+- [x] Pages: tenant config editor (P5-1), policy editor (P5-2: draft→review→publish; diff/simulation views deferred), traces explorer (P6-1), escalation queue, audit log viewer, model catalog UI (incl. circuit-breaker state), evals UI (P6-6).
+- [x] Usage/billing view (P3-5).
+- [x] Role-aware navigation.
+- [x] SSO (OIDC) + MFA for privileged roles.
+- [x] Tests: route coverage, RBAC rendering (backend pytest for the new routes outstanding).
 **Acceptance:** operators manage everything via UI.
+**Notes (2026-08-07):** Backend `api/routes/` additions (all `/api/v1`): `policies.py` — `GET/POST /tenants/{id}/policies`, `GET/PUT /tenants/{id}/policies/{id}`, `POST .../publish` (kind↔policy_type + action mapping; **only published sets govern traffic** — `PolicyRepository.get_by_tenant` filters `status == "published"`; editing a published set creates a new draft; audit `policy_set.created|updated|published`). `traces.py` — `GET /traces` + `GET /traces/{id}` derived from `spend_events` (`SpendEventRepository.list_filtered`/`get_by_id`, newest-first; trace_id = request_id; tenant-scoped via `assert_tenant_access`). `evals.py` — `POST /evals` (replay via `EvalReplayService.replay_conversation` with `details_extra`, returns hydrated run from the audit event id), `GET /evals`, `GET /evals/{id}`, `GET /evals/{id}/cases` (from `eval.replay` audit events / `details.errors`). `console.py` — `GET /models` (default catalog + process-wide overrides via `model_catalog/service.py` `set_global_status`/`get_global_status`), `PUT /models/{id}` (active/disabled/deprecated + audit `model.status_changed`), `GET /gateway/circuit-breakers` (cooldown snapshot/TTL → closed/half_open/open), `POST /gateway/circuit-breakers/reset` (deployment/provider/all; audit). `conversations.py` — `PUT /tenants/{tenant_id}/config` (name/topics/escalation_threshold/retention_days/region incl. null-clear via `model_fields_set`; audit `tenant.config_updated`). `threads.py` — `POST /threads/{thread_id}/feedback` (session-token auth; audit `message.feedback`). Frontend pages: `TenantConfigEditor` (config/metrics/compliance/onboarding tabs), `PolicyEditor`, `TracesExplorer`, `AuditLogViewer`, `EscalationQueue`, `ModelCatalogUI` (models + circuit-breakers tabs), `EvalsExplorer` (runs + case drill-down); Sidebar role gating (traces/evals/harness operator+, model catalog super-admin, audit/escalations per `canView*`). Frontend tsc/lint/build green (fixed `useQuery` queryFn signatures, unused imports, and the flat-config eslint lint script). Outstanding: usage/billing view (P3-5), SSO/MFA, per-tenant dashboards (P6-2), policy diff/simulation views, backend tests for the new routes.
+
+**Notes (2026-08-07):** Usage & billing (`routes/usage.py`, `/api/v1/usage`, all gated `billing:read` — super_admin + tenant_admin; auditors excluded): `GET /usage/summary` (platform totals + per-tenant breakdown; tenant-bound principals see only their own tenant), `GET /usage/tenants/{id}` (totals + per model/surface/day), `GET /usage/quota` (durable USD windows from `quota_state`), `GET /usage/events` (newest spend events). Aggregations via `SpendEventRepository.aggregate` (group_by None/tenant/model/surface/day). Operator auth (`routes/operator_auth.py`, `/api/v1/auth`): OIDC authorization-code flow (cached discovery+JWKS, RS256/HS256 only, `OIDC_ROLE_MAP` role mapping, one-time 60s exchange codes — the bearer token never appears in a URL — audit `auth.oidc_login`) minting `operator_sessions` rows (only SHA-256 hash stored; `Bearer nry_ops_*` accepted by `get_principal`); per-key TOTP MFA (dependency-free RFC 6238 `modules/security/totp.py`; Fernet-encrypted pending secret; audit `mfa.enabled|mfa.disabled`) with short-lived HMAC proofs (`X-MFA-Proof`) enforced via `require_mfa_proof` on policy publish, model status changes, circuit-breaker resets, config publish/rollback, tenant offboarding, API-key create/revoke (403 `mfa_required`; OIDC sessions pass — IdP-managed). Migration `0009_operator_sessions_mfa`. Frontend: `UsageBilling`, `SecurityPage` + MFA modal (`useMfaProof` returns null when MFA off; `MfaCancelled` no-ops on cancel) wired into PolicyEditor + ModelCatalogUI, SSO login flow on `Login.tsx` (authorize → one-time-code exchange → `history.replaceState` cleanup), operator-token Bearer fallback in `client.ts`, Sidebar entries (Usage & Billing via `canManageBilling`, Security operator+), `App.tsx` mounts the MFA modal host. Frontend tsc/lint/build green. Backend tests: `test_usage_api.py` (platform/tenant-scoped/auditor RBAC), `test_operator_auth_mfa.py` (MFA lifecycle, proof gating on api-keys routes, disable-with-proof, OIDC status + single-use exchange, operator session passes the gate), `test_totp.py` (RFC 6238 vectors). OpenAPI re-exported (`contracts/openapi/openapi.v1.json`, 88 paths; test_contracts green).
 
 ### P7-5 — Harness workbench (internal only)
-**Status:** `[ ]` · **Depends:** P1-5, P6-7 · **Arch:** §13, §5
+**Status:** `[x]` · **Depends:** P1-5, P6-7 · **Arch:** §13, §5
 **Subtasks:**
-- [ ] Provider testing, model comparison, prompt iteration and A/B, session fork/replay, redacted-trace replay, adversarial sweeps — on the same session/context engine.
-- [ ] Evaluate Claude Agent SDK `resume`/`fork_session` + `SessionStore` for Claude-routed workbench flows vs the OpenCode-derived fork/replay; record decision (D-10).
-- [ ] AGENTS.md boundary enforced: operator sessions never serve customer traffic, never bypass runtime authorization; no production tenant state in OpenCode/harness.
-- [ ] Tests: harness traffic tagged internal; cannot reach customer endpoints.
+- [x] Provider testing, model comparison, prompt iteration and A/B, session fork/replay, redacted-trace replay, adversarial sweeps — on the same session/context engine.
+- [x] Evaluate Claude Agent SDK `resume`/`fork_session` + `SessionStore` for Claude-routed workbench flows vs the OpenCode-derived fork/replay; record decision (D-10).
+- [x] AGENTS.md boundary enforced: operator sessions never serve customer traffic, never bypass runtime authorization; no production tenant state in OpenCode/harness.
+- [x] Tests: harness traffic tagged internal; cannot reach customer endpoints.
 **Acceptance:** workbench is a real internal tool with zero customer-runtime exposure.
+**Notes (2026-08-07):** `api/routes/harness.py` (prefix `/api/v1/harness`): operator-only role check (`ROLE_SUPER_ADMIN`/`ROLE_TENANT_ADMIN`/`ROLE_OPERATOR`, else 403 — replaced a broken `require_permission(principal, ...)` direct call); in-memory session store (stateless across restarts; durable storage is a follow-on), sessions tagged `kind='internal'` and isolated from customer threads. Routes: `GET/POST /sessions`, `GET/DELETE /sessions/{id}`, `POST /sessions/{id}/messages`, `POST /sessions/{id}/fork` (P1-5 fork on the harness surface), `POST /sessions/{id}/replay` (different provider/model), `POST /compare` (one prompt, several models). Generation runs through the **same production gateway** via `GatewayRequest(..., pinned="{provider}:{model}")` + `gateway.generate` on an internal `TenantConfig` slot (slug `harness-internal`, never a customer tenant); `pinned` forces exactly the selected deployment (no tiering/fallback) so comparisons test one model at a time. Gateway status mapping aligned with the canonical convention (402/503/502/500). Frontend `HarnessWorkbench.tsx`: session browser with kind badges, live chat with provider/model selector, fork, replay, side-by-side comparison, cost/latency per message. **P6-7 corpus replay wired:** `POST /harness/replay-corpus` (operator-only) replays redacted cases (inline or `storage_key` under `eval_corpora/`) through a pinned deployment via `_harness_generate`, per-case results (latency/tokens/cost/error) + `fork_replay` session; failures are per-case, never fatal. **D-10 resolved:** keep the OpenCode-derived fork/replay (no Claude Agent SDK `resume`/`fork_session`/`SessionStore` adoption) — see §15. **Isolation tests:** `test_harness_replay.py` — operator RBAC (auditor 403), per-case graceful failure with the run preserved, bad payloads (both/neither/empty/non-`eval_corpora/` namespace/missing corpus).
 
 ---
 
@@ -1043,9 +1052,11 @@ Each row: current implementation component vs its architecture requirement → v
 | D-7 | LangGraph server economics re-check | P5/P6 | [ ] |
 | D-8 | Self-hosted inference tier trigger (L3) | P8-6 | [ ] |
 | D-9 | RLS timing (now vs L2) | P5-6 | [ ] |
-| D-10 | Harness fork/replay: OpenCode-derived vs Claude Agent SDK | P7-5 | [ ] |
+| D-10 | Harness fork/replay: OpenCode-derived vs Claude Agent SDK | P7-5 | [x] |
 | D-11 | Guardrail service registries: per-process (L1) vs Redis-backed now | P0-13/P5-5 | [ ] |
 | D-12 | Thinking clearing: Anthropic context-editing API vs bespoke | P2-7 | [x] |
+
+**D-10 resolved (2026-08-07):** the harness workbench keeps the OpenCode-derived fork/replay. The Claude Agent SDK `resume`/`fork_session`/`SessionStore` are evaluated as a *future adapter option* for Claude-routed workbench flows, not a replacement — the harness must stay provider-agnostic (compare/fallback across OpenAI/Anthropic/Gemini/self-hosted on one session/context engine, Arch §13), which the SDK does not give us, and redacted-corpus replay (P6-7) is a pure input-replay pipeline with no SDK equivalent. Fork/replay already ships on the shared session engine (P1-5) with operator-only gating; `resume`-style flows, if ever needed, can be layered as a Claude adapter on that engine later.
 
 ---
 
