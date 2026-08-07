@@ -24,12 +24,18 @@ from backend.app.api.middleware import (
     LoggingMiddleware,
 )
 from backend.app.api.routes import (
+    console_router,
     conversations_router,
+    evals_router,
+    harness_router,
     model_catalog_router,
+    openai_compat_router,
     operations_router,
+    policies_router,
     sessions_router,
     surfaces_router,
     threads_router,
+    traces_router,
     webhooks_router,
 )
 from backend.app.gateway.admission import get_admission_gate, init_admission
@@ -239,7 +245,13 @@ def create_application() -> FastAPI:
     app.include_router(threads_router, prefix="/api/v1")
     app.include_router(webhooks_router, prefix="/api/v1")
     app.include_router(model_catalog_router, prefix="/api/v1")
+    app.include_router(openai_compat_router, prefix="/api/v1")
+    app.include_router(harness_router, prefix="/api/v1")
     app.include_router(operations_router, prefix="/api/v1")
+    app.include_router(policies_router, prefix="/api/v1")
+    app.include_router(traces_router, prefix="/api/v1")
+    app.include_router(evals_router, prefix="/api/v1")
+    app.include_router(console_router, prefix="/api/v1")
 
     @app.get("/health/live")
     async def liveness_check():

@@ -1,98 +1,107 @@
-/* eslint-disable react-refresh/only-export-components -- route tree must export route objects + components together */
+/* eslint-disable react-refresh/only-export-components */
 import { createRootRoute, createRoute } from '@tanstack/react-router';
 import { App } from './App';
 import { Dashboard } from '../features/dashboard/Dashboard';
 import { TenantsList } from '../features/tenants/TenantsList';
+import { PolicyEditor } from '../features/policies/PolicyEditor';
+import { TracesExplorer } from '../features/traces/TracesExplorer';
+import { AuditLogViewer } from '../features/traces/AuditLogViewer';
+import { EvalsExplorer } from '../features/evaluations/EvalsExplorer';
+import { EscalationQueue } from '../features/handoffs/EscalationQueue';
+import { ModelCatalogUI } from '../features/tenants/ModelCatalogUI';
+import { HarnessWorkbench } from '../features/harness/HarnessWorkbench';
+import { useAuthStore } from '../lib/auth/session';
 
 // Root route
-const rootRoute = createRootRoute({
-  component: App,
-});
+const rootRoute = createRootRoute({ component: App });
 
-// Dashboard route
+// Dashboard
 const dashboardRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/',
   component: Dashboard,
 });
 
-// Tenant routes
+// Tenants
 const tenantsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/tenants',
   component: TenantsList,
 });
 
-// Policy routes
+// Policies — now uses the real editor
 const policiesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/policies',
-  component: PoliciesList,
+  component: PoliciesPage,
 });
 
-function PoliciesList() {
-  return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900">Policies</h1>
-      <p className="text-gray-600">Configure guardrails, safety rules, and compliance settings.</p>
-    </div>
-  );
+function PoliciesPage() {
+  const principal = useAuthStore((s) => s.principal);
+  const tenantId = principal?.tenantId ?? '';
+  if (!tenantId) {
+    return (
+      <div className="space-y-4">
+        <h1 className="text-2xl font-bold text-gray-900">Policies</h1>
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 text-sm text-yellow-800">
+          Select a tenant context to manage its policies, or use a tenant-bound API key.
+        </div>
+      </div>
+    );
+  }
+  return <PolicyEditor tenantId={tenantId} />;
 }
 
-// Traces route
+// Traces
 const tracesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/traces',
-  component: TracesList,
+  component: TracesExplorer,
 });
 
-function TracesList() {
-  return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900">Traces</h1>
-      <p className="text-gray-600">View and analyze conversation traces from Langfuse.</p>
-    </div>
-  );
-}
+// Audit Log
+const auditRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/audit',
+  component: AuditLogViewer,
+});
 
-// Evaluations route
+// Evaluations
 const evaluationsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/evaluations',
-  component: EvaluationsList,
+  component: EvalsExplorer,
 });
 
-function EvaluationsList() {
-  return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900">Evaluations</h1>
-      <p className="text-gray-600">Manage eval runs, red-team reports, and regression tests.</p>
-    </div>
-  );
-}
-
-// Handoffs route
+// Escalations (Handoffs)
 const handoffsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: '/handoffs',
-  component: HandoffsList,
+  component: EscalationQueue,
 });
 
-function HandoffsList() {
-  return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900">Human Handoffs</h1>
-      <p className="text-gray-600">Review and manage escalated conversations requiring human intervention.</p>
-    </div>
-  );
-}
+// Model Catalog
+const modelsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/models',
+  component: ModelCatalogUI,
+});
 
-// Create the route tree
+// Harness Workbench (operator only)
+const harnessRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/harness',
+  component: HarnessWorkbench,
+});
+
 export const routeTree = rootRoute.addChildren([
   dashboardRoute,
   tenantsRoute,
   policiesRoute,
   tracesRoute,
+  auditRoute,
   evaluationsRoute,
   handoffsRoute,
+  modelsRoute,
+  harnessRoute,
 ]);

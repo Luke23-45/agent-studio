@@ -39,6 +39,10 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "escalations:read", "escalations:write",
         "webhooks:read", "webhooks:write",
         "knowledge:write", "evals:run",
+        # P7-4 admin console surfaces
+        "policies:read", "policies:write",
+        "models:read", "models:write",
+        "evals:read",
     },
     ROLE_TENANT_ADMIN: {
         "tenants:read", "conversations:read", "conversations:write",
@@ -48,6 +52,10 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         # P5-10 delegated admin: tenant-bound keys may manage their own
         # tenant's keys (enforced in the api-keys routes via assert_tenant_access).
         "api_keys:manage",
+        # P7-4 admin console surfaces (scoped to the bound tenant)
+        "policies:read", "policies:write",
+        "models:read", "models:write",
+        "evals:read",
     },
     ROLE_OPERATOR: {"conversations:read", "escalations:read", "escalations:write"},
     ROLE_AUDITOR: {"tenants:read", "audit:read"},

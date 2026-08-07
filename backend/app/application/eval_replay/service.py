@@ -43,8 +43,14 @@ class EvalReplayService:
         session_id: str,
         escalation_repository=None,
         ticketing_webhook_url: str | None = None,
+        details_extra: dict | None = None,
     ) -> dict:
-        """Replay one stored conversation and return a comparison report."""
+        """Replay one stored conversation and return a comparison report.
+
+        ``details_extra`` is merged into the audit event details (run
+        name/type/config from the caller). The returned report carries an
+        ``audit_event_id`` so callers can hydrate the run without re-querying.
+        """
         conversation_repo = self._repo_factory(ConversationRepository)
         conversation = await conversation_repo.get_by_session(tenant_id, session_id)
         if not conversation:
@@ -132,12 +138,16 @@ class EvalReplayService:
         logger.info("eval_replay_completed", **{k: v for k, v in report.items() if k != "errors"})
 
         audit_repo = self._audit_factory(AuditRepository)
-        await audit_repo.add(
+        audit_details: dict = {"session_id": session_id, **report}
+        if details_extra:
+            audit_details.update(details_extra)
+        audit_event = await audit_repo.add(
             action="eval.replay",
             resource_type="conversation",
             resource_id=conversation["id"],
             tenant_id=tenant_id,
             actor_type="system",
-            details={"session_id": session_id, **report},
+            details=audit_details,
         )
+        report["audit_event_id"] = audit_event["id"]
         return report

@@ -423,14 +423,27 @@ class AuditRepository:
             return _row_to_dict(model)
 
     async def list_events(
-        self, tenant_id: str | None = None, limit: int = 100
+        self,
+        tenant_id: str | None = None,
+        limit: int = 100,
+        action: str | None = None,
     ) -> list[dict[str, Any]]:
         async with self.db.get_session() as session:
             stmt = select(AuditEventModel)
             if tenant_id:
                 stmt = stmt.where(AuditEventModel.tenant_id == tenant_id)
+            if action:
+                stmt = stmt.where(AuditEventModel.action == action)
             result = await session.execute(stmt.order_by(AuditEventModel.created_at.desc()).limit(limit))
             return [_row_to_dict(r) for r in result.scalars()]
+
+    async def get_by_id(self, event_id: str) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(AuditEventModel).where(AuditEventModel.id == event_id)
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
 
     async def verify_chain(self, tenant_id: str | None = None) -> tuple[bool, str | None]:
         """Recompute the hash chain over the trail.
@@ -571,6 +584,37 @@ class SpendEventRepository:
             session.add(model)
             await session.flush()
             return _row_to_dict(model)
+
+    async def list_filtered(
+        self,
+        tenant_id: str | None = None,
+        limit: int = 100,
+        conversation_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Newest-first spend events (P0-10 cost ledger), optionally scoped
+        to a tenant and/or conversation."""
+        async with self.db.get_session() as session:
+            stmt = select(SpendEventModel)
+            if tenant_id:
+                stmt = stmt.where(SpendEventModel.tenant_id == tenant_id)
+            if conversation_id:
+                stmt = stmt.where(
+                    SpendEventModel.conversation_id == conversation_id
+                )
+            result = await session.execute(
+                stmt.order_by(SpendEventModel.created_at.desc()).limit(limit)
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def get_by_id(
+        self, event_id: str, tenant_id: str | None = None
+    ) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            stmt = select(SpendEventModel).where(SpendEventModel.id == event_id)
+            if tenant_id:
+                stmt = stmt.where(SpendEventModel.tenant_id == tenant_id)
+            row = (await session.execute(stmt)).scalar_one_or_none()
+            return _row_to_dict(row) if row else None
 
 
 class QuotaStateRepository:
@@ -1537,10 +1581,15 @@ class PolicyRepository:
             return _row_to_dict(model)
 
     async def get_by_tenant(self, tenant_id: str) -> dict[str, Any] | None:
+        """The tenant's active (published) policy set — the one the runtime
+        evaluates. Drafts never govern traffic."""
         async with self.db.get_session() as session:
             result = await session.execute(
                 select(PolicySetModel)
-                .where(PolicySetModel.tenant_id == tenant_id)
+                .where(
+                    PolicySetModel.tenant_id == tenant_id,
+                    PolicySetModel.status == "published",
+                )
                 .order_by(PolicySetModel.version.desc())
                 .limit(1)
             )
@@ -1555,6 +1604,140 @@ class PolicyRepository:
             data = _row_to_dict(row)
             data["rules"] = [_row_to_dict(r) for r in rules_result.scalars()]
             return data
+
+    async def list_sets(self, tenant_id: str) -> list[dict[str, Any]]:
+        """Every policy set for a tenant (all statuses), newest version first,
+        rules included."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(PolicySetModel)
+                .where(PolicySetModel.tenant_id == tenant_id)
+                .order_by(PolicySetModel.version.desc())
+            )
+            sets: list[dict[str, Any]] = []
+            for row in result.scalars():
+                rules_result = await session.execute(
+                    select(PolicyRuleModel)
+                    .where(PolicyRuleModel.policy_set_id == row.id)
+                    .order_by(PolicyRuleModel.priority.desc())
+                )
+                data = _row_to_dict(row)
+                data["rules"] = [_row_to_dict(r) for r in rules_result.scalars()]
+                sets.append(data)
+            return sets
+
+    async def get_set(
+        self, set_id: str, tenant_id: str
+    ) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(PolicySetModel).where(
+                    PolicySetModel.id == set_id,
+                    PolicySetModel.tenant_id == tenant_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if not row:
+                return None
+            rules_result = await session.execute(
+                select(PolicyRuleModel)
+                .where(PolicyRuleModel.policy_set_id == row.id)
+                .order_by(PolicyRuleModel.priority.desc())
+            )
+            data = _row_to_dict(row)
+            data["rules"] = [_row_to_dict(r) for r in rules_result.scalars()]
+            return data
+
+    async def update_set_rules(
+        self,
+        set_id: str,
+        tenant_id: str,
+        *,
+        name: str | None = None,
+        rules: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any] | None:
+        """Mutate a draft set in place; editing a published revision creates a
+        new draft on top (published revisions stay immutable). Returns the
+        affected set with rules included."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(PolicySetModel).where(
+                    PolicySetModel.id == set_id,
+                    PolicySetModel.tenant_id == tenant_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            target = row
+            if row.status != "draft":
+                max_version = (
+                    await session.execute(
+                        select(func.max(PolicySetModel.version)).where(
+                            PolicySetModel.tenant_id == tenant_id
+                        )
+                    )
+                ).scalar() or 0
+                target = PolicySetModel(
+                    id=str(uuid4()),
+                    tenant_id=tenant_id,
+                    name=name or row.name,
+                    version=max_version + 1,
+                    status="draft",
+                )
+                session.add(target)
+                await session.flush()
+            if name is not None:
+                target.name = name
+            if rules is not None:
+                old_rules = (
+                    await session.execute(
+                        select(PolicyRuleModel).where(
+                            PolicyRuleModel.policy_set_id == target.id
+                        )
+                    )
+                ).scalars()
+                for old in old_rules:
+                    await session.delete(old)
+                for rule_data in rules:
+                    session.add(
+                        PolicyRuleModel(
+                            id=str(uuid4()),
+                            policy_set_id=target.id,
+                            name=rule_data.get("name", ""),
+                            policy_type=rule_data.get("policy_type", "topic_filter"),
+                            action=rule_data.get("action", "allow"),
+                            conditions=rule_data.get("conditions", {}),
+                            priority=rule_data.get("priority", 0),
+                            enabled=rule_data.get("enabled", True),
+                        )
+                    )
+            await session.flush()
+            rules_result = await session.execute(
+                select(PolicyRuleModel)
+                .where(PolicyRuleModel.policy_set_id == target.id)
+                .order_by(PolicyRuleModel.priority.desc())
+            )
+            data = _row_to_dict(target)
+            data["rules"] = [_row_to_dict(r) for r in rules_result.scalars()]
+            return data
+
+    async def publish_set(self, set_id: str, tenant_id: str) -> dict[str, Any] | None:
+        """Promote a draft to published (idempotent for published sets)."""
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(PolicySetModel).where(
+                    PolicySetModel.id == set_id,
+                    PolicySetModel.tenant_id == tenant_id,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            if row.status != "published":
+                row.status = "published"
+                await session.flush()
+            return _row_to_dict(row)
 
 
 class WebhookRepository:

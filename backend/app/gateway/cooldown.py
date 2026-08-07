@@ -131,6 +131,68 @@ class RedisCooldownCache(ManagedService):
             await self._log_degraded_once(e)
             return True
 
+    async def snapshot(self) -> dict[str, int]:
+        """Current failure counts for every deployment, keyed
+        ``"provider:model"`` (P7-4 circuit-breaker console)."""
+        if not self._redis_available or self._redis is None:
+            return {}
+        try:
+            keys = await self._redis.keys(f"{self.config.prefix}*")
+            if not keys:
+                return {}
+            values = await self._redis.mget(keys)
+            snapshot: dict[str, int] = {}
+            for key, value in zip(keys, values):
+                if value is None:
+                    continue
+                name = key[len(self.config.prefix):]
+                provider, _, model = name.partition(":")
+                snapshot[f"{provider}:{model}"] = int(value)
+            return snapshot
+        except Exception as e:
+            await self._log_degraded_once(e)
+            return {}
+
+    async def reset(
+        self,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> int:
+        """Clear cooldown state. Scoped to one deployment when both
+        provider/model are given, otherwise clears every matching key
+        (provider-scoped when only provider is given). Returns the number
+        of deployments cleared."""
+        if not self._redis_available or self._redis is None:
+            return 0
+        try:
+            if provider and model:
+                await self._redis.delete(self._key(provider, model))
+                return 1
+            pattern = f"{self.config.prefix}*"
+            if provider:
+                pattern = f"{self.config.prefix}{provider.strip().lower()}:*"
+            keys = await self._redis.keys(pattern)
+            if not keys:
+                return 0
+            return int(await self._redis.delete(*keys))
+        except Exception as e:
+            await self._log_degraded_once(e)
+            return 0
+
+    async def cooldown_ttl(self, provider: str, model: str) -> float | None:
+        """Remaining cooldown for a deployment in seconds, or None when the
+        deployment has no failure record (Redis down also returns None)."""
+        if not self._redis_available or self._redis is None:
+            return None
+        try:
+            ttl_ms = await self._redis.pttl(self._key(provider, model))
+            if ttl_ms is None or ttl_ms < 0:
+                return None
+            return ttl_ms / 1000.0
+        except Exception as e:
+            await self._log_degraded_once(e)
+            return None
+
     async def _log_degraded_once(self, error: Exception) -> None:
         if not self._degraded_logged:
             self._degraded_logged = True

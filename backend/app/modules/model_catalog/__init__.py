@@ -5,6 +5,8 @@ from .service import (
     ModelCatalogService,
     ModelNotAllowed,
     estimate_tokens,
+    get_global_status,
+    set_global_status,
 )
 
 __all__ = [
@@ -12,4 +14,6 @@ __all__ = [
     "ModelCatalogService",
     "ModelNotAllowed",
     "estimate_tokens",
+    "get_global_status",
+    "set_global_status",
 ]

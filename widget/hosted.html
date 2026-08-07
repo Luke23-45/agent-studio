@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Neryva Chat</title>
+  <meta name="description" content="AI-powered chat assistant" />
+
+  <!--
+    Tenant configuration via meta tags (P7-2).
+    These are the defaults; override via URL params or window.__NERYVA_CONFIG__.
+
+    <meta name="neryva:tenant" content="acme" />
+    <meta name="neryva:tenant-id" content="t_abc123" />
+    <meta name="neryva:surface-id" content="s_sales" />
+    <meta name="neryva:api-base" content="/api" />
+    <meta name="neryva:title" content="Acme Support" />
+    <meta name="neryva:accent-color" content="#2563eb" />
+    <meta name="neryva:logo-url" content="/assets/logo.png" />
+  -->
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #f9fafb;
+    }
+    #app {
+      height: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module">
+    import { NeryvaHostedPage } from './src/ui/hosted-page.ts';
+
+    const root = document.getElementById('app');
+    const page = new NeryvaHostedPage(root);
+    page.mount();
+  </script>
+</body>
+</html>

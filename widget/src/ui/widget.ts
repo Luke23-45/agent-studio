@@ -1,35 +1,49 @@
 /**
- * NeryvaWidget — the customer-facing embeddable chat widget.
+ * NeryvaWidget — the customer-facing embeddable chat widget (P7-1).
  *
  * A framework-free custom element with shadow DOM. Configured through
  * attributes:
  *
  *   <neryva-widget
- *     tenant="acme"            required: tenant slug
- *     api-key="nrv_live_…"     required: tenant-bound API key
+ *     tenant="acme"            required: tenant slug (used for conversation routing)
+ *     tenant-id="t_abc123"     required: tenant ID (used for session-token bootstrap)
+ *     surface-id="s_sales"     optional: surface ID (selects persona/config)
  *     api-base="/api"          optional: backend base path (default /api)
  *     title="Support"          optional: header title
  *     accent-color="#2563eb"   optional: accent color
  *     session-id="…"           optional: conversation session (generated if absent)
  *     disclosure="…"           optional: Art. 50 notice text (default below)
+ *     max-length="2000"        optional: input character limit (default 2000)
  *   ></neryva-widget>
  *
+ * NOTE: The legacy `api-key` attribute is intentionally removed (Arch §6.4).
+ * Authentication is handled via session tokens minted by the backend.
+ *
  * Host pages can call open()/close()/sendMessage(text) on the element and
- * listen for "neryva:reply" / "neryva:error" CustomEvents.
+ * listen for "neryva:reply" / "neryva:error" / "neryva:feedback" CustomEvents.
  */
 
-import { sendMessage, WidgetApiError } from '../api/client';
+import {
+  bootstrapSessionToken,
+  streamMessage,
+  submitFeedback,
+  WidgetApiError,
+  type SessionTokenResult,
+} from '../api/client';
 import {
   appendMessage,
   createBudgetErrorBubble,
   createErrorBubble,
   createMessage,
-  ChatMessage,
+  updateLastMessage,
+  type ChatMessage,
 } from '../state/messages';
 
 const WIDGET_TAG = 'neryva-widget';
 const DEFAULT_ACCENT = '#2563eb';
 const DEFAULT_API_BASE = '/api';
+const DEFAULT_MAX_INPUT_LENGTH = 2000;
+
 // P5-11 (Art. 50): default bot/AI-interaction disclosure; mirrors
 // backend/app/governance/compliance.py DEFAULT_DISCLOSURE_TEXT.
 const DEFAULT_DISCLOSURE =
@@ -38,58 +52,159 @@ const DEFAULT_DISCLOSURE =
 const STYLES = `
 :host { all: initial; }
 * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+
 .launcher {
   position: fixed; right: 20px; bottom: 20px; z-index: 2147483000;
   width: 60px; height: 60px; border-radius: 50%; border: none; cursor: pointer;
   color: #fff; font-size: 26px; box-shadow: 0 4px 14px rgba(0,0,0,.25);
   display: flex; align-items: center; justify-content: center;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
+.launcher:hover { transform: scale(1.05); box-shadow: 0 6px 20px rgba(0,0,0,.3); }
+.launcher:focus-visible { outline: 3px solid #000; outline-offset: 2px; }
+
 .panel {
   position: fixed; right: 20px; bottom: 92px; z-index: 2147483000;
-  width: 360px; max-width: calc(100vw - 40px); height: 480px; max-height: calc(100vh - 120px);
-  background: #fff; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,.2);
+  width: 380px; max-width: calc(100vw - 40px); height: 520px; max-height: calc(100vh - 120px);
+  background: #fff; border-radius: 16px; box-shadow: 0 8px 30px rgba(0,0,0,.2);
   display: flex; flex-direction: column; overflow: hidden;
+  transition: opacity 0.15s ease, transform 0.15s ease;
 }
-.header { padding: 12px 16px; color: #fff; font-weight: 600; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
-.close { background: none; border: none; color: inherit; font-size: 18px; cursor: pointer; }
-.messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; background: #f9fafb; }
-.msg { max-width: 80%; padding: 8px 12px; border-radius: 10px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
-.msg.user { align-self: flex-end; background: #2563eb; color: #fff; border-bottom-right-radius: 2px; }
-.msg.assistant { align-self: flex-start; background: #fff; color: #111827; border: 1px solid #e5e7eb; border-bottom-left-radius: 2px; }
-.msg.error { align-self: flex-start; background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
-.msg.error.budget { background: #fffbeb; color: #92400e; border: 1px solid #fde68a; }
-.typing { align-self: flex-start; color: #9ca3af; font-size: 12px; padding: 4px 8px; }
-.inputRow { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid #e5e7eb; background: #fff; }
-.inputRow input { flex: 1; border: 1px solid #d1d5db; border-radius: 8px; padding: 8px 10px; font-size: 13px; outline: none; }
-.inputRow input:focus { border-color: #2563eb; }
-.inputRow button { border: none; border-radius: 8px; padding: 8px 14px; color: #fff; font-size: 13px; cursor: pointer; }
+
+.header {
+  padding: 14px 16px; color: #fff; font-weight: 600; font-size: 15px;
+  display: flex; justify-content: space-between; align-items: center;
+  border-radius: 16px 16px 0 0;
+}
+
+.close {
+  background: none; border: none; color: inherit; font-size: 20px;
+  cursor: pointer; padding: 4px 8px; border-radius: 4px;
+}
+.close:hover { background: rgba(255,255,255,.15); }
+.close:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+.messages {
+  flex: 1; overflow-y: auto; padding: 14px; display: flex;
+  flex-direction: column; gap: 10px; background: #f9fafb;
+  scroll-behavior: smooth;
+}
+
+.msg {
+  max-width: 82%; padding: 10px 14px; border-radius: 12px;
+  font-size: 13.5px; line-height: 1.5; white-space: pre-wrap;
+  word-break: break-word; position: relative;
+}
+.msg.user {
+  align-self: flex-end; color: #fff;
+  border-bottom-right-radius: 4px;
+}
+.msg.assistant {
+  align-self: flex-start; background: #fff; color: #111827;
+  border: 1px solid #e5e7eb; border-bottom-left-radius: 4px;
+}
+.msg.error {
+  align-self: flex-start; background: #fef2f2; color: #b91c1c;
+  border: 1px solid #fecaca;
+}
+.msg.error.budget {
+  background: #fffbeb; color: #92400e; border: 1px solid #fde68a;
+}
+.msg.streaming::after {
+  content: '▊'; animation: blink 0.7s steps(2) infinite; margin-left: 1px;
+}
+@keyframes blink { 50% { opacity: 0; } }
+
+.feedback-row {
+  display: flex; gap: 4px; margin-top: 6px;
+}
+.feedback-btn {
+  background: none; border: 1px solid #e5e7eb; border-radius: 6px;
+  padding: 2px 8px; font-size: 12px; cursor: pointer; color: #6b7280;
+  transition: background 0.15s;
+}
+.feedback-btn:hover { background: #f3f4f6; }
+.feedback-btn.active { border-color: #2563eb; color: #2563eb; background: #eff6ff; }
+.feedback-btn:focus-visible { outline: 2px solid #2563eb; outline-offset: 1px; }
+
+.typing {
+  align-self: flex-start; color: #9ca3af; font-size: 12px;
+  padding: 4px 8px;
+}
+
+.inputRow {
+  display: flex; gap: 8px; padding: 12px 14px;
+  border-top: 1px solid #e5e7eb; background: #fff;
+}
+.inputRow input {
+  flex: 1; border: 1px solid #d1d5db; border-radius: 10px;
+  padding: 10px 12px; font-size: 13.5px; outline: none;
+  transition: border-color 0.15s;
+}
+.inputRow input:focus { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,.1); }
+.inputRow button {
+  border: none; border-radius: 10px; padding: 10px 16px; color: #fff;
+  font-size: 13.5px; cursor: pointer; font-weight: 500;
+  transition: opacity 0.15s;
+}
 .inputRow button:disabled { opacity: .5; cursor: default; }
-.empty { margin: auto; color: #9ca3af; font-size: 13px; text-align: center; padding: 16px; }
-.notice { padding: 8px 16px; font-size: 11px; line-height: 1.4; color: #6b7280;
-  background: #f9fafb; border-top: 1px solid #e5e7eb; }
+.inputRow button:focus-visible { outline: 2px solid #000; outline-offset: 2px; }
+
+.char-count {
+  padding: 0 14px 2px; font-size: 11px; color: #9ca3af; text-align: right;
+}
+.char-count.warn { color: #f59e0b; }
+.char-count.over { color: #ef4444; }
+
+.notice {
+  padding: 8px 16px; font-size: 11px; line-height: 1.4; color: #6b7280;
+  background: #f9fafb; border-top: 1px solid #e5e7eb;
+}
+
+.empty {
+  margin: auto; color: #9ca3af; font-size: 13px;
+  text-align: center; padding: 16px;
+}
+
+.reconnecting {
+  background: #fef3c7; color: #92400e; font-size: 11px;
+  padding: 4px 14px; text-align: center;
+}
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+}
 `;
 
 export class NeryvaWidget extends HTMLElement {
   private shadow: ShadowRoot;
   private messages: ChatMessage[] = [];
   private sending = false;
-  private open = false;
+  private isOpen = false;
   private sessionId: string;
+  private sessionToken: SessionTokenResult | null = null;
+  private cancelStream: (() => void) | null = null;
+  /** Backend thread id from the last completed turn (used for feedback). */
+  private currentThreadId: string | null = null;
 
   private panelEl!: HTMLDivElement;
   private launcherEl!: HTMLButtonElement;
   private listEl!: HTMLDivElement;
   private inputEl!: HTMLInputElement;
+  private charCountEl!: HTMLDivElement;
 
   static get observedAttributes(): string[] {
     return [
       'tenant',
-      'api-key',
+      'tenant-id',
+      'surface-id',
       'api-base',
       'title',
       'accent-color',
       'session-id',
       'disclosure',
+      'max-length',
     ];
   }
 
@@ -106,28 +221,40 @@ export class NeryvaWidget extends HTMLElement {
   connectedCallback(): void {
     this.renderShell();
     this.render();
+    // Bootstrap token eagerly so first message is fast
+    void this.ensureToken();
+  }
+
+  disconnectedCallback(): void {
+    this.cancelStream?.();
   }
 
   attributeChangedCallback(): void {
-    if (this.shadow && this.shadow.isConnected) {
+    if (this.shadow && this.shadow.querySelector('.panel')) {
       this.renderShell();
       this.render();
     }
   }
 
+  // -- Attribute accessors --------------------------------------------------
+
   get tenant(): string {
     return this.getAttribute('tenant') ?? '';
   }
 
-  get apiKey(): string {
-    return this.getAttribute('api-key') ?? '';
+  get tenantId(): string {
+    return this.getAttribute('tenant-id') ?? '';
+  }
+
+  get surfaceId(): string | undefined {
+    return this.getAttribute('surface-id') ?? undefined;
   }
 
   get apiBase(): string {
     return (this.getAttribute('api-base') ?? DEFAULT_API_BASE).replace(/\/$/, '');
   }
 
-  get title(): string {
+  get widgetTitle(): string {
     return this.getAttribute('title') ?? 'Neryva Assistant';
   }
 
@@ -143,68 +270,149 @@ export class NeryvaWidget extends HTMLElement {
     return this.getAttribute('disclosure') ?? DEFAULT_DISCLOSURE;
   }
 
+  get maxInputLength(): number {
+    const attr = this.getAttribute('max-length');
+    return attr ? Math.max(1, parseInt(attr, 10) || DEFAULT_MAX_INPUT_LENGTH) : DEFAULT_MAX_INPUT_LENGTH;
+  }
+
+  // -- Public API -----------------------------------------------------------
+
   openPanel(): void {
-    this.open = true;
+    this.isOpen = true;
     this.render();
+    this.inputEl?.focus();
   }
 
   closePanel(): void {
-    this.open = false;
+    this.isOpen = false;
     this.render();
   }
 
   toggle(): void {
-    this.open ? this.closePanel() : this.openPanel();
+    this.isOpen ? this.closePanel() : this.openPanel();
   }
 
   async sendMessage(text: string): Promise<void> {
     const message = text.trim();
     if (!message || this.sending) return;
-    if (!this.tenant || !this.apiKey) {
-      this.showError('Widget is missing the tenant or api-key attribute.');
+
+    if (message.length > this.maxInputLength) {
+      this.showError(`Message exceeds the ${this.maxInputLength} character limit.`);
+      return;
+    }
+
+    if (!this.tenant || !this.tenantId) {
+      this.showError('Widget is missing the tenant or tenant-id attribute.');
+      return;
+    }
+
+    // Ensure we have a session token
+    let token: SessionTokenResult;
+    try {
+      token = await this.ensureToken();
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : 'Session bootstrap failed';
+      this.showError(detail);
       return;
     }
 
     this.sending = true;
     this.messages = appendMessage(this.messages, createMessage('user', message));
-    this.inputEl.value = '';
+    // Create a streaming placeholder for the assistant response
+    this.messages = appendMessage(this.messages, createMessage('assistant', '', true));
+    if (this.inputEl) this.inputEl.value = '';
+    this.updateCharCount();
     this.render();
 
-    try {
-      const result = await sendMessage({
-        apiBase: this.apiBase,
-        tenantSlug: this.tenant,
-        apiKey: this.apiKey,
-        message,
-        sessionId: this.sessionId,
-      });
-      this.sessionId = result.sessionId;
-      this.setAttribute('session-id', result.sessionId);
-      this.messages = appendMessage(
-        this.messages,
-        createMessage('assistant', result.response),
-      );
-      this.dispatchEvent(
-        new CustomEvent('neryva:reply', {
-          detail: {
-            response: result.response,
-            confidence: result.confidence,
-            handoffRequired: result.handoffRequired,
-            sessionId: result.sessionId,
-          },
-        }),
-      );
-    } catch (err) {
-      // P5-7: a 402 from the gateway is a surface-level budget rejection
-      // (request refused by the budget gate, not an outage) — render it as a
-      // distinct budget bubble the customer can act on.
-      const budgetRejected = err instanceof WidgetApiError && err.status === 402;
-      const detail = err instanceof Error ? err.message : 'Request failed';
-      this.showError(detail, budgetRejected);
-    } finally {
-      this.sending = false;
-      this.render();
-    }
+    // Use SSE streaming
+    this.cancelStream = streamMessage({
+      apiBase: this.apiBase,
+      tenantSlug: this.tenant,
+      token: token.token,
+      message,
+      sessionId: this.sessionId,
+      surfaceId: this.surfaceId,
+
+      onDelta: (delta: string) => {
+        this.messages = updateLastMessage(this.messages, (msg) => ({
+          ...msg,
+          content: msg.content + delta,
+          streaming: true,
+        }));
+        this.renderMessages();
+        this.scrollToBottom();
+      },
+
+      onSession: ({ threadId: thread }) => {
+        if (thread) this.currentThreadId = thread;
+      },
+
+      onRedaction: (text: string) => {
+        // Output moderation retracted already-released deltas: replace the
+        // streamed content with the safe remainder.
+        this.messages = updateLastMessage(this.messages, (msg) => ({
+          ...msg,
+          content: text,
+          streaming: true,
+        }));
+        this.renderMessages();
+        this.scrollToBottom();
+      },
+
+      onComplete: (result) => {
+        this.sending = false;
+        this.cancelStream = null;
+        this.sessionId = result.sessionId || this.sessionId;
+        if (result.threadId) this.currentThreadId = result.threadId;
+        this.setAttribute('session-id', this.sessionId);
+
+        this.messages = updateLastMessage(this.messages, (msg) => ({
+          ...msg,
+          content: result.response || msg.content,
+          streaming: false,
+        }));
+
+        this.dispatchEvent(
+          new CustomEvent('neryva:reply', {
+            detail: {
+              response: result.response,
+              confidence: result.confidence,
+              handoffRequired: result.handoffRequired,
+              sessionId: result.sessionId,
+              threadId: result.threadId,
+            },
+          }),
+        );
+        this.render();
+      },
+
+      onError: (err: WidgetApiError) => {
+        this.sending = false;
+        this.cancelStream = null;
+        // Remove the streaming placeholder
+        this.messages = this.messages.filter((m) => !m.streaming);
+        this.showError(err.detail, err.budgetRejected);
+
+        // If the token expired, clear it so next attempt re-bootstraps
+        if (err.status === 401) {
+          this.sessionToken = null;
+        }
+        this.render();
+      },
+    });
+  }
+
+  // -- Internal -------------------------------------------------------------
+
+  private async ensureToken(): Promise<SessionTokenResult> {
+    if (this.sessionToken) return this.sessionToken;
+
+    this.sessionToken = await bootstrapSessionToken({
+      apiBase: this.apiBase,
+      tenantId: this.tenantId,
+      surfaceId: this.surfaceId,
+    });
+    return this.sessionToken;
   }
 
   private showError(detail: string, budgetRejected = false): void {
@@ -219,29 +427,89 @@ export class NeryvaWidget extends HTMLElement {
     );
   }
 
+  private async handleFeedback(messageId: string, rating: 'up' | 'down'): Promise<void> {
+    // Update UI immediately
+    this.messages = this.messages.map((m) =>
+      m.id === messageId ? { ...m, feedback: rating } : m,
+    );
+    this.renderMessages();
+
+    this.dispatchEvent(
+      new CustomEvent('neryva:feedback', {
+        detail: { messageId, rating },
+      }),
+    );
+
+    // Best-effort submit to backend
+    try {
+      const token = await this.ensureToken();
+      const threadId = this.currentThreadId;
+      if (threadId) {
+        await submitFeedback({
+          apiBase: this.apiBase,
+          token: token.token,
+          threadId,
+          messageId,
+          rating,
+        });
+      }
+    } catch {
+      // Feedback submission is best-effort
+    }
+  }
+
+  private updateCharCount(): void {
+    if (!this.charCountEl || !this.inputEl) return;
+    const len = this.inputEl.value.length;
+    const max = this.maxInputLength;
+    this.charCountEl.textContent = `${len}/${max}`;
+    this.charCountEl.className = 'char-count' +
+      (len > max ? ' over' : len > max * 0.9 ? ' warn' : '');
+  }
+
+  private scrollToBottom(): void {
+    if (this.listEl) {
+      this.listEl.scrollTop = this.listEl.scrollHeight;
+    }
+  }
+
+  // -- Rendering ------------------------------------------------------------
+
   private renderShell(): void {
     const accent = this.accentColor;
     this.shadow.innerHTML = `
       <style>${STYLES}</style>
-      <button class="launcher" style="background:${accent}" aria-label="Open chat">💬</button>
-      <div class="panel" style="display:none">
+      <button class="launcher" style="background:${accent}" aria-label="Open chat" role="button">
+        <span aria-hidden="true">💬</span>
+      </button>
+      <div class="panel" style="display:none" role="dialog" aria-label="${escapeHtml(this.widgetTitle)}" aria-modal="false">
         <div class="header" style="background:${accent}">
-          <span>${escapeHtml(this.title)}</span>
+          <span>${escapeHtml(this.widgetTitle)}</span>
           <button class="close" aria-label="Close chat">×</button>
         </div>
-        <div class="messages"></div>
-        <form class="inputRow">
-          <input placeholder="Type a message…" aria-label="Message" autocomplete="off" />
-          <button type="submit" style="background:${accent}">Send</button>
+        <div class="reconnecting" style="display:none" role="status" aria-live="polite">Reconnecting…</div>
+        <div class="messages" role="log" aria-label="Chat messages" aria-live="polite" aria-relevant="additions"></div>
+        <div class="char-count" aria-hidden="true">0/${this.maxInputLength}</div>
+        <form class="inputRow" role="form" aria-label="Send a message">
+          <label class="sr-only" for="neryva-input">Message</label>
+          <input
+            id="neryva-input"
+            placeholder="Type a message…"
+            aria-label="Message"
+            autocomplete="off"
+            maxlength="${this.maxInputLength}"
+          />
+          <button type="submit" style="background:${accent}" aria-label="Send message">Send</button>
         </form>
-        <div class="notice">${escapeHtml(this.disclosureText)}</div>
+        <div class="notice" role="status">${escapeHtml(this.disclosureText)}</div>
       </div>
     `;
 
     this.panelEl = this.shadow.querySelector('.panel') as HTMLDivElement;
     this.launcherEl = this.shadow.querySelector('.launcher') as HTMLButtonElement;
     this.listEl = this.shadow.querySelector('.messages') as HTMLDivElement;
-    this.inputEl = this.shadow.querySelector('input') as HTMLInputElement;
+    this.inputEl = this.shadow.querySelector('#neryva-input') as HTMLInputElement;
+    this.charCountEl = this.shadow.querySelector('.char-count') as HTMLDivElement;
 
     this.launcherEl.addEventListener('click', () => this.toggle());
     this.shadow.querySelector('.close')!.addEventListener('click', () => this.closePanel());
@@ -251,12 +519,26 @@ export class NeryvaWidget extends HTMLElement {
         e.preventDefault();
         void this.sendMessage(this.inputEl.value);
       });
+    this.inputEl.addEventListener('input', () => this.updateCharCount());
+
+    // Keyboard: Escape closes the panel
+    this.panelEl.addEventListener('keydown', (e) => {
+      if ((e as KeyboardEvent).key === 'Escape') {
+        this.closePanel();
+        this.launcherEl.focus();
+      }
+    });
   }
 
   private render(): void {
     if (!this.panelEl) return;
-    this.panelEl.style.display = this.open ? 'flex' : 'none';
-    this.launcherEl.style.display = this.open ? 'none' : 'flex';
+    this.panelEl.style.display = this.isOpen ? 'flex' : 'none';
+    this.launcherEl.style.display = this.isOpen ? 'none' : 'flex';
+    this.renderMessages();
+  }
+
+  private renderMessages(): void {
+    if (!this.listEl) return;
     this.listEl.innerHTML = '';
 
     if (this.messages.length === 0) {
@@ -267,21 +549,63 @@ export class NeryvaWidget extends HTMLElement {
     } else {
       for (const message of this.messages) {
         const node = document.createElement('div');
-        node.className = `msg ${message.role}${message.error ? ' error' : ''}${message.budget ? ' budget' : ''}`;
-        node.textContent = message.content;
+        const classes = ['msg', message.role];
+        if (message.error) classes.push('error');
+        if (message.budget) classes.push('budget');
+        if (message.streaming) classes.push('streaming');
+        node.className = classes.join(' ');
+        node.setAttribute('role', 'article');
+        node.setAttribute('aria-label', `${message.role} message`);
+
+        // Sanitize content — textContent is safe against XSS
+        const contentSpan = document.createElement('span');
+        contentSpan.textContent = message.content;
+        node.appendChild(contentSpan);
+
+        // Feedback buttons for assistant messages (non-error, non-streaming)
+        if (
+          message.role === 'assistant' &&
+          !message.error &&
+          !message.streaming &&
+          message.content
+        ) {
+          const feedbackRow = document.createElement('div');
+          feedbackRow.className = 'feedback-row';
+
+          const thumbUp = document.createElement('button');
+          thumbUp.className = 'feedback-btn' + (message.feedback === 'up' ? ' active' : '');
+          thumbUp.textContent = '👍';
+          thumbUp.setAttribute('aria-label', 'Helpful');
+          thumbUp.setAttribute('aria-pressed', String(message.feedback === 'up'));
+          thumbUp.addEventListener('click', () => void this.handleFeedback(message.id, 'up'));
+
+          const thumbDown = document.createElement('button');
+          thumbDown.className = 'feedback-btn' + (message.feedback === 'down' ? ' active' : '');
+          thumbDown.textContent = '👎';
+          thumbDown.setAttribute('aria-label', 'Not helpful');
+          thumbDown.setAttribute('aria-pressed', String(message.feedback === 'down'));
+          thumbDown.addEventListener('click', () => void this.handleFeedback(message.id, 'down'));
+
+          feedbackRow.appendChild(thumbUp);
+          feedbackRow.appendChild(thumbDown);
+          node.appendChild(feedbackRow);
+        }
+
         this.listEl.appendChild(node);
       }
     }
 
-    if (this.sending) {
+    if (this.sending && !this.messages.some((m) => m.streaming)) {
       const typing = document.createElement('div');
       typing.className = 'typing';
+      typing.setAttribute('role', 'status');
       typing.textContent = '…';
       this.listEl.appendChild(typing);
-      this.listEl.scrollTop = this.listEl.scrollHeight;
     }
 
-    if (this.open) {
+    this.scrollToBottom();
+
+    if (this.isOpen && this.inputEl && !this.sending) {
       this.inputEl.focus();
     }
   }

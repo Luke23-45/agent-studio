@@ -32,9 +32,9 @@ function StatCard({
 }
 
 export function Dashboard() {
-  const tenants = useQuery({ queryKey: ['tenants'], queryFn: listTenants });
-  const escalations = useQuery({ queryKey: ['escalations'], queryFn: listEscalations });
-  const audit = useQuery({ queryKey: ['audit'], queryFn: listAuditEvents });
+  const tenants = useQuery({ queryKey: ['tenants'], queryFn: () => listTenants() });
+  const escalations = useQuery({ queryKey: ['escalations'], queryFn: () => listEscalations() });
+  const audit = useQuery({ queryKey: ['audit'], queryFn: () => listAuditEvents() });
 
   const error = tenants.error ?? escalations.error ?? audit.error;
   const loading = tenants.isLoading || escalations.isLoading || audit.isLoading;

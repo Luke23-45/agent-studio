@@ -2437,6 +2437,100 @@ async def set_tenant_deployment_shape(
     }
 
 
+class TenantUpdateRequest(BaseModel):
+    """Editable tenant settings from the console config tab (P7-4).
+
+    Row-level fields only; full config-version promotion stays on the
+    ``config-versions`` endpoints.
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=256)
+    allowed_topics: list[str] | None = None
+    blocked_topics: list[str] | None = None
+    escalation_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    retention_days: int | None = Field(default=None, ge=1, le=3650)
+    region: str | None = Field(default=None, max_length=32)
+
+
+@router.put("/tenants/{tenant_id}/config", response_model=TenantResponse)
+async def update_tenant_config(
+    tenant_id: UUID,
+    request: TenantUpdateRequest,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Update a tenant's row-level settings from the console config tab.
+
+    Persisted directly on the tenant row (the runtime's authoritative
+    source for these fields) and recorded on the audit trail."""
+    assert_tenant_access(principal, tenant_id)
+
+    db = get_database_manager()
+    current = await TenantRepository(db).get_by_id(str(tenant_id))
+    if current is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+
+    updates: dict[str, Any] = {}
+    if request.name is not None:
+        updates["name"] = request.name
+    if request.allowed_topics is not None:
+        updates["allowed_topics"] = request.allowed_topics
+    if request.blocked_topics is not None:
+        updates["blocked_topics"] = request.blocked_topics
+    if request.escalation_threshold is not None:
+        updates["escalation_threshold"] = request.escalation_threshold
+    if request.retention_days is not None:
+        updates["retention_days"] = request.retention_days
+    if "region" in request.model_fields_set:
+        updates["region"] = request.region
+    if not updates:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No fields to update",
+        )
+
+    row = await TenantRepository(db).update(str(tenant_id), updates)
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+
+    changed = {
+        k: v
+        for k, v in updates.items()
+        if v is not None and current.get(k) != v
+    }
+    await AuditRepository(db).add(
+        action="tenant.config_updated",
+        resource_type="tenant",
+        resource_id=str(tenant_id),
+        tenant_id=str(tenant_id),
+        actor_type="api_key",
+        actor_id=principal.key_id,
+        details={"changed": changed},
+    )
+    logger.info(
+        "tenant_config_updated",
+        tenant_id=str(tenant_id),
+        changed=list(changed.keys()),
+        actor=principal.key_id,
+    )
+
+    return TenantResponse(
+        id=row["id"],
+        name=row["name"],
+        slug=row["slug"],
+        allowed_topics=row["allowed_topics"],
+        blocked_topics=row["blocked_topics"],
+        escalation_threshold=row["escalation_threshold"],
+        region=row.get("region"),
+        retention_days=row.get("retention_days"),
+    )
+
+
 @router.post(
     "/tenants/{tenant_id}/config-versions",
     response_model=ConfigVersionResponse,

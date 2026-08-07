@@ -276,19 +276,30 @@ def policy_set_from_db(row: dict[str, Any]) -> PolicySet:
     """Rehydrate a domain PolicySet from a PolicyRepository row (rules included).
 
     The DB is the source of truth for tenant policies; the request path must
-    never evaluate against an empty in-memory set after a restart.
+    never evaluate against an empty in-memory set after a restart. Rules whose
+    stored enum values no longer match the domain enums are skipped with a
+    warning — a single bad row must never crash the request path.
     """
     rules: list[PolicyRule] = []
     for rule_data in row.get("rules") or []:
-        rules.append(
-            PolicyRule(
-                name=rule_data.get("name", ""),
-                policy_type=PolicyType(rule_data.get("policy_type", "topic_filter")),
-                action=PolicyAction(rule_data.get("action", "allow")),
-                conditions=rule_data.get("conditions", {}),
-                priority=rule_data.get("priority", 0),
+        try:
+            rules.append(
+                PolicyRule(
+                    name=rule_data.get("name", ""),
+                    policy_type=PolicyType(rule_data.get("policy_type", "topic_filter")),
+                    action=PolicyAction(rule_data.get("action", "allow")),
+                    conditions=rule_data.get("conditions", {}),
+                    priority=rule_data.get("priority", 0),
+                )
             )
-        )
+        except ValueError:
+            logger.warning(
+                "policy_rule_skipped_unknown_enum",
+                rule_name=rule_data.get("name", ""),
+                policy_type=rule_data.get("policy_type"),
+                action=rule_data.get("action"),
+            )
+            continue
     return PolicySet(
         id=UUID(row["id"]),
         tenant_id=UUID(row["tenant_id"]),

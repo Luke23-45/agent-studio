@@ -284,13 +284,13 @@ class TestToolGate:
         asyncio.run(gate.authorize_async({"name": "search", "arguments": {}}))
         assert audited == []
 
-    def test_build_authorizer_reads_registry_and_surface(self):
+    def test_build_authorizer_reads_registry_and_surface(self, tmp_path):
         from backend.app.infrastructure.db import ToolRegistryRepository
         from backend.app.infrastructure.db.manager import DatabaseConfig, DatabaseManager
         from backend.app.infrastructure.db.models import Base
 
         db = DatabaseManager(
-            DatabaseConfig(database_url=f"sqlite+aiosqlite:///{uuid4().hex}.db")
+            DatabaseConfig(database_url=f"sqlite+aiosqlite:///{tmp_path.as_posix()}/gov.db")
         )
 
         async def _scenario():

@@ -10,9 +10,28 @@
 import structlog
 from typing import Any
 
+from backend.app.gateway.catalog import model_key
 from backend.app.infrastructure.db import DatabaseManager, ModelCatalogRepository
 
 logger = structlog.get_logger(__name__)
+
+# Process-wide enablement overrides for the console models tab (P7-4).
+# Mirrors the gateway's process-wide ``default_catalog``: in-memory by
+# design, so a restart resets to the seed catalog (all active). Per-tenant
+# enablement is persisted in ``model_catalog`` rows via the tenant-scoped
+# routes and survives restarts.
+_GLOBAL_STATUS: dict[str, str] = {}
+
+
+def set_global_status(provider: str, model: str, status: str) -> str:
+    """Set the process-wide enablement status for a deployment."""
+    _GLOBAL_STATUS[model_key(provider, model)] = status
+    return status
+
+
+def get_global_status(provider: str, model: str) -> str | None:
+    """The process-wide override status for a deployment, if any."""
+    return _GLOBAL_STATUS.get(model_key(provider, model))
 
 
 class ModelNotAllowed(Exception):
