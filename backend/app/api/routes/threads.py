@@ -199,3 +199,123 @@ async def submit_feedback(
         },
     )
     return {"ok": True, "thread_id": thread_id, "rating": request.rating}
+
+
+class ArchiveRequest(BaseModel):
+    tenant_id: str | None = None
+    region: str | None = None
+    request_id: str | None = Field(default=None, max_length=64)
+
+
+class ArchiveResponse(BaseModel):
+    accepted: bool
+    job_type: str
+    thread_id: str
+    idempotency_key: str | None
+    note: str
+
+
+def _archive_route_common(thread_id: str, request: ArchiveRequest, principal: ApiKeyPrincipal):
+    tenant_id = _resolve_tenant_id(request.tenant_id, principal)
+    assert_tenant_access(principal, tenant_id)
+    return tenant_id
+
+
+@router.post(
+    "/threads/{thread_id}/archive",
+    response_model=ArchiveResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Move a thread to the cold-tier archive (P1-7)",
+)
+async def archive_thread(
+    thread_id: str,
+    request: ArchiveRequest = ArchiveRequest(),
+    principal: ApiKeyPrincipal = Depends(require_permission("conversations:write")),
+) -> ArchiveResponse:
+    """Enqueue a ``thread.archive`` worker job (202).
+
+    The worker dumps the full durable payload (thread, messages, parts,
+    events) to region-pinned object storage and flips the archived marker
+    — hot queries and the retention sweep then ignore the thread. Restore
+    pulls the payload back for checksum verification and clears the
+    marker. Idempotent by thread id.
+    """
+    from backend.app.infrastructure.queue import Job, get_queue_manager
+
+    tenant_id = _archive_route_common(thread_id, request, principal)
+    db = get_database_manager()
+    thread = await ThreadRepository(db).get_thread(tenant_id, thread_id)
+    if thread is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Thread not found: {thread_id}",
+        )
+
+    manager = get_queue_manager()
+    idem_key = request.request_id or f"thread-archive:{tenant_id}:{thread_id}"
+    job = Job(
+        type="thread.archive",
+        payload={
+            "tenant_id": tenant_id,
+            "thread_id": thread_id,
+            "region": request.region,
+            "request_id": idem_key,
+        },
+    )
+    accepted = await manager.enqueue(job, idempotency_key=idem_key)
+    return ArchiveResponse(
+        accepted=accepted,
+        job_type="thread.archive",
+        thread_id=thread_id,
+        idempotency_key=idem_key,
+        note="accepted; archive job runs on the worker",
+    )
+
+
+@router.post(
+    "/threads/{thread_id}/restore",
+    response_model=ArchiveResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Restore a thread from the cold-tier archive (P1-7)",
+)
+async def restore_thread(
+    thread_id: str,
+    request: ArchiveRequest = ArchiveRequest(),
+    principal: ApiKeyPrincipal = Depends(require_permission("conversations:write")),
+) -> ArchiveResponse:
+    """Enqueue a ``thread.restore`` worker job (202).
+
+    The worker downloads the cold-tier payload, verifies its checksum and
+    thread id, then clears the archived marker so the thread is visible to
+    hot queries again. A corrupt payload raises and the marker stays off.
+    """
+    from backend.app.infrastructure.queue import Job, get_queue_manager
+
+    tenant_id = _archive_route_common(thread_id, request, principal)
+    db = get_database_manager()
+    thread = await ThreadRepository(db).get_thread(tenant_id, thread_id)
+    if thread is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Thread not found: {thread_id}",
+        )
+
+    manager = get_queue_manager()
+    idem_key = request.request_id or f"thread-restore:{tenant_id}:{thread_id}"
+    job = Job(
+        type="thread.restore",
+        payload={
+            "tenant_id": tenant_id,
+            "thread_id": thread_id,
+            "region": request.region,
+            "request_id": idem_key,
+        },
+    )
+    accepted = await manager.enqueue(job, idempotency_key=idem_key)
+    return ArchiveResponse(
+        accepted=accepted,
+        job_type="thread.restore",
+        thread_id=thread_id,
+        idempotency_key=idem_key,
+        note="accepted; restore job runs on the worker",
+    )

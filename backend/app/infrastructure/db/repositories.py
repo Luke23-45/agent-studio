@@ -31,6 +31,7 @@ from .models import (
     OperatorSessionModel,
     PolicyRuleModel,
     PolicySetModel,
+    PromptModel,
     QuotaStateModel,
     SessionTokenModel,
     SpendEventModel,
@@ -310,6 +311,22 @@ class EvidenceRepository:
             )
             return result.rowcount or 0
 
+    async def purge_before(self, tenant_id: str, before: datetime) -> int:
+        """P6-8: delete this tenant's evidence older than the cutoff.
+
+        Compliance evidence survives the shorter retention windows; the
+        sweep calls this with the evidence retention window (default 730
+        days). Returns the number of rows deleted.
+        """
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                delete(GuardrailEvidenceModel).where(
+                    GuardrailEvidenceModel.tenant_id == tenant_id,
+                    GuardrailEvidenceModel.created_at < before,
+                )
+            )
+            return result.rowcount or 0
+
 
 class AuditRepository:
     """Immutable, tamper-evident admin audit trail (P5-9).
@@ -585,6 +602,39 @@ class ApiKeyRepository:
                 .values(last_used_at=_now(), usage_count=ApiKeyModel.usage_count + 1)
             )
 
+    async def apply_last_active_batch(
+        self, entries: list[tuple[str, int, str]]
+    ) -> int:
+        """Bulk-apply batched last-active deltas (Arch 11, P8-1).
+
+        One transaction per flush (not one per request): each entry is
+        ``(key_id, delta, iso_timestamp)``. Counters are incremented in
+        SQL (``usage_count = usage_count + delta``) so concurrent flushers
+        never lose increments; ``last_used_at`` is set to the batch's best
+        known timestamp (approximate by design). Revoked keys are skipped.
+        """
+        if not entries:
+            return 0
+        from datetime import datetime as _dt
+
+        async with self.db.get_session() as session:
+            for key_id, delta, ts_iso in entries:
+                ts = _dt.fromisoformat(ts_iso)
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                await session.execute(
+                    update(ApiKeyModel)
+                    .where(
+                        ApiKeyModel.id == key_id,
+                        ApiKeyModel.revoked.is_(False),
+                    )
+                    .values(
+                        usage_count=ApiKeyModel.usage_count + delta,
+                        last_used_at=ts,
+                    )
+                )
+        return len(entries)
+
     async def count_active(self) -> int:
         async with self.db.get_session() as session:
             result = await session.execute(
@@ -714,6 +764,23 @@ class SpendEventRepository:
                 stmt = stmt.where(SpendEventModel.tenant_id == tenant_id)
             row = (await session.execute(stmt)).scalar_one_or_none()
             return _row_to_dict(row) if row else None
+
+    async def purge_before(self, tenant_id: str, before: datetime) -> int:
+        """P6-8: delete this tenant's spend events older than the cutoff.
+
+        Traces are derived from spend events (P7-4), so the spend window
+        governs both: the retention sweep purges at
+        ``RetentionPolicy.spend_retention_days`` and documents that trace
+        expiry rides on it. Returns the number of rows deleted.
+        """
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                delete(SpendEventModel).where(
+                    SpendEventModel.tenant_id == tenant_id,
+                    SpendEventModel.created_at < before,
+                )
+            )
+            return result.rowcount or 0
 
     async def aggregate(
         self,
@@ -1719,6 +1786,54 @@ class ToolRegistryRepository:
             await session.flush()
             return _row_to_dict(row)
 
+    async def update_config(
+        self,
+        tenant_id: str,
+        name: str,
+        *,
+        description: str | None = None,
+        auth_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Merge updates into a tool's metadata (P9-1 admin API).
+
+        ``description=None`` leaves the description untouched; when set,
+        it replaces it. ``auth_config`` is merged field-wise over the
+        existing config so partial updates do not drop other settings.
+        """
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(ToolRegistryModel).where(
+                    ToolRegistryModel.tenant_id == tenant_id,
+                    ToolRegistryModel.name == name,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            if description is not None:
+                row.description = description
+            if auth_config:
+                merged = dict(row.auth_config or {})
+                merged.update(auth_config)
+                row.auth_config = merged
+            await session.flush()
+            return _row_to_dict(row)
+
+    async def delete(self, tenant_id: str, name: str) -> bool:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(ToolRegistryModel).where(
+                    ToolRegistryModel.tenant_id == tenant_id,
+                    ToolRegistryModel.name == name,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return False
+            await session.delete(row)
+            await session.flush()
+            return True
+
 
 class PolicyRepository:
     def __init__(self, db: DatabaseManager):
@@ -2169,6 +2284,137 @@ class ModelCatalogRepository:
                 delete(ModelCatalogModel).where(
                     ModelCatalogModel.id == entry_id,
                     ModelCatalogModel.tenant_id == tenant_id,
+                )
+            )
+            return bool(result.rowcount)
+
+class PromptRepository:
+    """Versioned tenant prompts with A/B targeting (P9-4)."""
+
+    def __init__(self, db: DatabaseManager):
+        self.db = db
+
+    async def list_by_tenant(self, tenant_id: str) -> list[dict[str, Any]]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(PromptModel)
+                .where(PromptModel.tenant_id == tenant_id)
+                .order_by(PromptModel.name.asc(), PromptModel.version.asc())
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def list_versions(self, tenant_id: str, name: str) -> list[dict[str, Any]]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(PromptModel)
+                .where(
+                    PromptModel.tenant_id == tenant_id,
+                    PromptModel.name == name,
+                )
+                .order_by(PromptModel.version.desc())
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def enabled_variants(self, tenant_id: str, name: str) -> list[dict[str, Any]]:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(PromptModel).where(
+                    PromptModel.tenant_id == tenant_id,
+                    PromptModel.name == name,
+                    PromptModel.enabled.is_(True),
+                )
+            )
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def get(self, tenant_id: str, name: str, version: int) -> dict[str, Any] | None:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(PromptModel).where(
+                    PromptModel.tenant_id == tenant_id,
+                    PromptModel.name == name,
+                    PromptModel.version == version,
+                )
+            )
+            row = result.scalar_one_or_none()
+            return _row_to_dict(row) if row else None
+
+    async def next_version(self, tenant_id: str, name: str) -> int:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(func.max(PromptModel.version)).where(
+                    PromptModel.tenant_id == tenant_id,
+                    PromptModel.name == name,
+                )
+            )
+            return int(result.scalar() or 0) + 1
+
+    async def create(
+        self,
+        tenant_id: str,
+        name: str,
+        content: str,
+        *,
+        description: str | None = None,
+        created_by: str | None = None,
+    ) -> dict[str, Any]:
+        version = await self.next_version(tenant_id, name)
+        async with self.db.get_session() as session:
+            model = PromptModel(
+                id=str(uuid4()),
+                tenant_id=tenant_id,
+                name=name,
+                version=version,
+                content=content,
+                description=description,
+                enabled=False,
+                target_percentage=0,
+                created_by=created_by,
+            )
+            session.add(model)
+            await session.flush()
+            return _row_to_dict(model)
+
+    async def set_active(
+        self,
+        tenant_id: str,
+        name: str,
+        version: int,
+        *,
+        enabled: bool,
+        target_percentage: int = 100,
+    ) -> dict[str, Any] | None:
+        """Activate/deactivate one version.
+
+        Multiple enabled variants coexist: the resolver allocates traffic
+        deterministically by ``target_percentage`` bands per session seed.
+        Setting one version to 100% (and others to 0) is the full-rollout
+        posture -- no cross-version mutation here.
+        """
+        if enabled and not (0 <= target_percentage <= 100):
+            raise ValueError("target_percentage must be within 0..100")
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                select(PromptModel).where(
+                    PromptModel.tenant_id == tenant_id,
+                    PromptModel.name == name,
+                    PromptModel.version == version,
+                )
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                return None
+            row.enabled = bool(enabled)
+            row.target_percentage = int(target_percentage) if enabled else 0
+            await session.flush()
+            return _row_to_dict(row)
+
+    async def delete_version(self, tenant_id: str, name: str, version: int) -> bool:
+        async with self.db.get_session() as session:
+            result = await session.execute(
+                delete(PromptModel).where(
+                    PromptModel.tenant_id == tenant_id,
+                    PromptModel.name == name,
+                    PromptModel.version == version,
                 )
             )
             return bool(result.rowcount)

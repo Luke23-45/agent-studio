@@ -10,7 +10,9 @@ end-user scoped where the caller passes one).
 """
 
 import structlog
-from typing import Any, Sequence
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from typing import Any, AsyncGenerator, Sequence
 from uuid import uuid4
 
 from sqlalchemy import delete, func, select
@@ -25,6 +27,7 @@ from .models import (
     ThreadEventModel,
     ThreadModel,
 )
+from .replicas import ReplicaRouter, get_replica_router
 from .repositories import _now, _row_to_dict
 
 logger = structlog.get_logger(__name__)
@@ -50,8 +53,27 @@ class ForkPointOutOfRange(Exception):
 
 
 class ThreadRepository:
-    def __init__(self, db: DatabaseManager):
+    def __init__(self, db: DatabaseManager, *, read_router: ReplicaRouter | None = None):
         self.db = db
+        # P8-3: pure history reads route to read replicas when configured;
+        # writes and correctness-critical reads always use the primary.
+        self.read_router = read_router if read_router is not None else get_replica_router()
+        # Fallback reads (no replicas / unhealthy / RYW window) must land on
+        # the SAME database this repository writes to.
+        self.read_router.bind_primary(db)
+
+    @asynccontextmanager
+    async def _read_session(
+        self, tenant_id: str, thread_id: str | None = None
+    ) -> AsyncGenerator[Any, None]:
+        """Session for pure history reads (replica-routed, P8-3).
+
+        ``(tenant_id, thread_id)`` are read-your-writes keys: a thread this
+        process wrote within the window is read back from the primary so
+        the caller never observes replica lag on its own writes.
+        """
+        async with self.read_router.get_read_session(tenant_id, thread_id) as session:
+            yield session
 
     # ---- thread lifecycle -------------------------------------------------
 
@@ -91,6 +113,10 @@ class ThreadRepository:
                 )
             )
             await session.flush()
+            # RYW: tenant key keeps thread listings consistent; conversation
+            # key covers conversation-scoped list reads; thread id covers
+            # single-thread history reads.
+            self.read_router.mark_write(tenant_id, conversation_id, thread_id)
         logger.info(
             "thread_created", tenant_id=tenant_id, thread_id=thread_id
         )
@@ -141,8 +167,13 @@ class ThreadRepository:
         limit: int = 50,
         before: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List threads for a tenant, optionally scoped to one end user."""
-        async with self.db.get_session() as session:
+        """List threads for a tenant, optionally scoped to one end user.
+
+        Tenant-keyed read-your-writes: a thread created by this process
+        within the window is read back from the primary, so fresh threads
+        always appear in listings.
+        """
+        async with self._read_session(tenant_id) as session:
             stmt = select(ThreadModel).where(ThreadModel.tenant_id == tenant_id)
             if end_user_id:
                 stmt = stmt.where(ThreadModel.end_user_id == end_user_id)
@@ -163,6 +194,9 @@ class ThreadRepository:
                     ThreadModel.end_user_id == end_user_id,
                 )
             )
+            # RYW: post-erasure reads stay on the primary so a lagging
+            # replica never resurrects erased rows.
+            self.read_router.mark_write(tenant_id)
             return result.rowcount or 0
 
     # ---- append path ------------------------------------------------------
@@ -282,6 +316,7 @@ class ThreadRepository:
             await session.flush()
             row = _row_to_dict(message)
             row["deduped"] = False
+            self.read_router.mark_write(tenant_id, thread_id, message.id)
             return row
 
     @staticmethod
@@ -338,6 +373,7 @@ class ThreadRepository:
             )
             session.add(event)
             await session.flush()
+            self.read_router.mark_write(tenant_id, thread_id)
             return _row_to_dict(event)
 
     # ---- read paths -------------------------------------------------------
@@ -366,7 +402,7 @@ class ThreadRepository:
         Returns ``{messages, has_more}``; the next page starts at
         ``messages[-1].seq``.
         """
-        async with self.db.get_session() as session:
+        async with self._read_session(tenant_id, thread_id) as session:
             stmt = (
                 select(MessageModel)
                 .where(
@@ -392,7 +428,7 @@ class ThreadRepository:
         limit: int = 20,
     ) -> list[dict[str, Any]]:
         """Newest-first tail (oldest of the returned set first in list order)."""
-        async with self.db.get_session() as session:
+        async with self._read_session(tenant_id, thread_id) as session:
             stmt = (
                 select(MessageModel)
                 .where(
@@ -523,6 +559,7 @@ class ThreadRepository:
             )
             session.add(part)
             await session.flush()
+            self.read_router.mark_write(tenant_id, thread_id)
 
             return {
                 "summary_version": new_version,
@@ -689,6 +726,8 @@ class ThreadRepository:
                 )
             )
             await session.flush()
+            self.read_router.mark_write(tenant_id, new_thread_id)
+            self.read_router.mark_write(tenant_id, source_thread_id)
 
         logger.info(
             "thread_forked",
@@ -702,7 +741,7 @@ class ThreadRepository:
     async def list_parts(
         self, tenant_id: str, message_id: str
     ) -> list[dict[str, Any]]:
-        async with self.db.get_session() as session:
+        async with self._read_session(tenant_id, message_id) as session:
             result = await session.execute(
                 select(MessagePartModel)
                 .where(
@@ -724,7 +763,7 @@ class ThreadRepository:
         (``content["cleared"]``) are excluded -- they no longer bloat
         context.
         """
-        async with self.db.get_session() as session:
+        async with self._read_session(tenant_id, thread_id) as session:
             result = await session.execute(
                 select(MessageModel.seq, MessagePartModel.content)
                 .join(
@@ -822,6 +861,7 @@ class ThreadRepository:
             )
             session.add(event)
             await session.flush()
+            self.read_router.mark_write(tenant_id, thread_id)
 
             return {
                 "cleared": len(eligible),
@@ -837,7 +877,7 @@ class ThreadRepository:
         after_seq: int | None = None,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
-        async with self.db.get_session() as session:
+        async with self._read_session(tenant_id, thread_id) as session:
             stmt = (
                 select(ThreadEventModel)
                 .where(
@@ -851,3 +891,137 @@ class ThreadRepository:
                 stmt = stmt.where(ThreadEventModel.seq > after_seq)
             result = await session.execute(stmt)
             return [_row_to_dict(r) for r in result.scalars()]
+
+    async def list_threads_archivable(
+        self,
+        tenant_id: str,
+        *,
+        older_than_days: int,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Threads eligible for the cold-tier archive (P1-7).
+
+        Returns non-archived threads whose newest activity is older than
+        the tenant's retention window, newest-first. Archive eligibility is
+        derived from the thread ``created_at`` (the log is immutable, so a
+        thread's lifetime is its creation timestamp).
+        """
+        cutoff = datetime.now(UTC) - timedelta(days=older_than_days)
+        async with self._read_session(tenant_id, tenant_id) as session:
+            stmt = (
+                select(ThreadModel)
+                .where(
+                    ThreadModel.tenant_id == tenant_id,
+                    ThreadModel.archived.is_(False),
+                    ThreadModel.created_at < cutoff,
+                )
+                .order_by(ThreadModel.created_at.asc())
+                .limit(limit)
+            )
+            result = await session.execute(stmt)
+            return [_row_to_dict(r) for r in result.scalars()]
+
+    async def dump_thread(
+        self, tenant_id: str, thread_id: str
+    ) -> dict[str, Any] | None:
+        """Full durable payload of a thread (P1-7 archive bundle).
+
+        Thread row + all messages + all parts + all events, serialized as
+        plain dicts for the object-storage archive. Returns None when the
+        thread does not belong to the tenant. Parts carry both ``content``
+        and ``redacted_content`` so the archive preserves the access-
+        controlled raw payload for DSR/legal re-reads.
+        """
+        async with self._read_session(tenant_id, thread_id) as session:
+            thread = (
+                await session.execute(
+                    select(ThreadModel).where(
+                        ThreadModel.id == thread_id,
+                        ThreadModel.tenant_id == tenant_id,
+                    )
+                )
+            ).scalar_one_or_none()
+            if thread is None:
+                return None
+            messages = (
+                await session.execute(
+                    select(MessageModel)
+                    .where(
+                        MessageModel.thread_id == thread_id,
+                        MessageModel.tenant_id == tenant_id,
+                    )
+                    .order_by(MessageModel.seq.asc())
+                )
+            ).scalars()
+            parts = (
+                await session.execute(
+                    select(MessagePartModel)
+                    .where(
+                        MessagePartModel.thread_id == thread_id,
+                        MessagePartModel.tenant_id == tenant_id,
+                    )
+                    .order_by(MessagePartModel.part_index.asc())
+                )
+            ).scalars()
+            events = (
+                await session.execute(
+                    select(ThreadEventModel)
+                    .where(
+                        ThreadEventModel.thread_id == thread_id,
+                        ThreadEventModel.tenant_id == tenant_id,
+                    )
+                    .order_by(ThreadEventModel.seq.asc())
+                )
+            ).scalars()
+            return {
+                "thread": _row_to_dict(thread),
+                "messages": [_row_to_dict(m) for m in messages],
+                "parts": [_row_to_dict(p) for p in parts],
+                "events": [_row_to_dict(e) for e in events],
+                "archived_at": None,
+                "checksum_algorithm": "sha256",
+            }
+
+    async def set_archived(
+        self,
+        tenant_id: str,
+        thread_id: str,
+        archived: bool,
+        *,
+        request_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Flip the cold-tier marker with a durable event (P1-7).
+
+        Appends ``thread.archive`` / ``thread.restore`` to the thread's
+        event log in the same transaction as the flag flip; the flag and
+        the event never diverge.
+        """
+        async with self.db.get_session() as session:
+            thread = await session.execute(
+                select(ThreadModel).where(
+                    ThreadModel.id == thread_id,
+                    ThreadModel.tenant_id == tenant_id,
+                ).with_for_update()
+            )
+            row = thread.scalar_one_or_none()
+            if row is None:
+                raise ThreadNotFoundError(f"Thread not found: {thread_id}")
+
+            row.archived = archived
+            await session.flush()
+
+            event_seq = (await self._max_event_seq(session, thread_id)) + 1
+            event = ThreadEventModel(
+                id=str(uuid4()),
+                thread_id=thread_id,
+                tenant_id=tenant_id,
+                seq=event_seq,
+                event_type="thread.archive" if archived else "thread.restore",
+                request_id=request_id,
+                payload={"archived": archived},
+            )
+            session.add(event)
+            await session.flush()
+            self.read_router.mark_write(tenant_id, thread_id)
+
+            return {"archived": archived, "event": _row_to_dict(event)}

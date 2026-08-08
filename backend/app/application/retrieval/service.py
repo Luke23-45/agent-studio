@@ -23,19 +23,34 @@ class RetrievalServiceConfig:
     enable_query_expansion: bool = False
     cache_ttl_seconds: int = 300
     max_retrieval_time_ms: float = 5000.0
+    # P9-2: hybrid retrieval (vector + BM25 fusion) + cross-encoder
+    # reranking. Both default OFF: single-stage retrieval remains the
+    # shipped path until recall evals (P6-6) justify the extra channel.
+    enable_hybrid: bool = False
+    hybrid_lexical_k: int = 15
+    enable_cross_encoder: bool = False
 
 
 class RetrievalService(ManagedService):
-    def __init__(self, rag_service: RAGService, config: Optional[RetrievalServiceConfig] = None):
+    def __init__(
+        self,
+        rag_service: RAGService,
+        config: Optional[RetrievalServiceConfig] = None,
+        lexical_index: Any = None,
+        reranker: Any = None,
+    ):
         super().__init__("retrieval_service")
         self.rag_service = rag_service
         self.config = config or RetrievalServiceConfig()
         self._cache: Dict[str, Tuple[RetrievalResult, float]] = {}
+        self._lexical_index = lexical_index
+        self._reranker = reranker
 
     async def _do_initialize(self) -> None:
         logger.info("retrieval_service_initialized",
                     top_k=self.config.top_k,
-                    reranking=self.config.enable_reranking)
+                    reranking=self.config.enable_reranking,
+                    hybrid=self.config.enable_hybrid)
 
     async def _do_close(self) -> None:
         self._cache.clear()
@@ -130,7 +145,13 @@ class RetrievalService(ManagedService):
             custom_config=initial,
         )
 
-        reranked = self._simple_rerank(initial_result.results, query_text)
+        candidates = initial_result.results
+        if self._reranker is not None:
+            from .rerankers import apply_rerank
+
+            reranked = await apply_rerank(candidates, query_text, self._reranker)
+        else:
+            reranked = self._simple_rerank(candidates, query_text)
         final_results = reranked[:top_k]
         context = self._build_spotlight_context(final_results)
 
@@ -141,6 +162,65 @@ class RetrievalService(ManagedService):
             total_results=initial_result.total_results,
             filtered_count=len(final_results),
             metadata={"reranked": True, "candidates_evaluated": len(reranked)},
+        )
+
+    async def retrieve_hybrid(
+        self,
+        query_text: str,
+        tenant_id: Optional[UUID] = None,
+        top_k: int = 5,
+        allowed_sources: Optional[List[str]] = None,
+    ) -> RetrievalResult:
+        """Vector + BM25 fusion (RRF), optionally re-ranked.
+
+        Falls back to plain vector retrieval when no lexical index is
+        wired (Postgres deployments can point the index at tsvector
+        later; the interface is unchanged).
+        """
+        vector_k = max(top_k * 3, self.config.hybrid_lexical_k)
+        initial = RetrievalConfig(top_k=vector_k, score_threshold=0.2)
+        vector_result = await self.retrieve(
+            query_text=query_text,
+            tenant_id=tenant_id,
+            custom_config=initial,
+            allowed_sources=allowed_sources,
+        )
+
+        if self._lexical_index is None:
+            final_results = vector_result.results[:top_k]
+            metadata = {"hybrid": False, "reason": "no_lexical_index"}
+        else:
+            from .hybrid import reciprocal_rank_fusion
+
+            lexical_hits = self._lexical_index.search(
+                query_text,
+                tenant_id=str(tenant_id) if tenant_id else None,
+                top_k=self.config.hybrid_lexical_k,
+            )
+            fused = reciprocal_rank_fusion(
+                vector_result.results,
+                lexical_hits,
+                index=self._lexical_index,
+            )
+            if self._reranker is not None:
+                from .rerankers import apply_rerank
+
+                fused = await apply_rerank(fused, query_text, self._reranker)
+            final_results = fused[:top_k]
+            metadata = {
+                "hybrid": True,
+                "vector_candidates": len(vector_result.results),
+                "lexical_candidates": len(lexical_hits),
+            }
+
+        context = self._build_spotlight_context(final_results)
+        return RetrievalResult(
+            query=query_text,
+            results=final_results,
+            context=context,
+            total_results=len(final_results),
+            filtered_count=len(final_results),
+            metadata=metadata,
         )
 
     async def multi_query_retrieval(
@@ -240,4 +320,24 @@ def create_retrieval_service(
     score_threshold: float = 0.3,
 ) -> RetrievalService:
     config = RetrievalServiceConfig(top_k=top_k, score_threshold=score_threshold)
-    return RetrievalService(rag_service=rag_service, config=config)
+    # P9-2: feature-flag driven hybrid/cross-encoder wiring (default off).
+    from backend.app.settings.feature_flags import feature_flags
+
+    config.enable_hybrid = feature_flags.ENABLE_HYBRID_RETRIEVAL
+    config.enable_cross_encoder = feature_flags.ENABLE_CROSS_ENCODER
+    lexical_index = None
+    reranker = None
+    if config.enable_hybrid:
+        from .hybrid import get_lexical_index
+
+        lexical_index = get_lexical_index()
+    if config.enable_cross_encoder:
+        from .rerankers import CrossEncoderReranker
+
+        reranker = CrossEncoderReranker()
+    return RetrievalService(
+        rag_service=rag_service,
+        config=config,
+        lexical_index=lexical_index,
+        reranker=reranker,
+    )

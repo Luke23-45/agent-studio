@@ -126,7 +126,7 @@ Current state: single linear LangGraph pipeline. Missing: agents/tools, memory, 
 |---|---|---|---|---|
 | 6.1 | Session persistence | Conversations in DB, resumable sessions, TTL per tenant | P0 | |
 | 6.2 | End-to-end streaming | Token-level streaming through guardrails → LLM → output check → SSE | P0 | |
-| 6.3 | MCP tool integration | MCP client with tool registry, allowlists per tenant/agent, input/output validation on tool calls | P1 | CIS MCP, OWASP-LLM06 |
+| 6.3 | MCP tool integration | MCP client with tool registry, allowlists per tenant/agent, input/output validation on tool calls | P1 | ✅ backend shipped (P9-1) — tool registry API (`/api/v1/tools`) with MCP servers as a tool source behind the P5-3 gate; UI/workbench wiring deferred | CIS MCP, OWASP-LLM06 |
 | 6.4 | Human-in-the-loop gates | Pause/suspend agent loop for approval; resume with modified plan; timeout → safe default | P0 | EU-AI-Act Art.26 |
 | 6.5 | Loop & runaway detection | Max steps, step budget, time budget, cost budget per session; hard kill switch | P0 | OWASP-LLM10 |
 | 6.6 | Model failover | Provider/model fallback chains, health-gated routing, degraded mode (static KB answers) | P1 | |
@@ -144,13 +144,13 @@ Current state: naive single-stage retrieval, in-memory, no persistence, broken p
 | # | Feature | Description | Priority | Standards |
 |---|---|---|---|---|
 | 7.1 | Offline indexing pipeline | Worker-driven: parse (OCR), structure-aware chunking (markdown/HTML/table-aware), semantic chunking, dedupe, PII scan before indexing, embedding, upsert | P0 | |
-| 7.2 | Hybrid retrieval | Dense + BM25/sparse + RRF fusion (pgvector + tsvector) | P1 | |
-| 7.3 | Cross-encoder reranking | Top-50 → rerank → top-5 (BGE/Cohere/Jina); +12–25 pts precision | P1 | OWASP-LLM09 |
+| 7.2 | Hybrid retrieval | Dense + BM25/sparse + RRF fusion (pgvector + tsvector) | P1 | ✅ backend shipped (P9-2) — Postgres FTS tsvector + GIN (migration 0011), in-memory BM25 for dev/tests, RRF fusion + fusion metrics; flag-gated (default off until P6-6 recall evals) |
+| 7.3 | Cross-encoder reranking | Top-50 → rerank → top-5 (BGE/Cohere/Jina); +12–25 pts precision | P1 | ✅ backend module shipped (P9-2, flag-gated default off) — `application/retrieval/rerankers.py`; still deferred until recall evals demand it | OWASP-LLM09 |
 | 7.4 | Query transformation | Expansion, HyDE, multi-query for hard queries | P2 | |
 | 7.5 | ACL-aware retrieval | Metadata filters carry access-control; user/role-scoped document access enforced at retrieval time | P0 | OWASP-LLM08, GDPR |
 | 7.6 | Citations & grounding | Output must cite retrieved chunks; faithfulness check (RAGAS) on generation; ungrounded claims flagged | P0 | OWASP-LLM09 |
 | 7.7 | Corpus management | Versioning, refresh cadence, stale-document detection, index health metrics | P1 | |
-| 7.8 | Semantic caching | 40–70% cost/latency reduction on repeated queries; per-tenant, TTL | P1 | OWASP-LLM10 |
+| 7.8 | Semantic caching | 40–70% cost/latency reduction on repeated queries; per-tenant, TTL — ✅ backend shipped (P3-7): exact + semantic layers, invalidation on config publish/KB reindex proven by tests | P1 | OWASP-LLM10 |
 | 7.9 | Retrieval evals in CI | Recall@k, MRR, context_precision/recall gates on every chunker/embedding/param change | P0 | |
 | 7.10 | Embedding drift monitoring | Compare online query embeddings vs index distribution; alert on drift | P2 | |
 | 7.11 | Cross-tenant leakage tests | Automated negative tests: tenant A query must never return tenant B content | P0 | |
@@ -162,7 +162,7 @@ Current state: naive single-stage retrieval, in-memory, no persistence, broken p
 | # | Feature | Description | Priority | Standards |
 |---|---|---|---|---|
 | 8.1 | Escalation queue (backend) | Handoff records persisted (not just in-memory), statuses, SLAs | P0 | |
-| 8.2 | Channel integrations | Email, Slack, Teams, webhook, Zendesk/Jira/ServiceNow (replace generic webhook only) | P1 | |
+| 8.2 | Channel integrations | Email, Slack, Teams, webhook, Zendesk/Jira/ServiceNow (replace generic webhook only) | P1 | ✅ backend shipped (P9-3) — concrete adapters (Zendesk/Jira/ServiceNow) dispatch from the escalation path, credential-gated, generic webhook unchanged as fallback; Slack/Teams/email remain via NOTIFICATION_CHANNEL | |
 | 8.3 | Routing rules | By tenant, category, severity, confidence, agent skill | P1 | |
 | 8.4 | Resolution feedback loop | Outcome captured → feeds guardrail/policy tuning and evals | P1 | ISO-42001 A.7 |
 | 8.5 | SLA timers & reminders | Escalation aging, stale-handoff alerts | P1 | |
@@ -178,9 +178,9 @@ Current state: naive single-stage retrieval, in-memory, no persistence, broken p
 | 9.3 | Metrics | Latency percentiles, tokens, cost, error rate, block rate, escalation rate, retrieval quality proxies | P0 | |
 | 9.4 | Alerting | Error-rate, cost-spike, block-rate anomaly, drift, queue depth, DLQ | P0 | |
 | 9.5 | Drift monitoring | Quality drift (LLM-as-judge scores over time), topic drift, jailbreak-trend | P1 | EU-AI-Act Art.72 |
-| 9.6 | Prompt management | Versioned prompts, A/B, rollback, prompt↔trace linkage | P1 | |
+| 9.6 | Prompt management | Versioned prompts, A/B, rollback, prompt↔trace linkage | P1 | ✅ backend shipped (P9-4) — portal API + deterministic A/B resolution + trace linkage; UI portal deferred |
 | 9.7 | SIEM export | Audit events to SIEM (Splunk/Datadog) for enterprise security teams | P1 | ISO-42001 A.9 |
-| 9.8 | Retention controls | Trace/log retention per tenant, archival to S3 | P0 | GDPR |
+| 9.8 | Retention controls | Trace/log retention per tenant, archival to S3 — ✅ backend shipped (P1-7): cold-tier thread archive/restore, region-pinned, checksum-verified | P0 | GDPR |
 
 ---
 
@@ -274,7 +274,7 @@ Current state: 0% — pure scaffolding. This is the customer-facing surface; qua
 |---|---|---|---|---|
 | 15.1 | AI inventory registry | Per-tenant system cards: purpose, model, data categories, owner, risk tier | P1 | ISO-42001 A.3, NIST-RMF Map |
 | 15.2 | Evidence generation | Auto-generated compliance packets: policy decisions, guardrail outcomes, eval reports, audit events, retention state | P1 | ISO-42001 Annex A, NIST-RMF Measure |
-| 15.3 | EU AI Act readiness | Transparency (Art.50), logging (Art.12), human oversight (Art.26), post-market monitoring (Art.72), incident reporting (Art.73) hooks | P1 | EU-AI-Act |
+| 15.3 | EU AI Act readiness | Transparency (Art.50), logging (Art.12), human oversight (Art.26), post-market monitoring (Art.72), incident reporting (Art.73) hooks + Annex III posture: per-tenant risk-assessment artifacts (`POST /tenants/{id}/compliance/risk-assessment` → audit trail), documented adversarial testing (P6-6 garak/pyrit), deployer documentation — surfaced via `GET /tenants/{id}/compliance` checklist | P1 | EU-AI-Act |
 | 15.4 | Data subject requests | Export/deletion APIs, automated fulfillment | P1 | GDPR |
 | 15.5 | Certifications path | SOC 2 Type II + ISO 27001 first, ISO 42001 next; controls documented from day one | P1 | |
 

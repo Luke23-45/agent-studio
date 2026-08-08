@@ -118,6 +118,7 @@ class OrchestrationService:
         surface_id: str | None = None,
         end_user_id: str | None = None,
         output_validator: Callable[[str], Awaitable[Any]] | None = None,
+        prompt_resolver: Callable[[str], str | None] | None = None,
     ):
         self.tenant_config = tenant_config
         self.policy_set = policy_set
@@ -187,6 +188,13 @@ class OrchestrationService:
         # escalates on exhaustion (Arch 9.2). None keeps the classic
         # streaming-path behavior (route-level window validation).
         self.output_validator = output_validator
+        # P9-4: prompt management portal hook. ``(name) -> content | None``;
+        # when it returns content for "system", that content replaces the
+        # default system prompt (deterministic per session -> cache-stable).
+        # The applied version is read from the resolver's ``resolved_version``
+        # attribute (feature-matrix 9.6 prompt<->trace linkage).
+        self.prompt_resolver = prompt_resolver
+        self.prompt_version: str | None = None
         self._build_graph()
 
     def _build_graph(self) -> None:
@@ -282,11 +290,20 @@ class OrchestrationService:
             return state
 
         try:
-            result = await self.retrieval_service.retrieve(
-                query_text=state["redacted_message"],
-                tenant_id=self.tenant_config.id,
-                allowed_sources=self.tenant_config.knowledge_allowlist,
-            )
+            config = getattr(self.retrieval_service, "config", None)
+            if getattr(config, "enable_hybrid", False):
+                # P9-2: vector + BM25 fusion (RRF) with optional rerank.
+                result = await self.retrieval_service.retrieve_hybrid(
+                    query_text=state["redacted_message"],
+                    tenant_id=self.tenant_config.id,
+                    allowed_sources=self.tenant_config.knowledge_allowlist,
+                )
+            else:
+                result = await self.retrieval_service.retrieve(
+                    query_text=state["redacted_message"],
+                    tenant_id=self.tenant_config.id,
+                    allowed_sources=self.tenant_config.knowledge_allowlist,
+                )
             state["retrieved_docs"] = [
                 {
                     "content": r.document.content,
@@ -326,6 +343,11 @@ class OrchestrationService:
             "llm.generate",
             tenant_id=str(state["tenant_id"]),
             surface_id=self.surface_id,
+            attributes=(
+                {"neryva.prompt_version": self.prompt_version}
+                if self.prompt_version
+                else None
+            ),
         ):
             return await self._generate_response_impl(state)
 
@@ -346,7 +368,11 @@ class OrchestrationService:
         without tools. A verify note (from ``validate_output``) is appended
         as a corrective instruction.
         """
-        logger.info("generating_response", tenant_id=state["tenant_id"])
+        logger.info(
+            "generating_response",
+            tenant_id=state["tenant_id"],
+            prompt_version=self.prompt_version,
+        )
 
         try:
             system_prompt = self._build_system_prompt(state)
@@ -1204,7 +1230,22 @@ class OrchestrationService:
         the SessionContextLoader (Arch 8.1). Keeping this prefix free of
         per-turn content makes it byte-identical across turns, which is the
         precondition for provider prompt caching (P2-6).
+
+        P9-4: a wired ``prompt_resolver`` may replace the prefix entirely
+        with a managed prompt version (A/B-resolved per session seed).
         """
+        if self.prompt_resolver is not None:
+            try:
+                override = self.prompt_resolver("system")
+            except Exception as e:  # pragma: no cover - resolver never breaks a turn
+                logger.warning("prompt_resolver_failed", error=str(e))
+                override = None
+            if override:
+                self.prompt_version = getattr(
+                    self.prompt_resolver, "resolved_version", None
+                )
+                return override
+            self.prompt_version = None
         allowed_topics = ", ".join(self.tenant_config.allowed_topics) or "general"
         blocked_topics = ", ".join(self.tenant_config.blocked_topics) or "none"
 

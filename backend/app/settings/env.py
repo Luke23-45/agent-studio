@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     VECTOR_STORE: str = "auto"
     VECTOR_STORE_TABLE: str = "embeddings"
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # P9-2: cross-encoder reranker model (lazy-loaded, flag-gated).
+    CROSS_ENCODER_MODEL: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # CORS (admin console + widget origins; "*" only for development)
     CORS_ORIGINS: list[str] = ["*"]
@@ -66,6 +68,23 @@ class Settings(BaseSettings):
 
     # Escalation / handoff
     TICKETING_WEBHOOK_URL: str | None = None
+    # P9-3 helpdesk channels (feature-matrix 8.2): generic (webhook) keeps
+    # the legacy behavior; zendesk | jira | servicenow use the concrete
+    # adapters when their credentials are configured.
+    TICKETING_ADAPTER: str = "generic"
+    ZENDESK_URL: str | None = None
+    ZENDESK_EMAIL: str | None = None
+    ZENDESK_API_TOKEN: str | None = None
+    JIRA_URL: str | None = None
+    JIRA_API_TOKEN: str | None = None
+    JIRA_PROJECT_KEY: str | None = None
+    SERVICENOW_URL: str | None = None
+    SERVICENOW_USERNAME: str | None = None
+    SERVICENOW_PASSWORD: str | None = None
+
+    # MCP tool sources (P9-1, feature-matrix 6.3): per-call timeout for the
+    # JSON-RPC transports. Enablement is per-tenant via the tools API.
+    MCP_TOOL_TIMEOUT_SECONDS: float = 15.0
 
     # Notifications (email via SMTP, SMS via provider webhook)
     SMTP_HOST: str | None = None
@@ -190,6 +209,31 @@ class Settings(BaseSettings):
     MFA_SIGNING_KEY_FILE: str = "mfa_master.key"
     MFA_PROOF_TTL_SECONDS: int = 60
     MFA_ISSUER: str = "Neryva Agent Studio"
+
+    # Data plane write discipline (Arch 11, P8-1): high-frequency "last
+    # active" updates (API-key usage, read receipts) buffer in Redis and
+    # flush to Postgres on a cadence / at a batch threshold -- never a
+    # per-event write to the primary.
+    LAST_ACTIVE_FLUSH_INTERVAL_SECONDS: float = 60.0
+    LAST_ACTIVE_BATCH_THRESHOLD: int = 500
+    LAST_ACTIVE_BUFFER_TTL_SECONDS: int = 300
+
+    # Read replicas (Arch 11, P8-3, L2): optional replica URLs the
+    # read router fans history reads out to. JSON array in env, e.g.
+    # '["postgresql+asyncpg://user:pass@replica-1:5432/neryva"]'.
+    # Empty = primary only (L1 shape).
+    REPLICA_DATABASE_URLS: list[str] = []
+    # Read-your-writes window: reads for a key the process just wrote
+    # within this window stay on the primary (in-process approximation at
+    # L1; Redis-shared at L2 -- see docs/implementation/read-replicas.md).
+    REPLICA_READ_YOUR_WRITES_WINDOW_SECONDS: float = 5.0
+
+    # Connection pooling for the primary (L2 readiness; mirrors the
+    # DatabaseConfig defaults so deployments can tune without code change).
+    DATABASE_POOL_SIZE: int = 20
+    DATABASE_MAX_OVERFLOW: int = 10
+    DATABASE_POOL_RECYCLE: int = 3600
+    DATABASE_STATEMENT_TIMEOUT_MS: int = 30000
 
     @property
     def is_production(self) -> bool:

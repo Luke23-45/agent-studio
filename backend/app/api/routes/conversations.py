@@ -306,6 +306,51 @@ async def _build_governance_wiring(
     return _tool_authorizer, gateway_cfg
 
 
+async def _build_prompt_resolver(db: Any, tenant_config: TenantConfig, session_id: str) -> Any:
+    """P9-4: managed system-prompt override (deterministic per session).
+
+    Resolves the active variant of the ``system`` prompt ONCE per request
+    (async, here in the route) so re-asks inside a turn see the identical
+    prompt, and a session keeps its variant across turns (cache-stable
+    prefix). No match -> the default system prompt is used.
+
+    The applied version is attached to the resolver as ``resolved_version``
+    so the orchestration layer can tag the LLM span with it (feature-matrix
+    9.6 prompt<->trace linkage); None when no managed prompt applies.
+    """
+    from backend.app.application.prompts.service import resolve_prompt_variant
+    from backend.app.infrastructure.db import PromptRepository
+
+    rows = await PromptRepository(db).enabled_variants(str(tenant_config.id), "system")
+    variant = resolve_prompt_variant(rows, seed=f"{tenant_config.id}:{session_id}")
+    resolved: str | None = variant["content"] if variant else None
+    resolved_version: str | None = (
+        f"{variant['name']}:v{variant['version']}" if variant else None
+    )
+
+    def resolver(name: str) -> str | None:
+        return resolved if name == "system" else None
+
+    resolver.resolved_version = resolved_version  # type: ignore[attr-defined]
+    return resolver
+
+
+async def _build_tool_registry(db: Any, tenant_config: TenantConfig) -> Any:
+    """P9-1: per-request tool registry from the tenant's tool_registry rows.
+
+    Enabled MCP servers become tool sources behind the P5-3 gate; gated
+    by the ENABLE_MCP_TOOLS flag (default off keeps today's behavior).
+    """
+    from backend.app.application.tools.factory import build_tool_registry
+    from backend.app.settings.feature_flags import feature_flags
+
+    return await build_tool_registry(
+        db=db,
+        tenant_id=str(tenant_config.id),
+        enable_mcp=feature_flags.ENABLE_MCP_TOOLS,
+    )
+
+
 async def _refresh_hot_tail(
     db: Any,
     tenant_id: str,
@@ -876,6 +921,7 @@ async def process_conversation(
         conversation_id=conversation["id"],
         evidence_repo=evidence_repo,
     )
+    tool_registry = await _build_tool_registry(db, tenant_config)
     orchestration = create_orchestration_service(
         tenant_config=tenant_config,
         policy_set=policy_set,
@@ -889,8 +935,12 @@ async def process_conversation(
         surface_id=surface["id"] if surface else None,
         end_user_id=principal.end_user_id,
         tool_authorizer=tool_authorizer,
+        tool_registry=tool_registry,
         gateway_cfg=gateway_cfg,
         output_validator=_output_validator,
+    )
+    orchestration.prompt_resolver = await _build_prompt_resolver(
+        db, tenant_config, session_id
     )
     orchestration.compaction_callback = _build_compaction_callback(
         db,
@@ -1149,7 +1199,8 @@ async def process_conversation(
     finally:
         await admission_handle.release()
         await thread_lease.release()
-        await thread_lease.release()
+        # P9-1: release MCP sources (httpx clients / stdio subprocesses).
+        await tool_registry.close()
 
 
 def _sse(event: str, data: dict, event_id: int | None = None) -> str:
@@ -1483,6 +1534,7 @@ async def stream_conversation(
         conversation_id=conversation["id"],
         evidence_repo=evidence_repo,
     )
+    tool_registry = await _build_tool_registry(db, tenant_config)
     orchestration = create_orchestration_service(
         tenant_config=tenant_config,
         policy_set=policy_set,
@@ -1496,7 +1548,11 @@ async def stream_conversation(
         surface_id=surface["id"] if surface else None,
         end_user_id=principal.end_user_id,
         tool_authorizer=tool_authorizer,
+        tool_registry=tool_registry,
         gateway_cfg=gateway_cfg,
+    )
+    orchestration.prompt_resolver = await _build_prompt_resolver(
+        db, tenant_config, session_id
     )
     orchestration.compaction_callback = _build_compaction_callback(
         db,
@@ -1932,6 +1988,8 @@ async def stream_conversation(
         finally:
             await admission_handle.release()
             await thread_lease.release()
+            # P9-1: release MCP sources (httpx clients / stdio subprocesses).
+            await tool_registry.close()
 
     return StreamingResponse(
         event_generator(),
@@ -2681,6 +2739,17 @@ async def publish_tenant_config_version(
         )
 
     get_tenant_config_service().invalidate_cache(tenant_id)
+    # P3-7: purge the tenant's gateway response caches (exact + semantic)
+    # so the published prompt/tools take effect immediately; the durable
+    # invalidation log records the change (P0-11 wiring).
+    try:
+        from backend.app.gateway.service import get_gateway
+
+        await get_gateway().cache.invalidate_tenant(
+            str(tenant_id), reason=f"config.publish:v{version}"
+        )
+    except RuntimeError:  # pragma: no cover - gateway not initialized
+        logger.warning("gateway_cache_invalidate_skipped", tenant_id=str(tenant_id))
     await AuditRepository(db).add(
         action="config_version.published",
         resource_type="tenant_config_version",
@@ -3063,6 +3132,9 @@ async def get_compliance_posture(
         )
     surface = await SurfaceRepository(db).get_default(str(tenant_id))
     service = ComplianceService()
+    records = await AuditRepository(db).list_events(
+        str(tenant_id), action="compliance.risk_assessment_recorded"
+    )
     return {
         "tenant_id": str(tenant_id),
         "disclosure": disclosure_payload(
@@ -3070,7 +3142,13 @@ async def get_compliance_posture(
             surface=surface,
             surface_type=(surface or {}).get("surface_type") or "widget",
         ),
-        "posture": service.checklist(),
+        "posture": service.checklist(
+            tenant_id=str(tenant_id),
+            risk_assessment_records=records,
+        ),
+        "risk_assessments": [
+            r["details"] for r in records if isinstance(r.get("details"), dict)
+        ],
     }
 
 
@@ -3111,6 +3189,61 @@ async def report_compliance_incident(
         "compliance_incident_reported",
         tenant_id=str(tenant_id),
         severity=request.severity,
+    )
+    return record
+
+
+class RiskAssessmentRequest(BaseModel):
+    """Annex III per-tenant risk-assessment artifact (P5-11, D-13).
+
+    The artifact (assessment report URL) is recorded on the immutable
+    audit trail; the posture checklist reflects it. Legal re-verification
+    stays a standing human action — recording an assessment never
+    auto-clears the re-verification date.
+    """
+
+    artifact_url: str = Field(..., min_length=1, max_length=2048)
+    assessed_by: str = Field(..., min_length=1, max_length=256)
+    scope: str = Field(default="high-risk-usage-patterns", max_length=256)
+
+
+@router.post("/tenants/{tenant_id}/compliance/risk-assessment")
+async def record_compliance_risk_assessment(
+    tenant_id: UUID,
+    request: RiskAssessmentRequest,
+    principal: ApiKeyPrincipal = Depends(require_permission("tenants:write")),
+):
+    """Record a per-tenant risk-assessment artifact (Annex III, P5-11)."""
+    assert_tenant_access(principal, tenant_id)
+
+    from backend.app.governance.compliance import ComplianceService
+
+    db = get_database_manager()
+    tenant = await TenantRepository(db).get_by_id(str(tenant_id))
+    if tenant is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant not found: {tenant_id}",
+        )
+    record = ComplianceService().record_risk_assessment(
+        tenant_id=str(tenant_id),
+        artifact_url=request.artifact_url,
+        assessed_by=request.assessed_by,
+        scope=request.scope,
+    )
+    await AuditRepository(db).add(
+        action="compliance.risk_assessment_recorded",
+        resource_type="tenant",
+        resource_id=str(tenant_id),
+        tenant_id=str(tenant_id),
+        actor_type="api_key",
+        actor_id=principal.key_id,
+        details=record,
+    )
+    logger.info(
+        "compliance_risk_assessment_recorded",
+        tenant_id=str(tenant_id),
+        assessed_by=request.assessed_by,
     )
     return record
 

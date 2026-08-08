@@ -149,6 +149,22 @@ class ExactCache(ManagedService):
         except Exception as e:
             await self._log_degraded_once(e)
 
+    async def purge_tenant(self, tenant_id: str) -> int:
+        """Drop every exact-cache key of a tenant (invalidation); count."""
+        if not self._redis_available or self._redis is None:
+            return 0
+        try:
+            pattern = f"{self.config.prefix}{tenant_id}:*"
+            keys = []
+            async for key in self._redis.scan_iter(match=pattern, count=100):
+                keys.append(key)
+            if keys:
+                await self._redis.delete(*keys)
+            return len(keys)
+        except Exception as e:
+            await self._log_degraded_once(e)
+            return 0
+
     async def _log_degraded_once(self, error: Exception) -> None:
         if not self._degraded_logged:
             self._degraded_logged = True
@@ -397,8 +413,9 @@ class GatewayCache:
         await self.semantic.store(tenant_id=tenant_id, query_text=query_text, entry=entry)
 
     async def invalidate_tenant(self, tenant_id: str, reason: str = "tenant invalidate") -> int:
-        """Purge all of a tenant's cached entries + log durably."""
-        removed = await self.semantic.purge_tenant(tenant_id)
+        """Purge all of a tenant's cached entries (exact + semantic) + log durably."""
+        removed = await self.exact.purge_tenant(tenant_id)
+        removed += await self.semantic.purge_tenant(tenant_id)
         await self._log_invalidation(tenant_id, "tenant", None, reason)
         logger.info("gateway_cache_tenant_invalidated", tenant_id=tenant_id, removed=removed)
         return removed
@@ -406,8 +423,14 @@ class GatewayCache:
     async def invalidate_resource(
         self, tenant_id: str, resource_id: str, reason: str = "resource invalidate"
     ) -> int:
-        """Drop a tenant's cached responses after a knowledge/config change."""
-        removed = await self.semantic.purge_tenant(tenant_id)
+        """Drop a tenant's cached responses after a knowledge/config change.
+
+        Both layers are purged: the semantic index fully, and the exact
+        keys via prefix scan — a KB edit must not keep serving cached
+        answers built from the pre-edit knowledge (§17 stale-result rule).
+        """
+        removed = await self.exact.purge_tenant(tenant_id)
+        removed += await self.semantic.purge_tenant(tenant_id)
         await self._log_invalidation(tenant_id, "resource", resource_id, reason)
         logger.info(
             "gateway_cache_resource_invalidated",

@@ -1,8 +1,11 @@
 # Neryva Agent Studio - dev parity compose stack (Arch 16, P0-12)
 # Usage: docker compose up --build
 # Production: replace SQLite/SQLite defaults via .env; Langfuse behind a profile.
+# Image naming: dev/CI builds use REGISTRY default `neryva-product-aaa`; the
+# staging deploy passes REGISTRY=ghcr.io/<repo> TAG=<sha8> to pull CI images.
 services:
   api:
+    image: ${REGISTRY:-neryva-product-aaa}/api:${TAG:-latest}
     build:
       context: .
       dockerfile: ops/docker/backend.Dockerfile
@@ -22,6 +25,7 @@ services:
         condition: service_healthy
 
   worker:
+    image: ${REGISTRY:-neryva-product-aaa}/worker:${TAG:-latest}
     build:
       context: .
       dockerfile: ops/docker/worker.Dockerfile

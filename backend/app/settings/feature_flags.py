@@ -48,6 +48,17 @@ class FeatureFlags:
     # Multi-tenancy
     ENABLE_ISOLATED_DEPLOYMENT: bool = True
 
+    # Phase 9 (pulled forward): MCP servers as tool sources behind the
+    # P5-3 gate (6.3). Default off; wired via backend/app/application/tools/factory.py
+    # and the /tools admin API when enabled.
+    ENABLE_MCP_TOOLS: bool = False
+
+    # Phase 9 (pulled forward): hybrid retrieval + cross-encoder rerank
+    # (7.2/7.3). Single-stage vector retrieval remains the default; flip
+    # these after recall evals (P6-6) show a gap.
+    ENABLE_HYBRID_RETRIEVAL: bool = False
+    ENABLE_CROSS_ENCODER: bool = False
+
 
 # Global feature flags instance
 feature_flags = FeatureFlags()

@@ -9,6 +9,7 @@ replay measures orchestration quality against the recorded transcript.
 """
 
 import structlog
+from typing import Any
 
 from backend.app.application.orchestration.factories import (
     get_retrieval_service,
@@ -74,12 +75,26 @@ class EvalReplayService:
             escalation_repository=escalation_repository,
         )
         retrieval_service = get_retrieval_service(tenant_config.id)
+        tool_registry = await self._build_tool_registry(tenant_config)
+        # P9-1: replay must run behind the same P5-3 gate as live traffic.
+        # Replay has no request surface, so the gate's allowlist is empty:
+        # tenant-enabled tools stay authorized=false -> every tool call is
+        # denied (deny-by-default), never executed gate-free.
+        tool_authorizer = None
+        if tool_registry is not None:
+            from backend.app.governance.toolgate import build_authorizer
+
+            tool_authorizer = await build_authorizer(
+                tenant_config=tenant_config, db=self.db, surface=None
+            )
         orchestration = create_orchestration_service(
             tenant_config=tenant_config,
             policy_set=policy_set,
             gateway=get_gateway(),
             retrieval_service=retrieval_service,
             escalation_service=escalation_service,
+            tool_registry=tool_registry,
+            tool_authorizer=tool_authorizer,
         )
 
         replayed = 0
@@ -151,3 +166,17 @@ class EvalReplayService:
         )
         report["audit_event_id"] = audit_event["id"]
         return report
+
+    async def _build_tool_registry(self, tenant_config) -> Any:
+        """P9-1: replay through the same tool wiring as live traffic."""
+        try:
+            from backend.app.application.tools.factory import build_tool_registry
+            from backend.app.settings.feature_flags import feature_flags
+
+            return await build_tool_registry(
+                db=self.db,
+                tenant_id=str(tenant_config.id),
+                enable_mcp=feature_flags.ENABLE_MCP_TOOLS,
+            )
+        except Exception:  # pragma: no cover - replay degrades to no tools
+            return None

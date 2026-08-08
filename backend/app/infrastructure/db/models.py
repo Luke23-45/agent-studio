@@ -104,6 +104,10 @@ class MessageModel(Base):
         UniqueConstraint("thread_id", "seq", name="uq_messages_thread_seq"),
         Index("ix_messages_request_id", "request_id", unique=True),
         Index("ix_messages_tenant_created", "tenant_id", "created_at"),
+        # P8-2: composite leading with tenant_id -- serves the thread-scoped
+        # reads that also filter tenant_id and enables partition pruning for
+        # the P8-4 tenant-hash sharding design.
+        Index("ix_messages_tenant_thread_seq", "tenant_id", "thread_id", "seq"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -390,6 +394,8 @@ class ThreadEventModel(Base):
         UniqueConstraint("thread_id", "seq", name="uq_thread_events_thread_seq"),
         Index("ix_thread_events_thread_created", "thread_id", "created_at"),
         Index("ix_thread_events_tenant_created", "tenant_id", "created_at"),
+        # P8-2: tenant-leading composite for the same reasons as messages.
+        Index("ix_thread_events_tenant_thread_seq", "tenant_id", "thread_id", "seq"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -784,3 +790,34 @@ class CacheInvalidationLogModel(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )
+
+
+class PromptModel(Base, TimestampMixin):
+    """Versioned tenant prompt with A/B targeting (P9-4, feature-matrix 4.x).
+
+    One row per (tenant, name, version); at most the enabled rows of a
+    name participate in A/B: each carries ``target_percentage`` (share of
+    sessions steered to it, deterministic per session seed). The
+    resolution logic lives in ``application/prompts/service.py``.
+    """
+
+    __tablename__ = "prompts"
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "name",
+            "version",
+            name="uq_prompts_tenant_name_version",
+        ),
+        Index("ix_prompts_tenant_name", "tenant_id", "name"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    target_percentage: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)

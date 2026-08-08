@@ -135,6 +135,8 @@ class TestHandlerRegistration:
             "canary.evaluate",
             "eval_extract.run",
             "retention.run",
+            "thread.archive",
+            "thread.restore",
             "gdpr.erase",
             "gdpr.export",
         }

@@ -1,0 +1,36 @@
+name: Load Test (staging)
+
+on:
+  workflow_dispatch:
+    inputs:
+      script:
+        description: "k6 script to run (ops/loadtest/*.js)"
+        required: false
+        default: load.js
+      base_url:
+        description: "Staging base URL"
+        required: false
+        default: ""
+
+jobs:
+  k6:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run k6 load test
+        uses: grafana/k6-action@v0.4.0
+        with:
+          filename: ops/loadtest/${{ github.event.inputs.script || 'load.js' }}
+          flags: >-
+            -e BASE_URL=${{ github.event.inputs.base_url || secrets.STAGING_URL }}
+            -e API_TOKEN=${{ secrets.STAGING_API_TOKEN }}
+
+      - name: Upload k6 summary
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-summary
+          path: |
+            summary.json
+            summary.csv

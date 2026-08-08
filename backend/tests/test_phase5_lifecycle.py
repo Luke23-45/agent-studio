@@ -255,6 +255,45 @@ class TestComplianceHelpers:
         assert retention_days_for({}) == 30
         assert retention_days_for({"memory": {"expiry_days": 14}}) == 14
 
+    def test_annex_iii_checklist_posture(self):
+        """P5-11/D-7: Annex III items documented; re-verification standing."""
+        from backend.app.governance.compliance import ComplianceService
+
+        service = ComplianceService()
+        checklist = service.checklist()["checklist"]
+
+        assert checklist["deployer_documentation"] is True
+        assert checklist["documented_adversarial_testing"] is True
+        assert checklist["per_tenant_risk_assessment"] is False  # no artifact yet
+        assert checklist["reverification_required_by"] == "2027-12-01"
+        # Legal re-verification is a standing human action — never auto-cleared.
+        assert "standing human action" in checklist["reverification_note"]
+
+    def test_risk_assessment_artifact_flips_posture(self):
+        from backend.app.governance.compliance import ComplianceService
+
+        service = ComplianceService()
+        record = service.record_risk_assessment(
+            tenant_id="t1",
+            artifact_url="s3://neryva/compliance/t1/assessment-v1.pdf",
+            assessed_by="compliance-officer@neryva.example",
+        )
+        assert record["tenant_id"] == "t1"
+        assert record["assessed_by"] == "compliance-officer@neryva.example"
+
+        # Posture reflects the in-memory registry for that tenant only.
+        assert service.checklist(tenant_id="t1")["checklist"]["per_tenant_risk_assessment"] is True
+        assert service.checklist(tenant_id="t2")["checklist"]["per_tenant_risk_assessment"] is False
+
+        # Durable-record path (audit rows passed by the route) flips it too.
+        assert (
+            service.checklist(
+                tenant_id="t9",
+                risk_assessment_records=[{"details": record}],
+            )["checklist"]["per_tenant_risk_assessment"]
+            is True
+        )
+
     def test_resolve_region_validation(self):
         from backend.app.governance.residency import resolve_region
 

@@ -21,9 +21,13 @@ from backend.app.worker.retention import (
     JOB_GDPR_ERASE,
     JOB_GDPR_EXPORT,
     JOB_RETENTION_RUN,
+    JOB_THREAD_ARCHIVE,
+    JOB_THREAD_RESTORE,
     handle_gdpr_erase,
     handle_gdpr_export,
     handle_retention_run,
+    handle_thread_archive,
+    handle_thread_restore,
 )
 
 logger = structlog.get_logger(__name__)
@@ -107,6 +111,27 @@ async def handle_ingestion_embed(payload: dict[str, Any]) -> None:
         source=source,
         embedding_dim=embedding_dim,
     )
+    # P9-2: keep the in-memory BM25 index fed alongside the vector store
+    # (best-effort; failures never fail the embed job).
+    try:
+        from backend.app.application.retrieval.hybrid import index_chunks
+
+        indexed = index_chunks(chunks, tenant_id=tenant_id, document_id=document_id, source=source)
+        logger.info("lexical_index_updated", document_id=document_id, chunks=indexed)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("lexical_index_failed", document_id=document_id, error=str(e))
+    # P3-7: a knowledge change must invalidate the tenant's gateway
+    # response caches — stale cached answers built from pre-edit knowledge
+    # are a product bug (§17). Best-effort: if the gateway isn't running,
+    # the exact-cache prompt-version bump still covers config-driven staleness.
+    try:
+        from backend.app.gateway.service import get_gateway
+
+        await get_gateway().cache.invalidate_resource(
+            tenant_id, document_id, reason="ingestion.embed:reindex"
+        )
+    except RuntimeError:  # pragma: no cover - gateway not initialized
+        logger.warning("gateway_cache_invalidate_skipped", tenant_id=tenant_id)
     logger.info("job_embed_done", document_id=document_id, stored=len(ids))
 
 
@@ -592,6 +617,8 @@ def build_handlers() -> dict[str, Callable]:
         JOB_CANARY_EVALUATE: handle_canary_evaluate,
         JOB_EVAL_EXTRACT: handle_eval_extract,
         JOB_RETENTION_RUN: handle_retention_run,
+        JOB_THREAD_ARCHIVE: handle_thread_archive,
+        JOB_THREAD_RESTORE: handle_thread_restore,
         JOB_GDPR_ERASE: handle_gdpr_erase,
         JOB_GDPR_EXPORT: handle_gdpr_export,
     }

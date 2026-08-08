@@ -78,3 +78,39 @@ class TestOrchestrationService:
         assert service._estimate_confidence(response_uncertain) < 0.5
         assert service._estimate_confidence(response_confident) > 0.7
         assert service._estimate_confidence(response_short) < 0.7
+
+    def test_system_prompt_resolver_override(self, sample_tenant_config, sample_policy_set):
+        """P9-4: a wired prompt_resolver replaces the system prompt; a
+        None result keeps the default; a failing resolver never breaks
+        the turn (falls back to default)."""
+        from backend.app.application.orchestration import create_orchestration_service
+
+        service = create_orchestration_service(
+            tenant_config=sample_tenant_config,
+            policy_set=sample_policy_set,
+            gateway=FakeGateway(),
+        )
+
+        managed = "managed prompt v3: you are the support bot."
+
+        def resolver_with_version(name):
+            if name == "system":
+                return managed
+            return None
+
+        resolver_with_version.resolved_version = "system:v3"
+        service.prompt_resolver = resolver_with_version
+        assert service._build_system_prompt({}) == managed
+        assert service.prompt_version == "system:v3"
+
+        service.prompt_resolver = lambda name: None
+        default = service._build_system_prompt({})
+        assert service.prompt_version is None
+        assert default != managed and "allowed_topics" not in default.lower()
+
+        def exploding(name):
+            raise RuntimeError("resolver exploded")
+
+        service.prompt_resolver = exploding
+        assert service._build_system_prompt({}) == default
+        assert service.prompt_version is None

@@ -26,6 +26,7 @@ from backend.app.infrastructure.db import (
 )
 from backend.app.infrastructure.db.repositories import OPERATOR_TOKEN_PREFIX
 from backend.app.infrastructure.patterns import RateLimitConfig, RateLimiter, RateLimitExceeded
+from backend.app.infrastructure.patterns.last_active import get_last_active_batcher
 from backend.app.settings.env import settings
 
 logger = structlog.get_logger(__name__)
@@ -50,6 +51,10 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "policies:read", "policies:write",
         "models:read", "models:write",
         "evals:read", "billing:read",
+        # P9-1 tool registry (MCP servers as tool sources)
+        "tools:read", "tools:write",
+        # P9-4 prompt management portal (versioned prompts + A/B)
+        "prompts:read", "prompts:write",
     },
     ROLE_TENANT_ADMIN: {
         "tenants:read", "conversations:read", "conversations:write",
@@ -63,6 +68,10 @@ ROLE_PERMISSIONS: dict[str, set[str]] = {
         "policies:read", "policies:write",
         "models:read", "models:write",
         "evals:read", "billing:read",
+        # P9-1 tool registry (scoped to the bound tenant)
+        "tools:read", "tools:write",
+        # P9-4 prompt management portal (scoped to the bound tenant)
+        "prompts:read", "prompts:write",
     },
     ROLE_OPERATOR: {"conversations:read", "escalations:read", "escalations:write"},
     ROLE_AUDITOR: {"tenants:read", "audit:read"},
@@ -273,7 +282,10 @@ async def get_principal(request: Request) -> ApiKeyPrincipal:
                 detail="API key expired",
             )
 
-    schedule_task(lambda: keys.touch_usage(record["id"]))
+    # P8-1 write discipline: last-active telemetry is buffered on the hot
+    # tier (Redis) and flushed to Postgres on a cadence -- never a
+    # per-request write to the primary.
+    schedule_task(lambda: get_last_active_batcher().touch(record["id"]))
 
     return ApiKeyPrincipal(
         key_id=record["id"],

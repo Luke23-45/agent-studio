@@ -55,11 +55,51 @@ def mark_export(export: dict[str, Any]) -> dict[str, Any]:
 
 
 class ComplianceService:
-    """Posture helpers: incident hook + re-verification cadence (D-6)."""
+    """Posture helpers: incident hook + re-verification cadence (D-6).
+
+    D-13 — Annex III posture:
+      - ``documented_adversarial_testing`` is met by the P6-6 CI suite
+        (garak/pyrit adversarial evals run per release).
+      - ``deployer_documentation`` is met by the deployer/runbook docs
+        under ``docs/`` (operations runbook + deployment shapes).
+      - ``per_tenant_risk_assessment`` is met when a risk-assessment
+        artifact has been recorded for the tenant (this service) — the
+        route persists each record on the immutable audit trail.
+      - Legal re-verification (Art. 61 standing) stays a human action:
+        ``reverification_required_by`` is a standing operational reminder,
+        never auto-cleared.
+    """
+
+    DEPLOYER_DOCS_REFERENCE = "docs/deployers/operations-runbook.md"
 
     def __init__(self, *, incident_hook=None, verified_on: date | None = None):
         self._incident_hook = incident_hook
         self._verified_on = verified_on or date(2026, 1, 1)
+        self._risk_assessments: dict[str, list[dict[str, Any]]] = {}
+
+    def record_risk_assessment(
+        self,
+        *,
+        tenant_id: str,
+        artifact_url: str,
+        assessed_by: str,
+        scope: str = "high-risk-usage-patterns",
+    ) -> dict[str, Any]:
+        """Record a per-tenant risk-assessment artifact (Annex III).
+
+        The record is kept in-memory for the posture surface AND returned
+        for the route to persist on the immutable audit trail (the durable
+        source of truth).
+        """
+        record = {
+            "tenant_id": tenant_id,
+            "artifact_url": artifact_url,
+            "assessed_by": assessed_by,
+            "scope": scope,
+            "assessed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._risk_assessments.setdefault(tenant_id, []).append(record)
+        return record
 
     def report_incident(self, *, tenant_id: str, severity: str, description: str) -> dict[str, Any]:
         """Record an Art. 73 incident; stateless hook (worker persistence
@@ -74,19 +114,38 @@ class ComplianceService:
             self._incident_hook(record)
         return record
 
-    def checklist(self, *, as_of: date | None = None) -> dict[str, Any]:
-        """Compliance checklist as of the last re-verification date (D-6)."""
+    def checklist(
+        self,
+        *,
+        as_of: date | None = None,
+        tenant_id: str | None = None,
+        risk_assessment_records: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Compliance checklist as of the last re-verification date (D-6).
+
+        ``risk_assessment_records`` are the durable audit records for the
+        tenant (from the route); ``tenant_id`` is used when the caller
+        wants the in-memory registry consulted instead.
+        """
         as_of = as_of or self._verified_on
+        in_memory = self._risk_assessments.get(tenant_id or "") if tenant_id else []
+        assessed = bool(in_memory) or bool(risk_assessment_records)
         check = {
             "disclosure_art50": True,
             "logging_art12": True,
             "human_oversight_art26": True,
             "post_market_monitoring_art72": "scheduled",  # P6-4
             "incident_reporting_art73": True,
-            "deployer_documentation": False,
-            "per_tenant_risk_assessment": False,
-            "documented_adversarial_testing": False,
+            "deployer_documentation": True,
+            "deployer_documentation_reference": self.DEPLOYER_DOCS_REFERENCE,
+            "per_tenant_risk_assessment": assessed,
+            "documented_adversarial_testing": True,
+            "documented_adversarial_testing_reference": "P6-6 garak/pyrit CI adversarial suite",
             "reverification_required_by": "2027-12-01",
+            "reverification_note": (
+                "Art. 61 re-verification is a standing human action; "
+                "the date is an operational reminder, not an auto-clear"
+            ),
         }
         return {
             "verified_on": as_of.isoformat(),

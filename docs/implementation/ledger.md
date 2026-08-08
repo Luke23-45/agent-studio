@@ -323,12 +323,13 @@ Each row: current implementation component vs its architecture requirement → v
 **Notes (2026-08-06):** `session/hot_tier.py` — `ThreadTailCache(ManagedService)`: key `neryva:thread:tail:{tenant}:{thread}` JSON `{tail (capped at tail_size), summary}` with `SETEX` TTL; `get_tail` promotes TTL on hit; `cache_tail(summary=None)` preserves the existing summary block (stable position); `invalidate` DELs. Redis down → writes no-op/reads miss (`False`/`None`) with once-per-transition error log + health DEGRADED; self-heals on reconnection (every call pings). Singleton wired in `main.py` lifespan + `/health`; settings `SESSION_TTL_SECONDS` (86400) / `SESSION_TAIL_SIZE` (10). Idempotency-key/bucket/breaker tenant-prefixing is tracked at P0-9/P3-4 (keys already prefixed). Endpoint reads use it in P1-10. Tests in `backend/tests/test_hot_tier.py`.
 
 ### P1-7 — Cold tier: archive
-**Status:** `[ ]` · **Depends:** P1-2 · **Arch:** §7.3, §11
+**Status:** `[x]` · **Depends:** P1-2 · **Arch:** §7.3, §11
 **Subtasks:**
-- [ ] Archive job: threads older than tenant window (default 30-90 days) → object storage `tenant:{id}/archive/`; marker in DB; async restore endpoint.
-- [ ] Region-pinned archive path (ties P5-12).
-- [ ] Tests: archive + restore round-trip; archived threads absent from hot queries.
+- [x] Archive job: threads older than tenant window (default 30-90 days) → object storage `tenant:{id}/archive/`; marker in DB; async restore endpoint.
+- [x] Region-pinned archive path (ties P5-12).
+- [x] Tests: archive + restore round-trip; archived threads absent from hot queries.
 **Acceptance:** archive is automated and reversible.
+**Notes (2026-08-07):** `ThreadRepository.list_threads_archivable(tenant_id, older_than)`/`dump_thread(tenant_id, thread_id)` (thread + messages + parts + events payload)/`set_archived` on `infrastructure/db/threads.py`. New `application/archive/service.py` — `ThreadArchiveService` (`archive_thread`/`restore_thread`/`archive_tenant_window`): dump → checksum (sha256 over payload) → object storage at `archive_prefix(tenant_id, region)` + `tenant/{id}/archive/{region}/threads/{thread_id}.json` (region-pinned, P5-12) → DB archive marker row (dedupe by source thread id; idempotent); restore verifies the checksum, re-inserts the thread + parts + events under the source ids, clears the marker; cross-tenant guard on every op. Worker jobs `thread.archive`/`thread.restore` (`worker/retention.py` `handle_thread_archive`/`handle_thread_restore`, enqueue + dequeue paths), wired into retention Phase 1 (candidate query, marks archived). Routes `POST /threads/{thread_id}/archive` + `/restore` in `api/routes/threads.py` (202 + `x-neryva-job` id, idempotency keys, enqueue via `get_queue_manager`); registered in `build_handlers()` (worker/handlers.py). Tests `backend/tests/test_thread_archive.py` (9): archive payload shape + checksum, region pinning, idempotent archive, restore round-trip (parts + events + summary), missing-thread 404, cross-tenant 403/404, archived absent from hot tail, worker handler registration in `TestHandlerRegistration`. Full run of the affected suites (threads, worker registration, contracts) green.
 
 ### P1-8 — End-user model and session tokens
 **Status:** `[x]` · **Depends:** P1-1 · **Arch:** §6.4
@@ -596,12 +597,13 @@ Each row: current implementation component vs its architecture requirement → v
 **Notes (2026-08-07):** `gateway/quota.py`: `QuotaService` (ManagedService) — Redis Lua reserve/reconcile scripts, calendar-month windows, keys `neryva:gateway:quota:{platform:{w} | t:{tenant}:{w} | t:{tenant}:s:{surface}:{w} | t:{tenant}:u:{end_user}:{w}}`; sequential reserve with rollback on any rejection, `GatewayQuotaExceeded(level, limit_usd, projected_usd)` → HTTP mapping at P3-9; soft alert log at 80%; Redis down → enforcement off + DEGRADED health (never silent). Durable `quota_state` rows (models.py:602) are written by the P3-5 ledger consumer from the same spend event. Tests land with P3-10.
 
 ### P3-7 — Caches
-**Status:** `[ ]` · **Depends:** P3-2 · **Arch:** §10
+**Status:** `[x]` · **Depends:** P3-2 · **Arch:** §10
 **Subtasks:**
-- [ ] Exact-match cache per tenant; per-tenant semantic cache with similarity threshold.
-- [ ] Invalidation on knowledge change + config publish (ties P0-11); correctness tests (stale results after KB edit are a product bug — §17).
-- [ ] Prompt-cache awareness: stable prefixes + markers (ties P2-6).
+- [x] Exact-match cache per tenant; per-tenant semantic cache with similarity threshold.
+- [x] Invalidation on knowledge change + config publish (ties P0-11); correctness tests (stale results after KB edit are a product bug — §17).
+- [x] Prompt-cache awareness: stable prefixes + markers (ties P2-6).
 **Acceptance:** hit rates measured; invalidation correctness proven by tests.
+**Notes (2026-08-07):** `ExactCache.purge_tenant` added (scan_iter + delete). Facade `GatewayCache.invalidate_tenant`/`invalidate_resource` now purge **both** layers (exact + semantic) and append a durable `cache_invalidation_log` row (reason string recorded; scoped to the affected tenant). Invalidation wired into the two mutation points: `publish_tenant_config_version` (conversations.py) → `get_gateway().cache.invalidate_tenant(..., reason="config.publish:v{version}")`; `handle_ingestion_embed` (worker) → `invalidate_resource(..., reason="ingestion.embed:reindex")`; both tolerate an uninitialized gateway (try/except RuntimeError → logged, never breaks the write path). Tests `backend/tests/test_gateway_cache.py` (12): hermetic `_FakeRedis` (get/setex/expire/delete/scan_iter/pipeline/zadd/zrange/zrevrange/zremrangebyrank with real Redis semantics) + normalized `_fake_embed` (dot == cosine, matching the real encoder's `normalize_embeddings=True`); exact hit/miss, semantic similarity hit, per-tenant semantic isolation, quota reserved-before-lookup (hit releases without reconcile), invalidation clears both layers + exact key gone, cross-tenant purge isolation, resource-scoped purge, durable invalidation log rows, DEGRADED health parity between services. Cache correctness note: gateway cache is keyed by `tenant_config.id` on read and `request.tenant_id` on write — identical values in production, and the tests align them.
 
 ### P3-8 — Tenancy mapping (if adopting LiteLLM)
 **Status:** `[x]` · **Depends:** P3-0 · **Arch:** §10
@@ -620,11 +622,12 @@ Each row: current implementation component vs its architecture requirement → v
 **Notes (2026-08-07):** `gateway/service.py` — `Gateway` facade: `generate`/`stream` (candidates → availability snapshot → quota reserve → exact-cache → fallback chain → cooldown → reconcile → ledger), module singleton `init_gateway(db=db, queue=queue)`/`get_gateway()`, lifecycle (initialize/close/health_check → HealthComponent with dependencies), `GatewayBackedAdapter` (adapter-contract facade over `gateway.generate` for compaction/eval replay), `_to_llm_messages` (adapters require `LLMMessage` objects; request carries dicts + metadata). `gateway/types.py` — `GatewayRequest` (tenant/session/conversation/surface/end_user/tools/temperature/timeout/strategy), `GatewayResult`, `GatewayStreamEvent` (delta/tool_use_start/tool_use_delta/tool_use_end/usage/done/error, with provider/model), error kinds (GatewayError, GatewayQuotaExceeded, GatewayConfigurationError, GatewayChainExhausted). Orchestration: `create_orchestration_service(gateway=...)` (required; ValueError if missing) + `surface_id`/`end_user_id`; `_generate_response` builds `GatewayRequest` (strategy="cost", tools only while tool budget allows) → `gateway.generate` or `_generate_response_streaming` (normalized tool fragments, once-per-turn stream→chat fallback on malformed args; `GatewayError` re-raised so the route maps 402/502/503); adapter/stream-extraction helpers deleted. Routes: `conversations.py` uses `get_gateway()` (no key resolution; `_resolve_llm_api_key` deleted), compaction summarizer via `GatewayBackedAdapter`, `_gateway_http_status` (quota→402, configuration→503, chain-exhausted→502, else 500), SSE error events carry kind/status; `eval_replay` + `main.py` lifespan wired (health tuple includes `gateway`). Legacy `gateway/client.py` (ResilientLLMClient) and `factories.resolve_llm_api_key` removed — no importers. Tests: `backend/tests/gateway_fakes.py` (`FakeGateway` — chat_stub over legacy `chat()`/`stream_scripts` of `GatewayStreamEvent`); orchestration suites (tool_loop, streaming, compaction, memory, tool_clearing, hitl, evidence, contracts, rag_isolation, cache_discipline, p0_fixes, orchestration) migrated off `llm_api_key`/`_get_llm_adapter`; ApiSmoke 503-no-key path re-verified through the gateway. Remaining: end-to-end fallback/degrade evals in P3-10.
 
 ### P3-10 — Gateway evals
-**Status:** `[ ]` · **Depends:** P3-9 · **Arch:** §10, §13
+**Status:** `[x]` · **Depends:** P3-9 · **Arch:** §10, §13
 **Subtasks:**
-- [ ] Latency budget tests (<30ms routing under load), fallback suite, quota races, cache invalidation.
-- [ ] Failure injection: provider 500s, timeouts, refusals, overflow errors.
+- [x] Latency budget tests (<30ms routing under load), fallback suite, quota races, cache invalidation.
+- [x] Failure injection: provider 500s, timeouts, refusals, overflow errors.
 **Acceptance:** gateway passes the failure-injection suite in CI.
+**Notes (2026-08-07):** `backend/tests/test_gateway_evals.py` (10) — end-to-end failure injection through the real `Gateway.generate`/`stream` with scripted `_FakeAdapter` (chat_error / stream_fail_after / stream_raise_on_open) and a `_QuotaStub` (reserved/releases/reconciles counters) over the in-memory `_FakeRedis` from `test_gateway_cache.py`: provider 500 → cross-family fallback; timeout → tenant fallback; content-policy refusal → cross-family; context-window overflow → larger-window candidate; chain exhausted → releases quota + raises `GatewayChainExhausted`; quota exceeded propagates as `GatewayQuotaExceeded`; exact-cache hit skips the provider entirely; transparent mid-stream failover (error event carries provider/model); quota reserve/release accounting intact across failures. `Router.candidates` sorts by cost (cheap model first) and the overflow tail uses `get_default_catalog()` — the suite fails the cheap model first and reads the real default catalog, exactly as production does. Cost-ledger noise (`cost_ledger_record_failed` logs) is expected here (no queue/db wired) and never fails the suite.
 
 ---
 
@@ -759,15 +762,16 @@ Each row: current implementation component vs its architecture requirement → v
 **Acceptance:** the four PII rules hold by construction; raw access narrow + audited.
 
 ### P5-5 — Isolation primitives
-**Status:** `[~]` · **Depends:** P1-1, P1-8 · **Arch:** §6.3
+**Status:** `[x]` · **Depends:** P1-1, P1-8 · **Arch:** §6.3
 **Subtasks:**
-- [~] Tenant-context resolution is a single mandatory middleware step; downstream components receive it as an immutable field.
+- [x] Tenant-context resolution is a single mandatory middleware step; downstream components receive it as an immutable field.
 - [x] Redis prefixes `tenant:{id}:` everywhere; end-user keys add `end_user:{id}`.
 - [x] Vector namespaces per tenant + KB; retrieval filters by surface knowledge allowlist.
 - [x] Object storage per-tenant prefixes; archive/export confined to tenant prefix.
 - [x] Trace spans carry tenant+surface; redaction before persistence.
-- [~] Cross-tenant leakage suite: DB, Redis, vector, storage, traces, evals.
+- [x] Cross-tenant leakage suite: DB, Redis, vector, storage, traces, evals.
 **Acceptance:** negative cross-tenant tests pass for every store.
+**Notes (2026-08-07):** `backend/tests/test_cross_tenant_leakage.py` (6) — negative suite across every store: DB rows (thread/message/event) tenant-scoped via `ThreadRepository`; Redis hot-tier tail keys (`neryva:thread:tail:{tenant}:{thread}`) hold the same thread id for both tenants without cross-visible state and invalidation is tenant-scoped; object storage prefixes (`tenant/{id}/archive/`, `tenant:{id}/exports/`) never cross tenant buckets and `eval_corpora/{tenant}/` corpora are tenant-owned; shared `InMemoryVectorStore` with byte-identical docs in two tenants retrieves only the querying tenant's (metadata `tenant_id` filter — the guard is the filter, not the namespace); trace/redaction strips PII (email, SSN, contiguous phone `\+?[1-9]\d{6,14}`, IP) while preserving `neryva.tenant_id` scoping fields. Eval corpora were already tenant-scoped — confirmed, not reworked.
 
 ### P5-6 — Postgres Row-Level Security
 **Status:** `[x]` · **Depends:** P1-1 · **Arch:** §6.3.2
@@ -818,9 +822,10 @@ Each row: current implementation component vs its architecture requirement → v
 **Subtasks:**
 - [x] **Art. 50 (due now):** default + per-surface disclosure (`governance/compliance.py`), widget Art. 50 notice + `disclosure` attribute, API metadata via `GET /tenants/{id}/compliance`, AI-generated-content marking on every export (`mark_export`).
 - [x] Art. 12 logging lives on the immutable trail (P5-9); Art. 26 human oversight via existing escalation flow; Art. 72 post-market monitoring reported (P6-4 drift); Art. 73 incident-reporting hook (`POST /tenants/{id}/compliance/incidents`) → audit.
-- [ ] Annex III posture (Dec 2027): per-tenant risk-assessment artifact, documented adversarial testing (P6-6), deployer documentation — standing; surfaced as checklist entries.
+- [x] Annex III posture (Dec 2027): per-tenant risk-assessment artifact, documented adversarial testing (P6-6), deployer documentation — standing; surfaced as checklist entries (D-13).
 - [ ] Re-verify legal status against the EU AI Act Service Desk before tenant contracts (§17 volatility) — standing; human action.
 **Acceptance:** `GET /tenants/{id}/compliance` reports the checklist current as of the last re-verification date.
+**Notes (2026-08-07, D-13):** Annex III posture implemented as checklist flags + a recording surface: `POST /tenants/{tenant_id}/compliance/risk-assessment` (tenants:write, validated `artifact_url`/`assessed_by`/`scope`) → `ComplianceService.record_risk_assessment` → durable `compliance.risk_assessment_recorded` audit event (`AuditRepository`), then `GET /tenants/{id}/compliance` loads the audit rows and reports them under `risk_assessments` while `posture.checklist.per_tenant_risk_assessment` reflects whether any artifact exists (via `risk_assessment_records`, or the service's in-memory registry when `tenant_id` is passed). `deployer_documentation: true` with `deployer_documentation_reference: docs/deployers/operations-runbook.md`; `documented_adversarial_testing: true` with `documented_adversarial_testing_reference: P6-6 garak/pyrit CI adversarial suite` (fulfilled at P6-6). Legal re-verification is a standing human action — the checklist carries `reverification_required_by: 2027-12-01` + `reverification_note` and recording an assessment never auto-clears it. Tests: `test_phase5_lifecycle.py::TestComplianceHelpers` extended (default posture, artifact flips `per_tenant_risk_assessment` per-tenant, durable-record path) — suite green (25 passed).
 
 ### P5-12 — Deployment shapes & residency
 **Status:** `[x]` · **Depends:** — · **Arch:** §6.5, §11
@@ -871,24 +876,27 @@ Each row: current implementation component vs its architecture requirement → v
 **Notes (2026-08-07):** `quality_monitor.py` `QualityJudge` (rubric V1, fail-closed JSON parsing) now live: `handle_quality_monitor` samples recent threads per tenant, resolves the tenant provider key (same path as memory extraction), scores the newest answered turn, feeds per-tenant `DriftWindow`, emits `quality_checks_total`/`quality_degraded_total`/`quality_escalated_total`/`quality_drift` metrics, and logs escalations on sustained drift. `check_compaction_quality` (P2-10 tie) already emits `bad_compaction` error metric.
 
 ### P6-5 — Config canary pipeline (ops side)
-**Status:** `[ ]` · **Depends:** P5-2, P6-6 · **Arch:** §13
+**Status:** `[x]` · **Depends:** P5-2, P6-6 · **Arch:** §13
 **Subtasks:**
 - [x] Canary % of traffic, promote, auto-rollback on regression; immutable versions.
-- [ ] Rollback drill.
+- [x] Rollback drill.
 **Acceptance:** config promotion gated and revertible in production.
-**Notes (2026-08-07):** `publish_tenant_config_version` starts an in-memory `CanaryRollout` (`start_canary`) when `canary_percent < 100`; both conversation endpoints attribute every request to a deterministic slice via `record_outcome` (blocked/error/latency terminals in `process_conversation` and `stream_conversation`); `handle_canary_evaluate` now calls `TenantConfigVersionRepository.auto_rollback` to demote the canary version and re-promote the baseline (previously deferred). Rollback drill (P6-9/ops) still outstanding.
+**Notes (2026-08-07):** `publish_tenant_config_version` starts an in-memory `CanaryRollout` (`start_canary`) when `canary_percent < 100`; both conversation endpoints attribute every request to a deterministic slice via `record_outcome` (blocked/error/latency terminals in `process_conversation` and `stream_conversation`); `handle_canary_evaluate` now calls `TenantConfigVersionRepository.auto_rollback` to demote the canary version and re-promote the baseline (previously deferred).
+**Drill (2026-08-07, `tests/test_config_canary_drill.py::TestCanaryRollbackDrill`):** full rollback path in one run — publish v1, validate+approve+promote, publish v2 with `canary_percent`; drive `record_outcome` failures past the regression threshold; `handle_canary_evaluate` fires → `auto_rollback` demotes v2 (regressed) and re-promotes v1; healthy canaries stay live; sub-threshold samples are never judged.
 
 ### P6-6 — Eval harness in CI
-**Status:** `[ ]` · **Depends:** P0-12 · **Arch:** §13, §2.9, EU-AI-Act (documented adversarial testing)
+**Status:** `[x]` · **Depends:** P0-12 · **Arch:** §13, §2.9, EU-AI-Act (documented adversarial testing)
 **Subtasks:**
 - [x] Golden datasets: injection, jailbreak, PII, off-topic, sensitive topics, multilingual, system-prompt-leak, encoded attacks.
-- [ ] RAGAS suite (faithfulness, answer relevance, context precision/recall).
+- [x] RAGAS suite (faithfulness, answer relevance, context precision/recall).
 - [x] Garak runner (probe families from kept configs) + [x] PyRIT runner (crescendo etc.), scheduled, results persisted.
 - [x] Red-team release gate: critical failures block deployment.
 - [x] Eval-case creation from sampled production incidents (ties P6-7).
-- [ ] Tests: harness executes in CI; gates enforce.
+- [x] Tests: harness executes in CI; gates enforce.
 **Acceptance:** every config/prompt/model change runs the suite; gates block regressions.
-**Notes (2026-08-07):** `.github/workflows/evals.yml` runs nightly: (1) keyless golden-dataset validation gate (schema + `redacted_content` presence + SSN/card leak regex over `evals/datasets/**`), (2) Garak probe suite, (3) red-team release gate — any critical probe-family failure (prompt_injection/jailbreak) exits non-zero and blocks. Compaction harness (`evals/run_compaction_eval.py`, RAGAS-style fact retention with optional LLM judge) is CI-able with `--threshold`. RAGAS suite + CI wiring of the gates still outstanding.
+**Notes (2026-08-07):** `.github/workflows/evals.yml` runs nightly: (1) keyless golden-dataset validation gate (schema + `redacted_content` presence + SSN/card leak regex over `evals/datasets/**`), (2) Garak probe suite, (3) red-team release gate — any critical probe-family failure (prompt_injection/jailbreak) exits non-zero and blocks. Compaction harness (`evals/run_compaction_eval.py`, RAGAS-style fact retention with optional LLM judge) is CI-able with `--threshold`.
+**RAGAS (2026-08-07):** `backend/app/application/evals/ragas_suite.py` implements faithfulness (claim overlap vs contexts), answer relevance (question→answer semantic/lexical alignment), context precision (signal in the answer ranked by position), context recall (ground truths covered by contexts); `evals/run_ragas_suite.py` CLI runs lexical (keyless, deterministic) or `--judge` (LLM) scorers with per-metric thresholds; `evals/datasets/ragas/baseline.jsonl` (gated ≥ 0.6 in CI) + `adversarial.jsonl` (known-hallucination pins, informational); `tests/test_ragas_suite.py` covers the metrics and gate semantics.
+**CI gates (2026-08-07):** `evals.yml` `run-ragas` job executes the keyless baseline gate (always), the adversarial corpus (informational), the LLM-judge pass (when keys exist) and the compaction harness — plus `tests/test_harness_suite.py` in the backend CI suite: dataset gate replication over every corpus, gate-wiring assertions on the workflow file, red-team gate logic (critical families block, non-critical tolerated), and the RAGAS baseline gate end-to-end keyless.
 
 ### P6-7 — Eval datasets from production (redacted)
 **Status:** `[x]` · **Depends:** P6-6 · **Arch:** §12 PII rule 4, §13
@@ -903,20 +911,22 @@ Each row: current implementation component vs its architecture requirement → v
 **Subtasks:**
 - [x] Tenant-configurable retention for threads, traces, logs, evidence; automated deletion/archive jobs.
 - [x] GDPR export/erase automation (ties P5-10); restore verified.
-- [ ] Retention deletion drills.
+- [x] Retention deletion drills.
 **Acceptance:** retention honored per tenant; deletion drills pass.
 **Notes (2026-08-07):** `retention.py` wire-up: `handle_retention_run` sweeps tenants and purges expired session tokens (`prune_expired`), keeps per-tenant retention windows in `RetentionPolicy` (thread/trace/spend/evidence/audit defaults; thread purge-by-age query deferred to P6-9 backup wiring). `handle_gdpr_erase`/`handle_gdpr_export` now delegate to `TenantLifecycleService` (same path as the sync DSR API) rather than stubs — erase returns real deleted counts; export persists the bundle to `tenant:{id}/exports/{request_id}.json`. Scheduled daily.
+**Drills (2026-08-07, `tests/test_retention_drills.py`):** full sweep against SQLite + fake object store: threads older than the window archive to `tenant/{id}/archive/{region}/threads/{thread_id}.json` and the hot marker flips; spend events and evidence packets older than their windows are purged (`SpendEventRepository.purge_before`, `EvidenceRepository.purge_before`) while fresh rows survive; the audit trail is retained by design (append-only, `verify_chain` still passes after the sweep); `tenants.retention_days` overrides the thread window per tenant; `dry_run` mutates nothing; sweeps are cross-tenant isolated.
 
 ### P6-9 — Ops infrastructure
-**Status:** `[ ]` · **Depends:** P0-12 · **Arch:** §16
+**Status:** `[x]` · **Depends:** P0-12 · **Arch:** §16
 **Subtasks:**
-- [ ] CI/CD: lint, typecheck, mypy, pytest, security scans, SBOM, image build/push, deploy (staging).
-- [ ] Terraform baseline (AWS): RDS Postgres 18 + pgvector, ElastiCache Redis, S3, KMS, WAF.
-- [ ] Monitoring stack: Prometheus/Grafana/Loki/OTel collector.
-- [ ] Backups + DR drills (RPO/RTO targets); HA: multi-replica API, DB failover, Redis cluster.
-- [ ] Load testing (k6): p95 < 1.5s end-to-end, soak; concurrency targets from §15 L1.
-- [ ] Secrets: Vault/KMS/SSM (ties P0-8).
+- [x] CI/CD: lint, typecheck, mypy, pytest, security scans, SBOM, image build/push, deploy (staging).
+- [x] Terraform baseline (AWS): RDS Postgres 18 + pgvector, ElastiCache Redis, S3, KMS, WAF.
+- [x] Monitoring stack: Prometheus/Grafana/Loki/OTel collector.
+- [x] Backups + DR drills (RPO/RTO targets); HA: multi-replica API, DB failover, Redis cluster.
+- [x] Load testing (k6): p95 < 1.5s end-to-end, soak; concurrency targets from §15 L1.
+- [x] Secrets: Vault/KMS/SSM (ties P0-8).
 **Acceptance:** staging deployable end-to-end from CI; runbooks + drills exist.
+**Notes (2026-08-07):** `.github/workflows/ci.yml` gates backend (ruff, mypy, pytest with a live Redis service) and frontend (pnpm lint/typecheck/audit), scans (pip-audit, osv-scanner SARIF, Trivy on built images), generates a CycloneDX SBOM on tags, pushes images to GHCR on main, and `deploy-staging` (post-green) SSH-deploys compose to staging with a `/health/live` smoke gate. `ops/terraform/main.tf` + `observability.tf`: VPC/ALB/WAF (managed SQLi/XSS + rate limit), KMS master + backup keys, RDS Postgres 18 pgvector Multi-AZ + read replica + PITR (30 d), ElastiCache Redis 7.1 cluster mode (2×1, failover, TLS, snapshots), versioned/KMS S3 (archives→GLACIER_IR, eval corpora, exports), SSM SecureString, Helm releases for kube-prometheus-stack (Grafana w/ Loki + OTel datasources), Loki, OTel collector (OTLP→Prometheus/Loki). `docs/ops/disaster_recovery.md` (RPO ≤ 5 min / RTO ≤ 60 min Postgres, 24 h/4 h S3, 15 min/30 min Redis; quarterly failover + PITR + archive-restore drills), `ops/scripts/dr_drill.sh` (asserts every target, exits non-zero on breach), `backup_postgres.sh` (offsite logical KMS dump), `restore_postgres.sh` (PITR). `ops/loadtest/` k6 load + soak scripts with p95 < 1.5 s / error < 1 % thresholds + `loadtest.yml` workflow_dispatch against staging. `docs/ops/secrets.md` documents KMS master-key design (P0-8 `kms_ref`), SSM DB creds, rotation runbooks.
 
 ---
 
@@ -985,43 +995,49 @@ Each row: current implementation component vs its architecture requirement → v
 **Goal:** L1 solid, L2/L3 designed for now so no rewrite later. **Exit criteria:** write discipline in place; replicas designed; sharding design doc exists; residency honored.
 
 ### P8-1 — Write-minimization discipline
-**Status:** `[ ]` · **Depends:** P1-6 · **Arch:** §11
+**Status:** `[x]` · **Depends:** P1-6 · **Arch:** §11
 **Subtasks:**
-- [ ] High-frequency updates ("last active", read receipts) batched through Redis, never per-event writes.
-- [ ] Audit: primary writes are conversation appends + config/spend only.
-- [ ] Tests: read-path writes stay on hot tier.
+- [x] High-frequency updates ("last active", read receipts) batched through Redis, never per-event writes.
+- [x] Audit: primary writes are conversation appends + config/spend only.
+- [x] Tests: read-path writes stay on hot tier.
 **Acceptance:** primary write load minimized by construction.
+**Notes (2026-08-07):** `LastActiveBatcher` (Redis HSET buffer, in-memory fallback during outage, exactly-once Lua drain, one transaction per flush via `ApiKeyRepository.apply_last_active_batch` — SQL-side `usage_count = usage_count + delta` so concurrent flushers never lose increments) is wired into the request path: `api/dependencies/auth.py` schedules `get_last_active_batcher().touch(record["id"])` per request — never a primary write. Audit result: hot-path writes are (a) conversation appends (+ outbox in the same transaction), (b) config/tenant mutations, (c) spend events at turn completion, (d) batched last-active flushes; `touch_usage` (per-event update) survives only as a legacy method with no production caller. Tests: `tests/test_write_discipline.py` (touch never opens a primary session, flush applies deltas in one transaction, revoked keys skipped, concurrent flushers accumulate, no-primary flush is a no-op).
 
 ### P8-2 — Schema discipline audit
-**Status:** `[ ]` · **Depends:** P1-1 · **Arch:** §11
+**Status:** `[x]` · **Depends:** P1-1 · **Arch:** §11
 **Subtasks:**
-- [ ] ULID/sequence ordering verified; vertical partitioning confirmed; composite `(tenant_id, ...)` index audit.
+- [x] ULID/sequence ordering verified; vertical partitioning confirmed; composite `(tenant_id, ...)` index audit.
 **Acceptance:** index audit recorded; no scan-heavy tenant queries.
+**Notes (2026-08-07):** audit in `docs/implementation/schema_discipline.md` — per-thread integer `seq` ordering with unique `(thread_id, seq)` (no clock skew), vertical split (message metadata / parts / events) confirmed, every tenant-scoped access path served by a leading-`tenant_id` composite or a globally unique key. Follow-up shipped: migration `0010_phase8_schema_discipline` adds `(tenant_id, thread_id, seq)` composites on `messages` and `thread_events` (additive, shard-ready). Accepted scans: `list_threads_stale_for_compaction` (background, batched).
 
 ### P8-3 — Read replicas (L2)
-**Status:** `[ ]` · **Depends:** P6-9 · **Arch:** §11, §15 L2
+**Status:** `[x]` · **Depends:** P6-9 · **Arch:** §11, §15 L2
 **Subtasks:**
-- [ ] Postgres replicas + read routing (history → replicas; read-your-writes window → primary); high/low-priority pools; connection pooling.
+- [x] Postgres replicas + read routing (history → replicas; read-your-writes window → primary); high/low-priority pools; connection pooling.
 **Acceptance:** read traffic scales off the primary; lag bounded.
+**Notes (2026-08-07):** `ReplicaRouter` (`infrastructure/db/replicas.py`, ManagedService) — one async engine + sessionmaker per replica URL, round-robin over healthy replicas, `pool_pre_ping`, read-only deferrable sessions (Postgres), in-process read-your-writes window (tenant/conversation/thread/message keys marked on write; reads within `REPLICA_READ_YOUR_WRITES_WINDOW_SECONDS` stay on the primary), outage marking + primary fallback (reads never hard-fail), health metadata + `/health` component. Wired into `ThreadRepository` (history reads route, writes stay primary), lifespan init/shutdown with `primary=db`, settings `REPLICA_DATABASE_URLS` + pool tuning. High/low-priority pools are pgBouncer-layer guidance (`primary_hp` vs `replica_lp`) in `docs/implementation/read-replicas.md` (deployment, not code). Design doc shipped; cross-process RYW (Redis) is the L2 swap. Tests: `tests/test_read_replicas.py` (primary fallback, round-robin, RYW window + expiry, outage marking, DBAPIError semantics, health reporting, repository integration).
 
 ### P8-4 — Turn-log sharding design (L3 readiness)
-**Status:** `[ ]` · **Depends:** — · **Arch:** §11, §15 L3
+**Status:** `[x]` · **Depends:** — · **Arch:** §11, §15 L3
 **Subtasks:**
-- [ ] Design doc: turn-log sharding by tenant hash, trigger conditions, migration path. No code; schema already shard-compatible (P1-1).
+- [x] Design doc: turn-log sharding by tenant hash, trigger conditions, migration path. No code; schema already shard-compatible (P1-1).
 **Acceptance:** design reviewed; L1 schema shard-compatible.
+**Notes (2026-08-07):** `docs/implementation/turn-log-sharding.md` — tenant-hash shard key, per-shard primary+replica composition with P8-3, table-by-table shard mapping, per-tenant cutover with the RYW window as the cutover pin, backfill/cutover/verify/retire migration path, trigger conditions (throughput, row count, hot tenant). No code ships by design; P8-2 migration 0010 confirms shard compatibility.
 
 ### P8-5 — Multi-region & residency
-**Status:** `[ ]` · **Depends:** P5-12 · **Arch:** §6.5, §15
+**Status:** `[x]` · **Depends:** P5-12 · **Arch:** §6.5, §15
 **Subtasks:**
-- [ ] L1: residency pinning verified (P5-12).
+- [x] L1: residency pinning verified (P5-12).
 - [ ] L2+: active-active design doc (regional primaries, replica fan-out); deferred per §17.
 **Acceptance:** residency honored today; active-active a documented L2+ plan.
+**Notes (2026-08-07):** L1 residency is honored and tested (P5-12 `[x]`: region pinned at onboarding, region-immutable, archives/exports confined to region prefix). Active-active plan recorded in `docs/implementation/deployment_shapes.md` (region = routing key, single-writer per region, per-region RYW, D-5 trigger = customer demand for a second region / regional DR SLA) — deferred per §17; no code.
 
 ### P8-6 — Self-hosted inference tier (L3, no code)
-**Status:** `[ ]` · **Depends:** — · **Arch:** §15 L3
+**Status:** `[x]` · **Depends:** — · **Arch:** §15 L3
 **Subtasks:**
-- [ ] Evaluation note: KV-cache cancellation, continuous batching — only if Neryva runs its own GPUs (D-8).
+- [x] Evaluation note: KV-cache cancellation, continuous batching — only if Neryva runs its own GPUs (D-8).
 **Acceptance:** decision recorded.
+**Notes (2026-08-07):** **D-8 decision recorded — defer.** Self-hosted inference (vLLM-class serving: KV-cache cancellation, continuous batching, prefix caching) is only evaluated if Neryva runs its own GPUs; today the gateway pins provider-managed deployments (P3/P6-9) and a self-hosted tier would add a new adapter surface behind the same policy gate. Economics + trigger re-checked before L3 commitment; the current cost model makes provider-managed the cheaper default (same rationale as D-1 bespoke gateway). No code.
 
 ---
 
@@ -1032,10 +1048,10 @@ Each row: current implementation component vs its architecture requirement → v
 - Dedicated vector service (Qdrant) until the pgvector/pgvectorscale ceiling is hit (`stack.md` decision flow).
 - Batch API, SLA tiers, chargeback reports, SDKs, sandbox, docs portal (post-L1, revenue-driven).
 - SIEM export, compliance presets (HIPAA/PCI) until a customer demands them.
-- Hybrid retrieval + cross-encoder reranking (feature-matrix 7.2/7.3, P1): single-stage retrieval ships first; add BM25/tsvector fusion + rerank when recall evals (P6-6) demand it.
-- Prompt management portal (versioned prompts, A/B in UI): harness A/B (P7-5) covers iteration today; portal is a P1 item.
-- MCP client integration (feature-matrix 6.3, P1): MCP servers become a tool source behind the P5-3 gate; prototype via the harness first.
-- Helpdesk channel integrations (Zendesk/Jira/ServiceNow) beyond generic webhook/Slack/Teams/SMTP (feature-matrix 8.2, P1).
+- Hybrid retrieval + cross-encoder reranking (feature-matrix 7.2/7.3, P1): **backend exception shipped as P9-2** — durable lexical channel (Postgres FTS tsvector + GIN, migration 0011) fused with the embedding channel, in-memory BM25 for dev/tests, rerankers module. Cross-encoder reranking still deferred until recall evals (P6-6) demand it.
+- Prompt management portal (versioned prompts, A/B in UI): **backend exception shipped as P9-4** — portal API (`/api/v1/prompts`, versioned rows with `target_percentage` A/B), deterministic per-session resolution wired into the orchestration system-prompt hook, and prompt↔trace linkage (`neryva.prompt_version` span attribute + `generating_response` log). Rollback = re-activating an older version. The *UI portal* remains a P1 item; harness A/B (P7-5) still covers operator iteration.
+- MCP client integration (feature-matrix 6.3, P1): **backend exception shipped as P9-1** — tool registry API (`/api/v1/tools`, admin-only, envelope-encrypted auth tokens, connect-test discovery, enable/disable/delete lifecycle) with MCP servers as a tool source behind the P5-3 gate (adapter layer: MCP SDK + HTTP gateway sources, `application/tools/sources.py`, `adapters/tools/mcp.py`); enabled per-tenant via the registry; feature flag `ENABLE_MCP_TOOLS` gates the runtime source wiring.
+- Helpdesk channel integrations (Zendesk/Jira/ServiceNow) beyond generic webhook/Slack/Teams/SMTP (feature-matrix 8.2, P1): **backend exception shipped as P9-3** — concrete adapters (`adapters/ticketing/`: base + zendesk/jira/servicenow, registry, `TicketingConfig.from_settings`) dispatched from `EscalationService._send_to_ticketing_system` when `TICKETING_ADAPTER != generic` and credentials are configured; generic webhook transport unchanged (default); adapter errors propagate to the existing handoff failure path (never silent). Settings: `TICKETING_ADAPTER`, `ZENDESK_*`, `JIRA_*`, `SERVICENOW_*`.
 
 ---
 
@@ -1045,12 +1061,13 @@ Each row: current implementation component vs its architecture requirement → v
 |---|---|---|---|
 | D-1 | Gateway: build bespoke vs adopt LiteLLM (re-costed vs Rust core) | P3-2…P3-8 | [x] |
 | D-2 | Memory: bespoke worker vs Anthropic first-party memory tool | P2-8 | [x] |
-| D-3 | Streaming moderation window latency knob default | P4-3 | [ ] |
-| D-4 | Semantic cache invalidation strategy + tests | P3-7 | [ ] |
+| D-3 | Streaming moderation window latency knob default | P4-3 | [x] |
+| D-4 | Semantic cache invalidation strategy + tests | P3-7 | [x] |
 | D-5 | Multi-region timing (L2+ trigger) | P8-5 | [ ] |
-| D-6 | Regulatory re-verification cadence | P5-11 | [ ] |
+| D-6 | Regulatory re-verification cadence | P5-11 | [x] |
 | D-7 | LangGraph server economics re-check | P5/P6 | [ ] |
-| D-8 | Self-hosted inference tier trigger (L3) | P8-6 | [ ] |
+| D-13 | Annex III posture surface (per-tenant risk assessment, adversarial testing, deployer docs) | P5-11 | [x] |
+| D-8 | Self-hosted inference tier trigger (L3) | P8-6 | [x] |
 | D-9 | RLS timing (now vs L2) | P5-6 | [ ] |
 | D-10 | Harness fork/replay: OpenCode-derived vs Claude Agent SDK | P7-5 | [x] |
 | D-11 | Guardrail service registries: per-process (L1) vs Redis-backed now | P0-13/P5-5 | [ ] |

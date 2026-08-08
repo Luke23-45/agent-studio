@@ -18,6 +18,8 @@ class EscalationService:
         escalation_repository: Any | None = None,
         notification_channel: str | None = None,
         notification_target: str | None = None,
+        ticketing_config: Any | None = None,
+        ticketing_transport: Any | None = None,
     ):
         self.tenant_config = tenant_config
         self.ticketing_webhook_url = ticketing_webhook_url
@@ -26,6 +28,20 @@ class EscalationService:
         self.notification_channel = notification_channel
         self.notification_target = notification_target
         self._ticketing_client: Any | None = None
+        # P9-3: concrete helpdesk adapters (zendesk/jira/servicenow) with
+        # injectable transport for tests.
+        self._ticketing_config = ticketing_config
+        self._ticketing_transport = ticketing_transport
+
+    def _adapter_config(self) -> Any:
+        if self._ticketing_config is not None:
+            return self._ticketing_config
+        from backend.app.adapters.ticketing import TicketingConfig
+
+        config = TicketingConfig.from_settings()
+        if self.helpdesk_integration and self.helpdesk_integration != "generic":
+            config.adapter = self.helpdesk_integration
+        return config
 
     def _default_notification_target(self) -> str | None:
         from backend.app.settings.env import get_settings
@@ -214,6 +230,40 @@ class EscalationService:
         return "Standard escalation - continue conversation from where bot left off."
 
     async def _send_to_ticketing_system(self, handoff: HandoffRequest) -> HandoffResponse:
+        # P9-3: concrete helpdesk adapters dispatch here (zendesk/jira/
+        # servicenow); generic keeps the legacy webhook transport.
+        from backend.app.adapters.ticketing import get_ticketing_adapter
+
+        config = self._adapter_config()
+        if config.adapter != "generic":
+            adapter = get_ticketing_adapter(config, transport=self._ticketing_transport)
+            if adapter is not None:
+                payload = handoff.to_ticket_payload()
+                result = await adapter.create_ticket(payload)
+                if hasattr(adapter, "close"):
+                    await adapter.close()
+                if result.ok:
+                    return HandoffResponse(
+                        success=True,
+                        ticket_id=result.ticket_id or str(handoff.id),
+                        assignment_url=result.url,
+                        message=f"Ticket created: {result.ticket_id}",
+                        estimated_wait_time_minutes=15,
+                    )
+                raise Exception(
+                    f"Ticketing API error ({config.adapter}): {result.error}"
+                )
+            logger.warning(
+                "helpdesk_adapter_unconfigured",
+                adapter=config.adapter,
+                handoff_id=handoff.id,
+            )
+            return HandoffResponse(
+                success=True,
+                message="Handoff recorded locally. No external ticketing system configured.",
+                estimated_wait_time_minutes=None,
+            )
+
         if not self.ticketing_webhook_url:
             logger.warning("no_ticketing_integration", handoff_id=handoff.id)
             return HandoffResponse(
@@ -265,6 +315,8 @@ def get_escalation_service(
     escalation_repository: Any | None = None,
     notification_channel: str | None = None,
     notification_target: str | None = None,
+    ticketing_config: Any | None = None,
+    ticketing_transport: Any | None = None,
 ) -> EscalationService:
     global _escalation_service
     if _escalation_service is None:
@@ -275,6 +327,8 @@ def get_escalation_service(
             escalation_repository=escalation_repository,
             notification_channel=notification_channel,
             notification_target=notification_target,
+            ticketing_config=ticketing_config,
+            ticketing_transport=ticketing_transport,
         )
     return _escalation_service
 
@@ -286,6 +340,8 @@ def create_escalation_service(
     escalation_repository: Any | None = None,
     notification_channel: str | None = None,
     notification_target: str | None = None,
+    ticketing_config: Any | None = None,
+    ticketing_transport: Any | None = None,
 ) -> EscalationService:
     return EscalationService(
         tenant_config=tenant_config,
@@ -294,4 +350,6 @@ def create_escalation_service(
         escalation_repository=escalation_repository,
         notification_channel=notification_channel,
         notification_target=notification_target,
+        ticketing_config=ticketing_config,
+        ticketing_transport=ticketing_transport,
     )

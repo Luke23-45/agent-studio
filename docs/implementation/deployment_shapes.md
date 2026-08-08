@@ -45,3 +45,27 @@ architecture and control plane do not.
   dedicated deployments additionally move the physical pool.
 - Region is immutable after onboarding; changing it requires a new tenant
   (data stays in the original region per the archive-pinning contract).
+
+## Active-active plan (P8-5, L2+, deferred)
+
+Regional primaries with replica fan-out are **designed but deferred**
+(D-5 trigger; §17). The plan, recorded so L2 has no rewrite:
+
+- **Residency as the routing key**: a tenant's region (already pinned and
+  immutable) selects its regional primary — the region field is the
+  shard-0 of multi-region. No new tenant-level config is needed.
+- **Single-writer per region**: one primary per region, replicas fan out
+  locally (P8-3); no cross-region write-path (no global sequence, no
+  distributed transactions). Cross-region traffic is read-only by design —
+  a tenant always writes to its own region's primary.
+- **Read-your-writes stays within the region**: the window mechanism
+  (P8-3) is per-region; a tenant's reads resolve against its region.
+- **Disaster recovery**: region pinning + archive prefixes (P5-12) already
+  bound data to a region; the regional restore drill is a P6-9 ops item,
+  not a code change.
+- **Trigger (D-5)**: multi-region timing is a customer demand decision —
+  no code until a customer requires residency in a second region or a
+  regional DR SLA.
+
+**Today (L1)**: residency pinning is honored and tested (P5-12 `[x]`);
+active-active is this documented plan.

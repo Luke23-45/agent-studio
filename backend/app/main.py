@@ -33,9 +33,11 @@ from backend.app.api.routes import (
     operations_router,
     operator_auth_router,
     policies_router,
+    prompts_router,
     sessions_router,
     surfaces_router,
     threads_router,
+    tools_router,
     traces_router,
     usage_router,
     webhooks_router,
@@ -49,12 +51,17 @@ from backend.app.infrastructure.db import (
     get_database_manager,
     init_database,
 )
+from backend.app.infrastructure.db.replicas import get_replica_router, init_replica_router
 from backend.app.infrastructure.observability.metrics import (
     init_metrics,
     metrics_endpoint_content,
 )
 from backend.app.infrastructure.observability.slos import init_slo_tracker
 from backend.app.infrastructure.observability.tracing import init_tracing
+from backend.app.infrastructure.patterns.last_active import (
+    get_last_active_batcher,
+    init_last_active_batcher,
+)
 from backend.app.infrastructure.queue import get_queue_manager, init_queue
 from backend.app.infrastructure.storage import get_storage_manager, init_storage
 from backend.app.infrastructure.stream import get_stream_buffer, init_stream_buffer
@@ -115,11 +122,38 @@ async def lifespan(app: FastAPI):
     """Application lifecycle: wire up shared services at startup."""
     configure_tenant_config_service(Path(settings.TENANT_CONFIG_PATH))
 
-    db = init_database(settings.DATABASE_URL, echo=settings.DB_ECHO)
+    db = init_database(
+        settings.DATABASE_URL,
+        echo=settings.DB_ECHO,
+        max_pool_size=settings.DATABASE_POOL_SIZE,
+        max_overflow=settings.DATABASE_MAX_OVERFLOW,
+        pool_recycle=settings.DATABASE_POOL_RECYCLE,
+        statement_timeout_ms=settings.DATABASE_STATEMENT_TIMEOUT_MS,
+    )
     await db.initialize()
     if settings.RUN_MIGRATIONS_ON_STARTUP:
         await db.run_migrations()
     await _bootstrap_api_key()
+
+    # Read replicas (Arch 11, P8-3): history reads fan out to configured
+    # replicas; unconfigured/unhealthy falls back to the primary. Startup
+    # never fails on replica outage -- it logs and degrades.
+    replica_router = init_replica_router(
+        settings.REPLICA_DATABASE_URLS,
+        window_seconds=settings.REPLICA_READ_YOUR_WRITES_WINDOW_SECONDS,
+        max_pool_size=settings.DATABASE_POOL_SIZE,
+        max_overflow=settings.DATABASE_MAX_OVERFLOW,
+        pool_recycle=settings.DATABASE_POOL_RECYCLE,
+        echo=settings.DB_ECHO,
+        primary=db,
+    )
+    last_active = init_last_active_batcher(
+        settings.REDIS_URL,
+        db=db,
+        flush_interval_seconds=settings.LAST_ACTIVE_FLUSH_INTERVAL_SECONDS,
+        batch_threshold=settings.LAST_ACTIVE_BATCH_THRESHOLD,
+        buffer_ttl_seconds=settings.LAST_ACTIVE_BUFFER_TTL_SECONDS,
+    )
 
     # Observability
     metrics = init_metrics()
@@ -177,6 +211,8 @@ async def lifespan(app: FastAPI):
         stream_buffer.initialize(),
         end_user_limits.initialize(),
         gateway.initialize(),
+        replica_router.initialize(),
+        last_active.initialize(),
         initialize_rate_limiter(),
     )
 
@@ -200,6 +236,8 @@ async def lifespan(app: FastAPI):
         stream_buffer.close(),
         end_user_limits.close(),
         gateway.close(),
+        replica_router.close(),
+        last_active.close(),
     )
     logger.info("application_shutdown")
 
@@ -251,11 +289,13 @@ def create_application() -> FastAPI:
     app.include_router(harness_router, prefix="/api/v1")
     app.include_router(operations_router, prefix="/api/v1")
     app.include_router(policies_router, prefix="/api/v1")
+    app.include_router(prompts_router, prefix="/api/v1")
     app.include_router(traces_router, prefix="/api/v1")
     app.include_router(evals_router, prefix="/api/v1")
     app.include_router(console_router, prefix="/api/v1")
     app.include_router(operator_auth_router, prefix="/api/v1")
     app.include_router(usage_router, prefix="/api/v1")
+    app.include_router(tools_router, prefix="/api/v1")
 
     @app.get("/health/live")
     async def liveness_check():
@@ -295,6 +335,8 @@ def create_application() -> FastAPI:
             ("stream_buffer", get_stream_buffer()),
             ("end_user_limits", get_end_user_limits()),
             ("gateway", get_gateway()),
+            ("replica_router", get_replica_router()),
+            ("last_active", get_last_active_batcher()),
         ):
             components[name] = (await manager.health_check()).to_dict()
 

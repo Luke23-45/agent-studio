@@ -8,6 +8,7 @@ on:
     paths:
       - 'evals/**'       # Run when eval configs change
       - 'backend/app/governance/**'  # Run on governance changes
+      - 'backend/app/application/evals/**'  # Run on RAG suite changes
 
 jobs:
   run-garak:
@@ -24,15 +25,30 @@ jobs:
           pip install --upgrade pip
           pip install -e ".[redteam]"
 
-      - name: Golden dataset validation gate (P6-6)
+      - name: Dataset validation gate (P6-6)
         # Schema + redaction hygiene check that runs with no API keys, so the
         # harness always executes in CI and malformed/leaky datasets block it.
+        # Schema-aware: compaction-style cases declare turns/probes, RAGAS-style
+        # cases declare question/contexts/ground_truths; every string field is
+        # scanned for SSN/card leaks regardless of schema.
         shell: python
         run: |
           import json, re, sys
           from pathlib import Path
 
+          leak = re.compile(r"\b\d{3}-\d{2}-\d{4}\b|\b\d{16}\b")
           failures = []
+
+          def walk_strings(node):
+              if isinstance(node, str):
+                  yield node
+              elif isinstance(node, dict):
+                  for value in node.values():
+                      yield from walk_strings(value)
+              elif isinstance(node, list):
+                  for value in node:
+                      yield from walk_strings(value)
+
           for path in sorted(Path("evals/datasets").rglob("*.jsonl")):
               for lineno, line in enumerate(
                   path.read_text(encoding="utf-8").splitlines(), start=1
@@ -42,18 +58,42 @@ jobs:
                   except json.JSONDecodeError:
                       failures.append(f"{path}:{lineno} invalid JSON")
                       continue
-                  for i, turn in enumerate(case.get("turns", [])):
-                      if "redacted_content" not in turn:
+                  if not isinstance(case, dict):
+                      failures.append(f"{path}:{lineno} entry must be an object")
+                      continue
+                  for text in walk_strings(case):
+                      if leak.search(text):
+                          failures.append(f"{path}:{lineno} may leak SSN/card")
+                  # Compaction schema: turns must carry redacted content.
+                  if "turns" in case:
+                      turns = case["turns"]
+                      if not isinstance(turns, list) or not turns:
+                          failures.append(f"{path}:{lineno} 'turns' must be non-empty")
+                      else:
+                          for i, turn in enumerate(turns):
+                              if not isinstance(turn, dict) or not isinstance(
+                                  turn.get("redacted_content"), str
+                              ):
+                                  failures.append(
+                                      f"{path}:{lineno} turns[{i}] missing redacted_content"
+                                  )
+                  if "probes" in case and not case.get("probes"):
+                      failures.append(f"{path}:{lineno} 'probes' must be non-empty")
+                  # RAGAS schema: question/contexts/ground_truths are required.
+                  if "contexts" in case:
+                      contexts = case["contexts"]
+                      if not isinstance(contexts, list) or not contexts or not all(
+                          isinstance(c, str) and c.strip() for c in contexts
+                      ):
+                          failures.append(f"{path}:{lineno} 'contexts' invalid")
+                      for key in ("question", "answer"):
+                          if not isinstance(case.get(key), str) or not case[key].strip():
+                              failures.append(f"{path}:{lineno} missing non-empty '{key}'")
+                      truths = case.get("ground_truths")
+                      if not isinstance(truths, list) or not truths:
                           failures.append(
-                              f"{path}:{lineno} turns[{i}] missing redacted_content"
+                              f"{path}:{lineno} 'ground_truths' must be non-empty"
                           )
-                      body = turn.get("redacted_content", "")
-                      if re.search(r"\b\d{3}-\d{2}-\d{4}\b|\b\d{16}\b", body):
-                          failures.append(
-                              f"{path}:{lineno} turns[{i}] may leak SSN/card"
-                          )
-                  if not case.get("probes"):
-                      failures.append(f"{path}:{lineno} missing probes")
           if failures:
               print("\n".join(failures))
               sys.exit(1)
@@ -102,3 +142,60 @@ jobs:
         with:
           name: garak-results
           path: garak-report.*
+
+  run-ragas:
+    runs-on: ubuntu-latest
+    env:
+      EVAL_OPENAI_API_KEY: ${{ secrets.EVAL_OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.EVAL_ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install backend (RAGAS harness imports)
+        run: pip install --upgrade pip && pip install -e ".[dev]"
+
+      - name: RAGAS baseline gate (keyless lexical, P6-6)
+        # Deterministic, model-free: always runs in CI; any metric below
+        # the threshold blocks. Every config/prompt/model change must keep
+        # the baseline green.
+        run: |
+          python evals/run_ragas_suite.py \
+            --dataset evals/datasets/ragas/baseline.jsonl \
+            --threshold 0.6
+
+      - name: RAGAS adversarial corpus (informational)
+        # Known-hallucination cases are reported, not gated: they pin the
+        # harness's ability to detect regressions, not the baseline itself.
+        run: |
+          python evals/run_ragas_suite.py \
+            --dataset evals/datasets/ragas/adversarial.jsonl \
+            --threshold 0
+
+      - name: RAGAS suite with LLM judge (needs provider key)
+        if: env.EVAL_OPENAI_API_KEY != ''
+        run: |
+          python evals/run_ragas_suite.py \
+            --dataset evals/datasets/ragas/baseline.jsonl \
+            --judge --provider openai \
+            --api-key "$EVAL_OPENAI_API_KEY" \
+            --threshold 0.6
+
+      - name: Compaction harness with LLM judge (needs provider key)
+        if: env.EVAL_OPENAI_API_KEY != ''
+        run: |
+          python evals/run_compaction_eval.py \
+            --dataset evals/datasets/compaction/baseline.jsonl \
+            --provider openai --model gpt-4o-mini \
+            --api-key "$EVAL_OPENAI_API_KEY" \
+            --judge --threshold 0
+
+      - name: Archive RAGAS results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ragas-results
+          path: evals/reports/

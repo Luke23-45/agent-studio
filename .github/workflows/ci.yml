@@ -88,10 +88,23 @@ jobs:
       - name: Trivy scan (API image)
         uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: neryva-product-aaa-api
+          image-ref: neryva-product-aaa/api
           format: table
           exit-code: 1
           severity: CRITICAL,HIGH
+
+      - name: Push images to GHCR (main only)
+        if: github.ref == 'refs/heads/main'
+        env:
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          for service in api worker; do
+            docker tag neryva-product-aaa/$service:latest ghcr.io/${{ github.repository }}/$service:${GITHUB_SHA::8}
+            docker tag neryva-product-aaa/$service:latest ghcr.io/${{ github.repository }}/$service:latest
+            docker push ghcr.io/${{ github.repository }}/$service:${GITHUB_SHA::8}
+            docker push ghcr.io/${{ github.repository }}/$service:latest
+          done
 
   sbom:
     runs-on: ubuntu-latest
@@ -112,3 +125,40 @@ jobs:
         with:
           name: cyclonedx-sbom
           path: sbom.xml
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [backend, frontend, docker]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: staging
+    concurrency: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to staging (SSH + compose)
+        env:
+          STAGING_HOST: ${{ secrets.STAGING_HOST }}
+          STAGING_SSH_KEY: ${{ secrets.STAGING_SSH_KEY }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "$STAGING_SSH_KEY" > /tmp/staging_key
+          chmod 600 /tmp/staging_key
+          export TAG=${GITHUB_SHA::8}
+          scp -i /tmp/staging_key -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null docker-compose.yml \
+            ubuntu@$STAGING_HOST:/srv/neryva/docker-compose.yml
+          ssh -i /tmp/staging_key -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null ubuntu@$STAGING_HOST "
+            set -euo pipefail
+            export GHCR_TOKEN='$GHCR_TOKEN'
+            echo \"\$GHCR_TOKEN\" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+            cd /srv/neryva
+            REGISTRY=ghcr.io/${{ github.repository }} TAG=$TAG docker compose pull api worker
+            REGISTRY=ghcr.io/${{ github.repository }} TAG=$TAG docker compose up -d api worker
+            for i in \$(seq 1 30); do
+              if curl -fsS http://localhost:8000/health/live; then break; fi
+              sleep 2
+            done
+            curl -fsS http://localhost:8000/health/live
+          "
