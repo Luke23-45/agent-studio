@@ -1,10 +1,10 @@
-# Neryva Agent Studio
+# Agent Studio
 
 **Enterprise-grade governance and control layer for LLM applications.**
 
 ## Overview
 
-Neryva Agent Studio provides a production-ready control layer that governs the behavior, voice, scope, and workflow fit of customer-selected LLMs without replacing the model provider or secure deployment layer.
+ Agent Studio provides a production-ready control layer that governs the behavior, voice, scope, and workflow fit of customer-selected LLMs without replacing the model provider or secure deployment layer.
 
 ## Architecture
 
@@ -124,5 +124,4 @@ OpenCode config lives in `opencode.json` and `.opencode/` at the project root. S
 Boundary rules are enforced in `AGENTS.md`, `opencode.json` (permissions), and `.opencode/agents/` (agent-level restrictions). Any tool, provider connection, or workflow prototyped here must pass through the production policy gate, PII layer, and guardrail stack before entering the customer runtime.
 
 ## License
-
-Proprietary - All rights reserved.
+MIT
